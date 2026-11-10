@@ -218,8 +218,8 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_avf_host_present.sh` | host-mode frame stamps after a seek, and when a reset re-seeds the timebase | main |
 | `test_avf_vsync_snap.sh` | frame stamps placed inside their refresh with hysteresis and enqueues paced to one point of it: no skip/repeat at any phase, one clean step per drift crossing, cadences (60, 50, 120, 48 Hz) kept, relock on a seek, a rate change or a moved display, 55 min of a 14 ppm drift, the auto pace rule, 3 h of drift with every repeat/skip at a cut, the cut/still classifier (patch 0307) | PR |
 | `test_avf_osd_ahead.sh` | how long flip_page may hold video for its subtitles | main |
-| `test_avf_osd_blend.sh` | the OSD's NEON libass blend matches its scalar reference bit for bit (patch 0043; aarch64 host) | main |
-| `test_avf_osd_dirty_set.sh` | each overlay buffer's next clear covers everything last drawn into it (patch 0043) | main |
+| `test_avf_osd_blend.sh` | the OSD's NEON blends, libass masks and premultiplied BGRA, match their scalar references bit for bit (patch 0043; aarch64 host) | main |
+| `test_avf_osd_damage.sh` | an overlay buffer drawn by tile, whatever it held, ends up exactly as a full clear and blend of the frame (patch 0048) | main |
 | `test_avf_osd_layer_geometry.sh` | the inline OSD layer's placement (macOS) | main |
 | `test_avf_main_thread_link.sh` | vo_avfoundation never waits on the main thread at teardown, at most 500 ms elsewhere; its geometry cache and late main-thread work (patch 0300; macOS) | main |
 | `test_avf_pip_frame_space_osd.sh` | frame-space OSD geometry for PiP | main |
