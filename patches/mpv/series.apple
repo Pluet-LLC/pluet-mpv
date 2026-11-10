@@ -55,3 +55,10 @@
 # TV drops frames (--avfoundation-vsync-snap, -snap-pace; test
 # test_avf_vsync_snap.sh).
 0307-avfoundation-stamp-frames-inside-their-refresh.patch
+# Upstream (edde746/mpv-build) Apple patches taken after Pluet's 03xx, so
+# 0300's bounded main-thread waits and 0307's stamps, lead and pacing stay as
+# they are: 0046 and 0048 apply as upstream wrote them; 0047 is covered by
+# 0300 and 0049 (opt-in) is not taken; 0050-0053 are ported onto 0300/0307 as
+# 0308-0311.
+# Startup: a file's first frame is on screen before the audio output opens.
+0046-player-first-video-frame-before-the-audio-output-opens.patch
