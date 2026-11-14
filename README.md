@@ -216,6 +216,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_ao_spatial.sh`, `test_spatial_*.sh` | spatial audio; see [docs/apple.md](docs/apple.md#its-tests) | PR, main |
 | `test_avf_dovi_profile5_rpu.sh` | which frames vo_avfoundation uploads with their Dolby Vision RPU | main |
 | `test_avf_host_present.sh` | host-mode frame stamps after a seek, and when a reset re-seeds the timebase | main |
+| `test_avf_vsync_snap.sh` | frame stamps placed inside their refresh with hysteresis and enqueues paced to one point of it: no skip/repeat at any phase, one clean step per drift crossing, cadences (60, 50, 120, 48 Hz) kept, relock on a seek, a rate change or a moved display, 55 min of a 14 ppm drift, the auto pace rule, 3 h of drift with every repeat/skip at a cut, the cut/still classifier (patch 0307) | PR |
 | `test_avf_osd_ahead.sh` | how long flip_page may hold video for its subtitles | main |
 | `test_avf_osd_blend.sh` | the OSD's NEON libass blend matches its scalar reference bit for bit (patch 0043; aarch64 host) | main |
 | `test_avf_osd_dirty_set.sh` | each overlay buffer's next clear covers everything last drawn into it (patch 0043) | main |

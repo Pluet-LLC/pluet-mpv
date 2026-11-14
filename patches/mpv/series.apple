@@ -49,3 +49,9 @@
 # 0025's recovery as --hwdec-recover-keyframes/--hwdec-recover-max-frames,
 # defaults unchanged (test test_hwdec_recovery.sh).
 0306-vd-lavc-options-for-the-hwdec-error-recovery.patch
+# Host-mode frames stamped a quarter refresh before the refresh they are
+# shown on, chosen with hysteresis, and enqueued at a fixed point of the
+# refresh, so the audio clock's drift never puts the enqueues where an Apple
+# TV drops frames (--avfoundation-vsync-snap, -snap-pace; test
+# test_avf_vsync_snap.sh).
+0307-avfoundation-stamp-frames-inside-their-refresh.patch

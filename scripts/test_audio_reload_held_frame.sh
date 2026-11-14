@@ -21,7 +21,13 @@ python3 "$E" type "$source_dir/player/core.h" "$workdir/reload_held_frame_types.
     --name playback_status --name ao_chain
 python3 "$E" symbol "$audio" "$workdir/reload_held_frame.inc" --fn ao_process --return void
 python3 "$E" symbol "$audio" "$workdir/reload_held_frame.inc" --append --fn reload_audio_output --return void
+# The Apple series' reload also consults the passthrough back-off (0303).
+defs=()
+if grep -q 'spdif_backed_off(mpctx, ao_c->track)' "$audio"; then
+    defs+=(-DHAVE_SPDIF_BACKOFF)
+fi
 # mpv builds its own sources without -Wsign-compare.
 cc -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function \
-    -I"$workdir" "$root/scripts/test_audio_reload_held_frame.c" -o "$workdir/test" -lm
+    ${defs[@]+"${defs[@]}"} -I"$workdir" "$root/scripts/test_audio_reload_held_frame.c" \
+    -o "$workdir/test" -lm
 "$workdir/test"

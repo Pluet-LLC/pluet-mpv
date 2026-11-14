@@ -1,0 +1,1905 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vo_avfoundation: stamp and enqueue host-mode frames at fixed
+ points of the refresh
+
+On tvOS a 23.976 fps film on a 23.976 Hz mode, Dolby passed through, can
+stutter hard while every mpv counter stays at zero: no drops, avsync ~0,
+the layer timebase on the host clock. The display layer's own count
+(AVVideoPerformanceMetrics.numberOfDroppedFrames) shows it: 10 to 25% of
+frames dropped, in stretches that depend on where in the refresh mpv's
+schedule falls, never elsewhere.
+
+Host mode stamps each frame with mpv's planned display time (frame->pts),
+which follows the audio clock and the container's 1 ms timestamp rounding,
+and the VO enqueues each frame about 119 ms before that time. Field logs
+from two Apple TVs, with the display link's refresh instants as the
+reference:
+
+- Apple TV 4K (1st generation), stamps as planned: drops while planned
+  times sat 21 to 36 ms past the instant, almost none from 0 to 20. With
+  every stamp 31.3 ms past the instant (this patch's first form), none
+  with planned times at 22 ms past it, 7% with them at 28 ms.
+- Apple TV 4K (2nd generation), every stamp 31.3 ms past the instant:
+  the audio clock ran 14 ppm off the 41.709 ms refresh, the planned
+  times swept the refresh every 49 minutes, and the layer dropped frames
+  for the ~6 minutes of each sweep in which they sat from ~7 ms before
+  the instant to ~2 ms after it (17 minutes into a film, and again after
+  a seek re-rolled the phase), none elsewhere.
+
+So the stamp's place in the refresh does not decide it, and the first
+form's reasoning (a stamp on a refresh boundary, sent either side of it by
+the rounding) was wrong: its stamps never moved, and the second TV still
+dropped frames. What fits both logs, as a hypothesis (the layer's
+internals are not documented), is that an enqueue landing in the ~10 ms
+before the display takes its next frame costs a frame: 30 to 40 ms past
+the instant on the first TV, 40 ms to 8 ms on the second. Enqueues from
+~9 to ~27 ms past it were clean on both.
+
+The VO now keeps both at fixed points of the refresh, from a CADisplayLink
+on the main run loop whose refresh instants it reads without waiting:
+
+- the stamp: each frame's refresh is picked with hysteresis (a lock on
+  the smoothed offset of planned times from their refreshes), and the
+  frame is stamped a fixed share of a refresh before it
+  (--avfoundation-vsync-snap-lead, 0.25), whatever the lock;
+- the enqueue: flip_page waits for the next instant a fixed share of a
+  refresh past the link's (--avfoundation-vsync-snap-pace-phase, 0.42:
+  17.5 ms at 23.976 Hz, the middle of the clean range), unless that would
+  leave the frame under 40 ms before its stamp. The wait is under one
+  refresh and changes nothing on screen.
+
+Where the audio clock and the refresh drift, a whole frame of drift must
+be absorbed somewhere. HDMI does not lock the two (audio travels with
+N/CTS against the TMDS clock, which lets them differ), and the field logs
+measure it against the host clock: on the 2nd generation the audio (the
+item timebase, which follows the audio device) ran +0.3 +-0.4 ppm, the
+refresh 14 ppm slow (two sweeps, 13.96 and 13.98 ppm), so a frame every
+49 minutes; on the 1st generation audio, refresh and host were within
+0.5 ppm and nothing drifted.
+
+- Decoded (PCM) audio: the picture never steps. At one frame per refresh
+  the VO asks the core (vo_set_audio_speed_hint(), new) to play the sound
+  that much faster or slower; player/video.c applies it as mpv's
+  display-resample does (speed_factor_a and _v, pure resampling through
+  swresample's compensation), never to passthrough and only in the
+  default audio-synced mode, and tells the VO whether it did. A PI servo
+  on the picture's offset from its sound sets the speed (it holds the
+  offset at 0, +-2 ms in tests), capped at
+  --avfoundation-vsync-snap-resample-ppm (500); a mismatch that keeps it
+  at the cap for a minute (24 fps on a 23.976 Hz mode, 1001 ppm) is left
+  to the steps instead.
+- Passthrough (and decoded audio past the cap): the step is hidden;
+  passthrough itself is never turned off or resampled. The picture may
+  drift within a lip-sync range of 60 ms early to 25 ms late against its
+  sound (--avfoundation-vsync-snap-sound-late-ms, -sound-early-ms; ITU-R
+  BT.1359 detects sound 45 ms early and 125 ms late; EBU R37 allows 40
+  early and 60 late; up to 90 late may be set), so the step can be taken
+  anywhere in a stretch of 43 ms of drift (52 minutes at 14 ppm; 87 at
+  90 ms). From the middle of that stretch it is taken at a hard cut or
+  the frame after a black or uniform one (a fade through black), or a
+  still picture; from three quarters on at a frame changing no more than
+  the calmest lately; only an unreadable frame leaves it to the end. A
+  skip drops the frame before (scored by the change from two frames back
+  to this one), a repeat holds it (scored by the change to this one).
+  Scores are the 75th percentile of the per-cell change over a 32x18 luma
+  grid: how much of the picture moves, so a still camera with one person
+  moving ranks far above a slow even pan, where a dropped frame is the
+  classic visible judder. Every format mpv gives this VO is sampled
+  (VideoToolbox's 8- and 10-bit biplanar 4:2:0/4:2:2/4:4:4, packed 4:2:2,
+  BGRA; NV12, P010, yuv420p, -p10, -p12 from software decoding), 4.6 us a
+  4K frame on an M1. A step only follows a measured drift (10 s spans
+  once the lock settles, three agreeing or one over 50 ppm), so locked
+  clocks never step. At a fresh lock (seek, unpause) at one frame per
+  refresh the picture starts in the middle of the range. Cadences (23.976
+  fps on 60 Hz, a 2,3 slip every 17 s) hide their slips the same way.
+
+The refresh clock keeps its grid across a stopped link (background, a
+sleeping display): a gap that comes back on the grid keeps the run, one at
+another phase starts a new run but keeps the measured period until the new
+one has its own, and a mode change (the TV going to 60 Hz and back) starts
+over; the lock is taken again once each time, and the resampling servo
+starts over on another mode.
+
+The enqueue's pacing now waits with the OSD and video samples already
+made, and aims early by the measured lateness of the video enqueue after
+it (the OSD enqueue between them, a few ms), so the enqueue lands on its
+point (build 44 put it at 21.9 ms for 17.5).
+
+--avfoundation-vsync-snap-pace=auto (the default) also reads the layer's
+counts once a second and moves the enqueue point on by a quarter refresh
+after two 5 s windows in a row with drops (3 or more, and 2%), for a
+display whose timing differs from the two measured; yes keeps the point,
+no enqueues on mpv's schedule as before. A seek, an unpause, a refresh
+rate change or refreshes that moved take a new lock; no refresh clock
+keeps the planned time and mpv's schedule.
+
+iOS/iPadOS and macOS run media mode: there the host time at which the
+timebase reaches the PTS is snapped and mapped back, from a passive 15 Hz
+link (iOS) or the hosting NSView's display link (macOS 14+), and nothing
+is paced. A 120 Hz iPad Pro dropped about a quarter of its frames with
+the snap on (cause unknown), so the default stays off outside tvOS.
+
+--avfoundation-vsync-snap=yes|no|measure (yes on tvOS, no elsewhere),
+-snap-lead (0.25), -snap-pace=no|yes|auto (auto), -snap-pace-phase
+(0.42), -snap-resample-ppm (500, 0 = never resample), -snap-sound-late-ms
+(60) and -snap-sound-early-ms (25). Every 5 s at -v the VO logs three lines (each under 200
+characters, which is what Pluet's field log keeps of a line), and a
+fourth on the steps, e.g.:
+
+  vsync-snap on: 120 frames/5.0s (0 no refresh), refresh 41.709 ms (link
+  41.709), lock +2.25 ms, layer -0.024 ms, moved=0, shift avg +2.22 max
+  2.74 ms, relocks=0 reslots=0
+  vsync-snap phase (ms past refresh): planned 39.49 [-0.51 +0.52], stamp
+  31.28 [+0.00 +0.00], enqueue 17.52 [-0.01 +0.40], refreshes 1:119 2:0
+  0:0, uneven A=0 B=0 S=0
+  vsync-snap pace auto 0.42: lead min 56.1 avg 99.0 max 131.0 ms, pace
+  wait avg 20.3 max 41.0, ready wait avg 0.0 max 0.0, layer shown 120
+  dropped 0, steps=0
+  vsync-snap sync: av -14.8..-13.9 ms, drift +14.0 ppm, resample +0.0
+  ppm off; steps cut 1 black 0 still 0 low 0 forced 0, last cut 40.00 at
+  +6.1 ms; sampled 120 cuts 2 flat 0
+
+"lock" is the shown refresh minus the planned time (smoothed), "moved"
+counts frames on another refresh than the first at or after their planned
+time, "shift" is the picture's offset from its planned time; the phase
+line gives where the planned times, the stamps and the enqueues fell
+past the link's refresh instant (mean [spread]), and the refreshes the
+frames went to (one frame each, two in one, none); "uneven" counts
+frames a refresh early or late against the one before (A: stamped as
+planned on the first refresh at or after, B: on the nearest, S: as
+snapped). The pace line gives each frame's lead before its stamp at the
+enqueue, the pacing and readiness waits, the layer's own counts for the
+window, and how often auto moved the point; the sync line the picture's
+offset from its sound over the window (+: picture late), the measured
+drift, the resampling asked (and whether the core applies it), the steps
+since the file opened by where they were hidden, the last one's kind,
+score and offset, and how many frames were sampled, cuts, flat frames
+and frames that could not be read.
+
+scripts/test_avf_vsync_snap.sh compiles the snap and the pacing from the
+final Apple series and drives them with synthetic clocks: every phase at
+23.976 on 23.976 Hz, drift, the 60/50 Hz cadences, 24 fps on 120 and 48
+Hz, refresh-rate changes mid-play, a window moved to another display, a
+seek, no refresh clock, 55 minutes of the second TV's drift (one frame
+per refresh but for one clean step, stamps at one point, enqueues held at
+one point and out of both TVs' late ranges), the auto rule; three hours
+at 14 ppm, passthrough, of a film, a pan with no cut, a static shot,
+talking heads, fades, unreadable frames and slow pans alternating with a
+still camera (4 steps each, at cuts, blacks, stills, the pan's calmest
+frames, never in a pan when a still camera comes; forced only when
+unreadable), the 60 and 90 ms ranges, a fast refresh (repeats at cuts),
+locked clocks (none); decoded audio at 14 and +-300 ppm (no step) and
+1001 ppm (the steps take over, at cuts); 23.976 on 60 Hz (every slip at a
+cut); a pause with the display waking at another phase; the refresh clock
+through gaps and mode changes; a link gap, 60 Hz and back and a seek
+while paused in one run; pacing at a start; and the classifiers.
+
+
+diff --git a/player/video.c b/player/video.c
+index 4d365a3..4c33302 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -974,6 +974,23 @@ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
+             mpctx->speed_factor_v = 1.0;
+             update_playback_speed(mpctx);
+         }
++        // A VO showing one frame per refresh (vo_avfoundation's vsync snap)
++        // may ask for the sound to follow the display instead: decoded audio
++        // is resampled by that much, and video timed to match, so the
++        // picture needs no repeat or skip. Never for passthrough (it cannot
++        // be resampled), and only in the default audio-synced mode.
++        double hint = vo_get_audio_speed_hint(mpctx->video_out);
++        bool apply = hint > 0.99 && hint < 1.01 && mpctx->ao_chain &&
++                     !mpctx->ao_chain->spdif_passthrough &&
++                     mpctx->audio_status == STATUS_PLAYING &&
++                     mpctx->video_out->opts->video_sync == VS_DEFAULT;
++        double want = apply ? hint : 1.0;
++        if (want != mpctx->speed_factor_a || want != mpctx->speed_factor_v) {
++            mpctx->speed_factor_a = want;
++            mpctx->speed_factor_v = want;
++            update_playback_speed(mpctx);
++        }
++        vo_set_audio_speed_applied(mpctx->video_out, apply);
+ 
+         update_av_diff(mpctx, mpctx->time_frame > 0 ?
+             mpctx->time_frame * mpctx->video_speed : 0);
+diff --git a/video/out/vo.c b/video/out/vo.c
+index b109ee1..664fd26 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -163,6 +163,8 @@ struct vo_internal {
+ 
+     int64_t flip_queue_offset; // queue flip events at most this much in advance
+     int64_t queue_slack;       // vo_set_queue_slack()
++    double audio_speed_hint;   // vo_set_audio_speed_hint(), 0: none
++    bool audio_speed_applied;  // vo_set_audio_speed_applied()
+     int64_t timing_offset;     // same (but from options; not VO configured)
+ 
+     int64_t delayed_count;
+@@ -1359,6 +1361,44 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames)
+     mp_mutex_unlock(&in->lock);
+ }
+ 
++// A VO that shows one frame per display refresh may ask for the audio to be
++// played this much faster (or slower, under 1) instead of the picture being
++// stepped: the core applies it by resampling decoded audio, never to
++// passthrough, and says whether it did (vo_get_audio_speed_applied()).
++void vo_set_audio_speed_hint(struct vo *vo, double speed)
++{
++    struct vo_internal *in = vo->in;
++    mp_mutex_lock(&in->lock);
++    in->audio_speed_hint = speed;
++    mp_mutex_unlock(&in->lock);
++}
++
++double vo_get_audio_speed_hint(struct vo *vo)
++{
++    struct vo_internal *in = vo->in;
++    mp_mutex_lock(&in->lock);
++    double r = in->audio_speed_hint;
++    mp_mutex_unlock(&in->lock);
++    return r;
++}
++
++void vo_set_audio_speed_applied(struct vo *vo, bool applied)
++{
++    struct vo_internal *in = vo->in;
++    mp_mutex_lock(&in->lock);
++    in->audio_speed_applied = applied;
++    mp_mutex_unlock(&in->lock);
++}
++
++bool vo_get_audio_speed_applied(struct vo *vo)
++{
++    struct vo_internal *in = vo->in;
++    mp_mutex_lock(&in->lock);
++    bool r = in->audio_speed_applied;
++    mp_mutex_unlock(&in->lock);
++    return r;
++}
++
+ void vo_set_queue_slack(struct vo *vo, int64_t slack_ns)
+ {
+     struct vo_internal *in = vo->in;
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 18a3b0c..8d6b293 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -556,6 +556,10 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames);
+ // the timer alone for target moves under 1 ms (or the slack, if less), which
+ // the audio clock makes on most core wakeups. 0 disables.
+ void vo_set_queue_slack(struct vo *vo, int64_t slack_ns);
++void vo_set_audio_speed_hint(struct vo *vo, double speed);
++double vo_get_audio_speed_hint(struct vo *vo);
++void vo_set_audio_speed_applied(struct vo *vo, bool applied);
++bool vo_get_audio_speed_applied(struct vo *vo);
+ int vo_get_num_req_frames(struct vo *vo);
+ double vo_get_vsync_interval(struct vo *vo);
+ double vo_get_estimated_vsync_interval(struct vo *vo);
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 2b644cd..0d332af 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -269,6 +269,29 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
+     int presentation;
+     int osd_max_height;
+     bool osd_video_res;
++    int vsync_snap;
++    double vsync_snap_lead;
++    int vsync_snap_pace;
++    double vsync_snap_pace_phase;
++    double vsync_snap_resample_ppm;
++    int vsync_snap_sound_late_ms, vsync_snap_sound_early_ms;
++};
++
++// --avfoundation-vsync-snap: stamps placed inside their refresh (yes), left
++// as planned but logged as if placed (measure), or neither (no).
++enum avf_vsync_snap_mode {
++    AVF_VSYNC_SNAP_NO = 0,
++    AVF_VSYNC_SNAP_YES = 1,
++    AVF_VSYNC_SNAP_MEASURE = 2,
++};
++
++// --avfoundation-vsync-snap-pace: with the snap on, frames go to the layer
++// at a fixed point of the refresh (yes), at a point that moves on when the
++// layer reports drops (auto), or whenever mpv's schedule says (no).
++enum avf_vsync_pace_mode {
++    AVF_VSYNC_PACE_NO = 0,
++    AVF_VSYNC_PACE_YES = 1,
++    AVF_VSYNC_PACE_AUTO = 2,
+ };
+ 
+ // --- avf sync servo core (host-testable; keep freestanding) ---
+@@ -476,6 +499,660 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+ }
+ // --- end avf sync servo core ---
+ 
++// --- avf vsync snap (host-testable; keep freestanding) ---
++// Host mode stamps each frame with mpv's planned display time, which follows
++// the audio clock (with passthrough, the HDMI audio clock) and carries the
++// container's timestamp rounding (Matroska: 1 ms, so a 23.976 fps film's
++// planned times sit up to 0.5 ms off an even 41.708 ms grid). The VO also
++// does its per-frame work at times set by that clock: mpv hands it each frame
++// about queue-lead-ms before the planned time, and it enqueues the frame then.
++// Measured on two Apple TVs with a 23.976 fps film on a 23.976 Hz mode, the
++// layer drops frames by its own count (AVVideoPerformanceMetrics: 10 to 25%
++// of them, a visible stutter, with every mpv counter at zero) while that work
++// falls in one part of the refresh, and none outside it:
++//   - Apple TV 4K (1st generation), stamps as planned: drops while planned
++//     times sat 21 to 36 ms past the display link's refresh instant, almost
++//     none from 0 to 20. With every stamp 31.3 ms past the instant, none
++//     with planned times at 22 ms, 7% with them at 28 ms.
++//   - Apple TV 4K (2nd generation), every stamp 31.3 ms past the instant:
++//     its audio clock ran 14 ppm off the refresh, so the planned times swept
++//     the whole refresh every 49 minutes, and the layer dropped frames for the
++//     ~6 minutes of each sweep in which they sat from ~7 ms before the instant
++//     to ~2 ms after it, none elsewhere; the stamps never moved.
++// The stamp's place in the refresh is therefore not what decides it. The
++// reading that fits both (a hypothesis: the layer's internals are not
++// documented) is that an enqueue (about 119 ms ahead of the planned time)
++// landing in the ~10 ms before the display takes its next frame costs a
++// frame: that is 30 to 40 ms past the instant on the first, 40 to 8 on the
++// second, and enqueues from ~9 to ~27 ms past it were clean on both.
++//
++// So the VO decides each frame's refresh itself and keeps both its stamp and
++// its enqueue at fixed points of the refresh, never where the audio clock
++// happens to put them. The refresh is picked with hysteresis: lock_ns is the
++// smoothed offset of planned times from the refreshes they are shown on, and
++// every frame goes to the refresh that keeps its own offset within half a
++// refresh of it, so jitter of up to a quarter refresh (in a cadence like 24
++// fps on 60 Hz, the spread of the cadence's phases plus the jitter) never
++// changes a frame's refresh. The stamp is a fixed share of a refresh
++// (--avfoundation-vsync-snap-lead) before that refresh, whatever the lock;
++// the enqueue waits for a fixed point of the refresh
++// (--avfoundation-vsync-snap-pace-phase, avf_vsync_pace_ns()). When the audio
++// clock drifts against the refresh, lock_ns follows, and a whole frame of
++// drift has to become one repeat or skip. The audio clock is not slaved to
++// the refresh even over HDMI (audio is sent with N/CTS against the TMDS
++// clock, which lets them differ): on the 2nd generation Apple TV the audio
++// ran with the host clock (+0.3 ppm) and the 23.976 Hz refresh 14 ppm slow
++// (a frame every 49 minutes); on the 1st both were within 0.5 ppm of the
++// host clock and nothing drifted. Decoded (PCM) audio is resampled to
++// follow the display instead (avf_av_servo_update(); the core applies it),
++// so there the picture never steps. Passthrough cannot be resampled: the
++// picture may drift within a lip-sync range (AVF_AV_*_PICTURE_NS, wider on
++// the side people notice least), the step can be taken anywhere in the
++// stretch where it keeps the picture in range, and avf_step_choice() puts
++// it on a cut, a fade through black, a still picture or, failing those in
++// a long pan, the calmest frame lately (struct avf_step_cand). Cadences
++// (24 fps on 60 Hz) hide their 2,3 slips the same way. A new lock (the
++// first frame after a seek, a pause, a mode change, or refreshes that moved
++// by part of one, as when a window goes to another display) takes the
++// refresh nearest the frame (at one frame per refresh, the one nearest the
++// middle of the lip-sync range); while it is young
++// (AVF_VSYNC_SNAP_ALPHA_DIV frames) it averages the frames' offsets and does
++// not move by whole refreshes, so a cadence's first frames may hold one
++// refresh more or less while it settles.
++// What a frame offers as a place to hide a step (the caller fills it in for
++// every frame from a sparse luma grid; see vsync_frame_candidate()).
++//   kind:   0 nothing special, 1 a hard cut from the frame before, 2 the
++//           frame before is black or uniform (a fade through black);
++//   skip:   how much the picture changes if the frame before is never
++//           shown (difference between the frame two back and this one);
++//   repeat: how much it changes if the frame before is shown twice
++//           (difference between it and this one).
++// Differences are mean absolute 8-bit luma steps over the grid; valid is
++// false when the frame could not be read (then only a forced step remains).
++struct avf_step_cand {
++    bool valid;
++    int kind;
++    double skip, repeat;
++};
++
++enum {
++    AVF_STEP_NONE = 0,
++    AVF_STEP_CUT = 1,
++    AVF_STEP_BLACK = 2,
++    AVF_STEP_STILL = 3,     // score at or under AVF_STEP_STILL_MAX
++    AVF_STEP_LOW = 4,       // the lowest motion seen lately
++    AVF_STEP_FORCED = 5,    // the lip-sync budget ran out
++};
++
++struct avf_vsync_snap {
++    bool locked;
++    int64_t period_ns;      // refresh period the lock was taken with
++    double lock_ns;         // smoothed (planned - shown) offset
++    int frames;             // frames since the lock, for the warm-up mean
++    int64_t last_target_ns;
++    int64_t grid_ns;        // a refresh of the grid the lock was made on
++    int relocks;            // diagnostics: locks taken
++    int reslots;            // diagnostics: whole-refresh moves of the lock
++    // In, per frame: what it offers as a hiding place for a step, and
++    // whether only a step forced by the lip-sync range may be taken (while
++    // the sound is resampled to follow the display, the offset is held).
++    struct avf_step_cand cand;
++    bool hold;
++    // In: the lip-sync range (ns the picture may be early, i.e. the sound
++    // late, and late, i.e. the sound early); 0 takes the defaults.
++    int64_t picture_early_ns, picture_late_ns;
++    double frame_ns;        // smoothed spacing of planned times
++    // Drift of shown minus planned, ms per s of planned time (+: the
++    // picture falls behind, a skip will be needed; -: a repeat), measured
++    // over 10 s spans; kept across locks while the refresh period holds.
++    double drift;
++    int64_t drift_t0;
++    double drift_l0;
++    double drift_raw;       // spans' running estimate, before it is trusted
++    int drift_spans;        // spans in a row of the same sign
++    // Lowest step score seen lately (rises slowly), per direction.
++    double best_skip, best_repeat;
++    // Diagnostics: steps by kind, and the last one.
++    int steps_by_kind[6];
++    int last_kind;
++    double last_score, last_av_ns;
++};
++
++#define AVF_VSYNC_SNAP_HYST_DIV 16
++#define AVF_VSYNC_SNAP_ALPHA_DIV 32
++// Planned times further apart than this (a stall, a skipped stretch) start
++// a new lock rather than carry the old phase over.
++#define AVF_VSYNC_SNAP_GAP_NS INT64_C(1000000000)
++// Lip sync: how far the picture may be shown after the sound it belongs to
++// (sound early) and before it (sound late). ITU-R BT.1359 puts the
++// threshold of detection at sound 45 ms early and 125 ms late, and EBU R37
++// asks a broadcast chain to keep within sound 40 ms early and 60 ms late;
++// these stay inside both, on the side people notice least.
++#define AVF_AV_LATE_PICTURE_NS  INT64_C(25000000)   // sound early by up to 25 ms
++#define AVF_AV_EARLY_PICTURE_NS INT64_C(60000000)   // sound late by up to 60 ms
++// A step is a still frame's when its score is at most this, and the
++// drift's direction is trusted when it is over this many ms per s (4 ppm).
++#define AVF_STEP_STILL_MAX 0.6
++#define AVF_DRIFT_MIN 0.004
++
++static int64_t avf_vsync_floor_div(int64_t a, int64_t b)
++{
++    int64_t q = a / b;
++    if (a % b != 0 && a < 0)
++        q--;
++    return q;
++}
++
++// Forget the lock: the next frame goes to the refresh nearest its planned
++// time (or, at one frame per refresh, the one nearest the middle of the
++// lip-sync range) and the phase is learned again. A seek, a pause or a lost
++// refresh clock calls it.
++static void avf_vsync_snap_unlock(struct avf_vsync_snap *s)
++{
++    s->locked = false;
++}
++
++static bool avf_vsync_one_to_one(const struct avf_vsync_snap *s, double period)
++{
++    return s->frame_ns > 0 && fabs(s->frame_ns - period) * 64 < period;
++}
++
++// Whether to take the step on this frame, which would move the picture by
++// one refresh in direction dir (+1: a skip, the picture falls behind; -1: a
++// repeat). b is how much of the stretch in which the step keeps the picture
++// in range is used (0: the step has just become possible, 1: it is due).
++// In the first half of the stretch nothing is taken, so the picture keeps
++// near the middle of its lip-sync range on average. From there a cut or a
++// fade through black takes it at once, and a still picture too; from
++// three quarters on, a frame whose change is no more than the lowest seen
++// lately (by up to half again as the stretch runs out), so a step that has
++// to fall in a long pan still falls on its calmest frame. Scores measure how
++// much of the picture changes (avf_grid_score), so a frame where only a
++// small part moves ranks above a slow pan where everything does. At 1 the
++// step is taken whatever the frame (forced).
++static int avf_step_choice(struct avf_vsync_snap *s, int dir, double b,
++                           double *score)
++{
++    const struct avf_step_cand *c = &s->cand;
++    *score = -1;
++    if (!c->valid)
++        return b >= 1 ? AVF_STEP_FORCED : AVF_STEP_NONE;
++    *score = dir > 0 ? c->skip : c->repeat;
++    if (b >= 1)
++        return AVF_STEP_FORCED;
++    if (b < 0.5)
++        return AVF_STEP_NONE;
++    if (c->kind == 1)
++        return AVF_STEP_CUT;
++    if (c->kind == 2)
++        return AVF_STEP_BLACK;
++    if (*score <= AVF_STEP_STILL_MAX)
++        return AVF_STEP_STILL;
++    double best = dir > 0 ? s->best_skip : s->best_repeat;
++    if (b >= 0.75 && best > 0 && *score <= best * (1 + 2 * (b - 0.75)))
++        return AVF_STEP_LOW;
++    return AVF_STEP_NONE;
++}
++
++static void avf_step_note_scores(struct avf_vsync_snap *s)
++{
++    const struct avf_step_cand *c = &s->cand;
++    if (!c->valid || c->kind)
++        return;
++    // A minimum that forgets slowly: up by e every 5 minutes of 24 fps.
++    s->best_skip = s->best_skip > 0 ? fmin(c->skip, s->best_skip * (1 + 1.0 / 7200))
++                                    : c->skip;
++    s->best_repeat = s->best_repeat > 0
++        ? fmin(c->repeat, s->best_repeat * (1 + 1.0 / 7200)) : c->repeat;
++}
++
++// The refresh (an instant on the grid vsync_ns + k * period_ns) that the frame
++// planned for target_ns is shown on. vsync_ns is any refresh instant in the
++// stamps' clock. period_ns <= 0 means no grid: target_ns comes back.
++static int64_t avf_vsync_snap_refresh(struct avf_vsync_snap *s,
++                                      int64_t target_ns, int64_t vsync_ns,
++                                      int64_t period_ns)
++{
++    if (period_ns <= 0) {
++        s->locked = false;
++        return target_ns;
++    }
++    const double period = (double)period_ns;
++    // Planned time past the refresh at or before it, in [0, period).
++    int64_t off = target_ns - vsync_ns;
++    off -= avf_vsync_floor_div(off, period_ns) * period_ns;
++
++    int64_t dperiod = period_ns - s->period_ns;
++    if (dperiod < 0)
++        dperiod = -dperiod;
++    bool new_period = dperiod * 500 > s->period_ns;
++    // The grid moved under the lock (a window taken to another display of
++    // the same rate, a display that changed its timing): its refreshes are
++    // no longer where the lock's were.
++    int64_t moved = s->locked ? vsync_ns - s->grid_ns : 0;
++    moved -= avf_vsync_floor_div(moved, period_ns) * period_ns;
++    if (moved > period_ns / 2)
++        moved = period_ns - moved;
++    s->grid_ns = vsync_ns;
++    // The picture's lip-sync range, as lock_ns (planned - shown) values.
++    const double lo = -(double)(s->picture_late_ns > 0 ? s->picture_late_ns
++                                                       : AVF_AV_LATE_PICTURE_NS);
++    const double hi = (double)(s->picture_early_ns > 0 ? s->picture_early_ns
++                                                      : AVF_AV_EARLY_PICTURE_NS);
++    if (!s->locked || new_period || moved * 8 > period_ns ||
++        target_ns <= s->last_target_ns ||
++        target_ns - s->last_target_ns > AVF_VSYNC_SNAP_GAP_NS)
++    {
++        if (new_period) {
++            s->frame_ns = 0;
++            s->drift = s->drift_raw = 0;
++            s->drift_spans = 0;
++            s->best_skip = s->best_repeat = 0;
++        }
++        // New lock: the nearest refresh, offset in (-period/2, period/2];
++        // at one frame per refresh (known from before this lock), the
++        // refresh that puts the picture nearest the middle of its lip-sync
++        // range, which leaves the most room for drift either way.
++        s->locked = true;
++        s->period_ns = period_ns;
++        s->lock_ns = off > period_ns / 2 ? off - period_ns : off;
++        if (avf_vsync_one_to_one(s, period)) {
++            double mid = (lo + hi) / 2;
++            s->lock_ns += period * floor((mid - s->lock_ns) / period + 0.5);
++        }
++        s->frames = 0;
++        s->drift_t0 = 0;
++        s->relocks++;
++    } else {
++        double d = (double)(target_ns - s->last_target_ns);
++        s->frame_ns = s->frame_ns > 0 ? s->frame_ns + (d - s->frame_ns) / 16 : d;
++    }
++    s->last_target_ns = target_ns;
++
++    bool young = s->frames < AVF_VSYNC_SNAP_ALPHA_DIV;
++    // The drift, from the lock over 10 s spans once it has settled (240
++    // frames after it was taken). One span's noise is about 5 ppm, so a
++    // small drift is trusted after three spans in a row agree; a big one
++    // (over 50 ppm: 24 fps on 23.976 Hz is 1001) at once.
++    if (s->frames >= 240) {
++        if (!s->drift_t0) {
++            s->drift_t0 = target_ns;
++            s->drift_l0 = s->lock_ns;
++        } else if (target_ns - s->drift_t0 >= INT64_C(10000000000)) {
++            double rate = -(s->lock_ns - s->drift_l0) /
++                          ((target_ns - s->drift_t0) / 1e9) / 1e6;   // ms/s
++            bool same = (rate > 0) == (s->drift_raw > 0);
++            s->drift_spans = same ? s->drift_spans + 1 : 1;
++            s->drift_raw = s->drift_raw && same ? s->drift_raw + (rate - s->drift_raw) / 4
++                                                : rate;
++            if (s->drift_spans >= 3 || fabs(rate) > 0.05)
++                s->drift = s->drift_raw;
++            s->drift_t0 = target_ns;
++            s->drift_l0 = s->lock_ns;
++        }
++    }
++
++    // The step. The display shows a frame per refresh at its own rate and
++    // the sound plays at the audio clock's; where they differ (an Apple TV's
++    // 23.976 Hz mode measured 14 ppm slow against its audio, so a frame every
++    // 49 minutes), a frame has to be skipped or repeated now and then. The
++    // picture may drift within its lip-sync range (lo..hi) meanwhile, so
++    // the step can be taken anywhere in the stretch where it keeps the
++    // picture in range afterwards: two refreshes' worth of range less the
++    // step, 45 minutes at 14 ppm. avf_step_choice() picks the frame in that
++    // stretch; past the range the step is taken on the next frame anyway.
++    // It is applied before this frame's refresh is picked, so it falls
++    // between the frame before and this one.
++    if (!young) {
++        double av = -s->lock_ns;                // shown - planned
++        double span = -lo + hi - period;        // the stretch a step may use
++        double b_skip = (av - period + hi) / span;
++        double b_rep = (-lo - period - av) / span;
++        // The direction: the measured drift's. Without one (clocks locked,
++        // or not measured yet) no step is taken by choice, so locked clocks
++        // never step; a drift too small to measure reaches the end of the
++        // range only after hours (6 at 4 ppm).
++        int dir = s->drift > AVF_DRIFT_MIN ? 1 : s->drift < -AVF_DRIFT_MIN ? -1 : 0;
++        int kind = AVF_STEP_NONE;
++        double score = -1;
++        if (av > -lo) {
++            dir = 1;
++            kind = avf_step_choice(s, 1, 1, &score);
++        } else if (av < -hi) {
++            dir = -1;
++            kind = avf_step_choice(s, -1, 1, &score);
++        } else if (s->hold || span <= 0) {
++            // no step by choice
++        } else if (dir > 0 && b_skip >= 0) {
++            kind = avf_step_choice(s, 1, b_skip, &score);
++        } else if (dir < 0 && b_rep >= 0) {
++            kind = avf_step_choice(s, -1, b_rep, &score);
++        }
++        if (kind != AVF_STEP_NONE) {
++            s->lock_ns += dir > 0 ? period : -period;
++            s->drift_l0 += dir > 0 ? period : -period;
++            s->reslots++;
++            s->steps_by_kind[kind]++;
++            s->last_kind = kind;
++            s->last_score = score;
++            s->last_av_ns = av;
++        }
++    }
++    avf_step_note_scores(s);
++
++    // This frame's offset, taken within half a refresh of the lock.
++    int64_t k = (int64_t)floor((off - s->lock_ns) / period + 0.5);
++    int64_t r = off - k * period_ns;
++    // A frame near half a refresh from the lock could go to either refresh.
++    // That happens while a lock is young and has seen too few frames of a
++    // cadence to sit in the middle of their phases (the second frame of 24
++    // fps on 60 Hz is exactly half a refresh from the first): such a frame
++    // goes to the refresh nearer its planned time, which keeps the young
++    // lock inside its range instead of moving it a whole refresh.
++    if (young && fabs(r - s->lock_ns) > period * 7 / 16) {
++        int64_t other = r > s->lock_ns ? r - period_ns : r + period_ns;
++        if (llabs(other) < llabs(r))
++            r = other;
++    }
++
++    s->frames++;
++    int div = s->frames < AVF_VSYNC_SNAP_ALPHA_DIV ? s->frames
++                                                    : AVF_VSYNC_SNAP_ALPHA_DIV;
++    s->lock_ns += (r - s->lock_ns) / div;
++    if (young) {
++        // A young lock is still finding the middle of a cadence's phases;
++        // moving it a whole refresh then would be a skip or repeat of its own.
++        s->lock_ns = fmax(lo, fmin(hi, s->lock_ns));
++    }
++    return target_ns - r;
++}
++
++// When the VO hands the layer a frame stamped stamp_ns, at the earliest now_ns:
++// the next instant phase_ns past a refresh of the grid (vsync_ns + k *
++// period_ns), so every enqueue falls at the same point of the refresh however
++// mpv's schedule drifts against it. A wait that would leave the frame less
++// than min_lead_ns before its stamp is not made (now_ns comes back), nor is
++// one without a grid. The wait is under one refresh and changes nothing the
++// screen shows: the stamp alone decides the frame's refresh.
++static int64_t avf_vsync_pace_ns(int64_t now_ns, int64_t stamp_ns,
++                                 int64_t vsync_ns, int64_t period_ns,
++                                 int64_t phase_ns, int64_t min_lead_ns)
++{
++    if (period_ns <= 0)
++        return now_ns;
++    int64_t off = now_ns - vsync_ns - phase_ns;
++    off -= avf_vsync_floor_div(off, period_ns) * period_ns;  // [0, period)
++    int64_t at = off ? now_ns + (period_ns - off) : now_ns;
++    return stamp_ns - at < min_lead_ns ? now_ns : at;
++}
++
++// --avfoundation-vsync-snap-pace=auto: the enqueue point moves on by a quarter
++// refresh after two 5 s windows in a row in which the layer dropped frames
++// (at least AVF_VSYNC_PACE_BAD_DROPS, and 2% of what it showed). Moving it
++// shows nothing on screen (the stamps stay); it only stops an enqueue point
++// that a display with another timing than the two measured ones does not
++// take. Clean playback drops none in minutes.
++struct avf_vsync_pace {
++    double phase;           // enqueue point, share of a refresh past it
++    int bad_windows;
++    int steps;
++};
++
++#define AVF_VSYNC_PACE_BAD_DROPS 3
++#define AVF_VSYNC_PACE_MIN_FRAMES 48
++
++// One window of the layer's own counts; true when the point moved.
++static bool avf_vsync_pace_judge(struct avf_vsync_pace *s, int64_t shown,
++                                 int64_t dropped)
++{
++    if (shown + dropped < AVF_VSYNC_PACE_MIN_FRAMES)
++        return false;
++    bool bad = dropped >= AVF_VSYNC_PACE_BAD_DROPS &&
++               dropped * 50 >= shown + dropped;
++    s->bad_windows = bad ? s->bad_windows + 1 : 0;
++    if (s->bad_windows < 2)
++        return false;
++    s->bad_windows = 0;
++    s->phase += 0.25;
++    if (s->phase >= 1.0)
++        s->phase -= 1.0;
++    s->steps++;
++    return true;
++}
++
++// Whether a frame is one a repeat or skip can hide in, from the mean
++// absolute difference (diff, in 8-bit luma steps over a sparse grid) between
++// it and the frame before: a hard cut (far above the recent typical
++// difference, *typical, which this updates) or a still picture (no change
++// beyond the encoder's noise). 1: cut, 2: still, 0: neither.
++#define AVF_QUIET_CUT_MIN 12.0
++#define AVF_QUIET_CUT_RATIO 4.0
++#define AVF_QUIET_STILL_MAX 0.6
++
++static int avf_vsync_quiet_kind(double diff, double *typical)
++{
++    int kind = 0;
++    if (*typical > 0 && diff >= AVF_QUIET_CUT_MIN &&
++        diff >= *typical * AVF_QUIET_CUT_RATIO)
++        kind = 1;
++    else if (diff <= AVF_QUIET_STILL_MAX)
++        kind = 2;
++    // A cut does not count towards what is typical.
++    if (kind != 1)
++        *typical = *typical > 0 ? *typical + (diff - *typical) / 16 : fmax(diff, 0.1);
++    return kind;
++}
++
++// The display's refresh period from its link's timestamps: measured over a
++// run of them once it spans 12 refreshes, exact to nanoseconds over a long
++// run. A change of the link's own interval (a mode change: 23.976 to 60 Hz
++// and back when the TV sleeps and wakes) starts a new run and forgets the
++// old period. A gap (the link stopped while the app was in the background
++// or the display asleep, or the main thread stalled) keeps the run if the
++// timestamps still fall on its grid; if they came back at another phase,
++// a new run starts but the period measured before stays published until
++// the new run has its own, so the snap never loses its grid to a gap.
++// Returns the period, or (before any measurement) the link's interval when
++// interval_ok, else 0.
++struct avf_refresh_run {
++    int64_t start, nominal, last, period;
++};
++
++static int64_t avf_refresh_measure(struct avf_refresh_run *r, int64_t vsync,
++                                   int64_t nominal, bool interval_ok)
++{
++    if (nominal <= 0)
++        return 0;
++    if (!r->start || vsync <= r->last ||
++        llabs(nominal - r->nominal) * 200 > r->nominal)
++    {
++        bool same_mode = r->nominal && llabs(nominal - r->nominal) * 200 <= r->nominal;
++        *r = (struct avf_refresh_run){
++            .start = vsync, .nominal = nominal, .last = vsync,
++            .period = same_mode ? r->period : 0,
++        };
++    } else {
++        int64_t est = r->period ? r->period : nominal;
++        if (vsync - r->last > est * 5 / 2) {
++            // A gap: still on the run's grid?
++            int64_t span = vsync - r->start;
++            int64_t n = (span + est / 2) / est;
++            if (llabs(span - n * est) * 8 > est)
++                r->start = vsync;   // another phase: a new run, period kept
++        }
++        int64_t span = vsync - r->start;
++        int64_t n = (span + nominal / 2) / nominal;
++        if (n >= 12) {
++            int64_t measured = (span + n / 2) / n;
++            if (llabs(measured - nominal) * 100 <= nominal)
++                r->period = measured;
++            else
++                r->start = vsync;
++        }
++        r->last = vsync;
++    }
++    return r->period ? r->period : interval_ok ? nominal : 0;
++}
++
++// How much of the picture changes between two luma grids: the 75th
++// percentile of the per-cell absolute differences (8-bit steps). A slow pan
++// moves every cell a little and scores what each cell moved; a static shot
++// with a person talking moves a few cells a lot and scores the noise of the
++// rest. A step in the first is the classic visible judder; in the second it
++// is not seen.
++static double avf_grid_score(const uint8_t *a, const uint8_t *b, int n)
++{
++    int hist[256] = {0};
++    for (int i = 0; i < n; i++)
++        hist[abs((int)a[i] - (int)b[i])]++;
++    int want = n - n / 4, seen = 0;
++    for (int v = 0; v < 256; v++) {
++        seen += hist[v];
++        if (seen >= want)
++            return v;
++    }
++    return 255;
++}
++
++// A frame of the grid is black or uniform (the middle of a fade through
++// black, a title card's background): nothing moves in it to show a step.
++static bool avf_grid_flat(double mean, double sd)
++{
++    return sd <= 1.5 || (mean <= 24 && sd <= 4);
++}
++
++// Decoded (PCM) audio at one frame per refresh: rather than step a frame
++// now and then, play the sound faster or slower by the clocks' mismatch so
++// the picture never has to. The core resamples it (as for mpv's
++// display-resample; 14 ppm is 0.02 cents of pitch). This servo turns the
++// picture's offset from its planned time (av_ms, shown - planned) into that
++// speed, holding the offset at zero: the integral finds the mismatch, the
++// proportional part pulls a fresh lock in over about a minute. Its output is
++// capped at max_ppm; a bigger mismatch (24 fps on a 23.976 Hz mode is 1001
++// ppm) is left to the steps. dt_s is the time since the last call.
++struct avf_av_servo {
++    double integ;           // ms * s
++    double speed;           // last output, 1 = as recorded
++    bool saturated;         // at the cap: the steps must take the rest
++    double saturated_s;     // how long it has been at the cap
++    bool gave_up;           // a mismatch past the cap: steps only
++};
++
++// After this long at the cap the mismatch is taken to be past it (24 fps on
++// a 23.976 Hz mode): resampling stops and the steps hide it all, rather
++// than resampling and stepping fighting over the picture's offset.
++#define AVF_SERVO_GIVE_UP_S 60
++
++#define AVF_SERVO_KP 3.3e-5     // speed per ms of offset
++#define AVF_SERVO_KI 2.8e-7     // speed per ms*s of offset
++
++static double avf_av_servo_update(struct avf_av_servo *v, double av_ms,
++                                  double dt_s, double max_ppm)
++{
++    double cap = max_ppm * 1e-6;
++    if (v->gave_up) {
++        v->saturated = true;
++        v->speed = 1;
++        return v->speed;
++    }
++    if (dt_s > 0 && dt_s < 1) {
++        v->integ += av_ms * dt_s;
++        // No wind-up past what the cap can use.
++        double lim = cap / AVF_SERVO_KI;
++        v->integ = fmax(-lim, fmin(lim, v->integ));
++    }
++    double u = AVF_SERVO_KP * av_ms + AVF_SERVO_KI * v->integ;
++    // av > 0: the picture is behind, so the sound (and with it mpv's
++    // schedule) must slow down.
++    v->saturated = fabs(u) >= cap * 0.98;
++    // Time at the cap, forgotten four times slower than it builds, so a
++    // servo swung from one cap to the other by steps still counts.
++    if (dt_s > 0 && dt_s < 1)
++        v->saturated_s = fmax(0, v->saturated_s + (v->saturated ? dt_s : -dt_s / 4));
++    if (v->saturated_s >= AVF_SERVO_GIVE_UP_S) {
++        v->gave_up = true;
++        v->speed = 1;
++        return v->speed;
++    }
++    v->speed = 1 - fmax(-cap, fmin(cap, u));
++    return v->speed;
++}
++// --- end avf vsync snap ---
++
++// Where in the refresh a set of instants fell: their mean offset past the
++// refresh instant and their spread around it, taken against the window's
++// first one so that a phase near the instant does not wrap.
++struct avf_phase_stat {
++    int n;
++    double ref, sum, lo, hi;
++};
++
++// x and ref are offsets in [0, period); the result in (-period/2, period/2].
++static double avf_phase_diff(double x, double ref, double period)
++{
++    double d = fmod(x - ref, period);
++    if (d > period / 2)
++        d -= period;
++    if (d <= -period / 2)
++        d += period;
++    return d;
++}
++
++static void avf_phase_add(struct avf_phase_stat *s, double x, double period)
++{
++    if (!s->n) {
++        s->ref = x;
++        s->lo = s->hi = 0;
++    }
++    double d = avf_phase_diff(x, s->ref, period);
++    s->sum += d;
++    s->lo = MPMIN(s->lo, d);
++    s->hi = MPMAX(s->hi, d);
++    s->n++;
++}
++
++// Mean offset in [0, period), and the extremes as signed distances from it.
++static void avf_phase_get(const struct avf_phase_stat *s, double period,
++                          double *avg, double *lo, double *hi)
++{
++    double m = s->n ? s->sum / s->n : 0;
++    *avg = fmod(s->ref + m + period, period);
++    *lo = s->lo - m;
++    *hi = s->hi - m;
++}
++
++#define AVF_QUIET_GRID_W 32
++#define AVF_QUIET_GRID_H 18
++
++// The vsync snap's pacing lines, logged every 5 s (vsync_snap_report).
++struct avf_vsync_stats {
++    int64_t window_start_ns;
++    int frames, unsnapped, moved, uneven_a, uneven_b, uneven_s;
++    double shift_sum, shift_max;
++    int64_t period_ns, nominal_ns;
++    int relocks0, reslots0;
++    bool have_prev;
++    int64_t prev_err_a, prev_err_b, prev_err_s;
++    int prev_relocks;
++    // Offsets past the display link's refresh instant (ms in the log): of
++    // the planned times, of the stamps given to the layer, and of the
++    // enqueues; and the refreshes the frames went to (one frame each, two in
++    // one, or none in one: each a skip or a repeat).
++    struct avf_phase_stat planned, stamped, enqueued;
++    int occ_one, occ_two, occ_none;
++    int64_t prev_shown;
++    // Enqueue: lead before the stamp, and the pacing wait and readiness wait.
++    int enq;
++    double lead_min, lead_max, lead_sum, pace_sum, pace_max, ready_sum, ready_max;
++    // The layer's own counts at the window's start (-1: none read yet).
++    int64_t layer_total0, layer_dropped0;
++    // Frames sampled for cuts and stills, and what was found.
++    int sampled, cuts, stills, flats, unreadable;
++    bool frame_one_to_one;
++    double av_min, av_max;          // shown - planned, ns
++    int av_n;
++};
++
+ struct priv {
+     struct mp_hwdec_ctx hwctx;
+     struct m_config_cache *opts_cache;
+@@ -491,6 +1168,41 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+     int64_t next_present_host_ns;
+     // Latest host stamp given to a video frame; see avf_host_present_ns().
+     int64_t last_host_present_ns;
++    // Host mode: frames stamped inside their refresh ("avf vsync snap"). The
++    // refresh clock is an MPVDisplayRefreshClock (iOS/tvOS), made on the
++    // first frame that wants it.
++    id refresh_clock;
++    struct avf_vsync_snap vsync_snap;
++    struct avf_vsync_stats vsync_stats;
++    struct avf_vsync_pace vsync_pace;
++    bool vsync_paused;
++    // The frame flip_page will enqueue was snapped (host mode, a timed
++    // frame with a refresh clock): its planned time and stamp (mp_time_ns).
++    bool vsync_frame_snapped;
++    int64_t vsync_frame_planned_ns, vsync_frame_stamp_ns;
++    int64_t vsync_metrics_asked_ns;
++    int64_t vsync_pace_wait_ns;
++    double vsync_pace_opt;          // the pace-phase option last applied
++    // A sparse luma grid of the last frame, to find cuts and still pictures
++    // (vsync_frame_candidate).
++    uint8_t vsync_grid[2][AVF_QUIET_GRID_W * AVF_QUIET_GRID_H];
++    int vsync_grids;                // how many of them hold a frame
++    double vsync_grid_mean, vsync_grid_sd;  // of vsync_grid[0]
++    double vsync_typical_diff;
++    // Decoded audio at one frame per refresh: the speed asked of the core.
++    struct avf_av_servo vsync_servo;
++    double vsync_speed_sent;
++    int64_t vsync_servo_period;
++    int64_t vsync_servo_t;
++    // How late the video enqueue falls after the pacing point (smoothed),
++    // taken off the next wait.
++    double vsync_pace_late_ns;
++    int64_t vsync_pace_at_ns;
++    // Media mode: the snapped stamp for the next frame, in media time.
++    int64_t next_media_stamp_ns;
++    bool next_media_stamp_valid;
++    int64_t vsync_tb_offset_ns;     // layer timebase minus mp_time_ns()
++    int64_t vsync_tb_checked_ns;
+     int64_t next_media_pts_ns;
+     bool next_media_pts_valid;
+     double next_timebase_rate;
+@@ -1200,12 +1912,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+     if (p->presentation_host)
+         return p->next_present_host_ns > 0 ? p->next_present_host_ns
+                                            : mp_time_ns();
++    if (p->next_media_stamp_valid)
++        return p->next_media_stamp_ns;
+     return current_media_time_ns(p);
+ }
+ 
+ static void reset_media_timing(struct priv *p)
+ {
+     p->next_present_host_ns = 0;
++    p->next_media_stamp_valid = false;
+     p->next_media_pts_ns = 0;
+     p->next_media_pts_valid = false;
+     p->next_timebase_rate = 0.0;
+@@ -1288,6 +2003,723 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+ // of a new frame's target an already queued frame can be stamped.
+ #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
+ 
++// --- avf display refresh clock
++// The display's refresh instants for the vsync snap, from a CADisplayLink on
++// the main run loop. Its callback stores the latest refresh and the period
++// under `lock`; the VO thread only reads them, and never waits for the main
++// thread (see "avf main-thread link"): the link is made and torn down by
++// main-queue blocks the VO does not wait for. The period is measured over the
++// link's own timestamps once they span 12 refreshes, so a refresh extrapolated
++// a queue lead ahead stays exact to microseconds; a change of display mode
++// restarts the measurement.
++//
++// tvOS: a link at the display's own rate, which is the film's once the TV
++// has switched. iOS and macOS: a passive link asking for 15 callbacks a
++// second (AVF_REFRESH_LINK_HZ) so it never holds a ProMotion display at a
++// high rate; its timestamps still fall on refreshes, and the refresh interval
++// is the link's duration. macOS 14+ only: the link comes from the view
++// hosting the display layer (NSView's displayLink), which follows the window
++// to whichever display it is on; before the layer is in a view the clock
++// looks again once a second. Without a link the snap stays off.
++#define AVF_REFRESH_LINK_HZ 15
++@interface MPVDisplayRefreshClock : NSObject {
++@public
++    os_unfair_lock lock;
++    int64_t vsync_ns;    // lock: latest refresh, mp_time_ns() clock
++    int64_t period_ns;   // lock: refresh period (0 until the first callback)
++    int64_t nominal_ns;  // lock: the link's own refresh interval
++    // lock: the display layer's own counts (AVVideoPerformanceMetrics, tvOS
++    // and iOS 17.4, macOS 14.4), -1 until one has been read
++    int64_t layer_total, layer_dropped;
++    // Main thread only. A CADisplayLink (typed id: macOS has the class only
++    // from 14, and the engine deploys to 12).
++    id link;
++    CALayer *layer;      // macOS: the display layer, to find its view
++    bool stopped;
++    int attempts;
++    struct avf_refresh_run run;
++}
++- (void)refresh:(id)sender;
++- (void)tick:(CADisplayLink *)sender API_AVAILABLE(macos(14.0));
++@end
++
++@implementation MPVDisplayRefreshClock
++- (void)refresh:(id)sender
++{
++    if (@available(macOS 14.0, *))
++        [self tick:sender];
++}
++
++- (void)tick:(CADisplayLink *)sender
++{
++    // CACurrentMediaTime() and mp_time_ns() both count mach_absolute_time().
++    int64_t offset = mp_time_ns() - (int64_t)llround(CACurrentMediaTime() * 1e9);
++    int64_t vsync = (int64_t)llround(sender.timestamp * 1e9) + offset;
++#if TARGET_OS_TV
++    double interval = sender.targetTimestamp - sender.timestamp;
++    if (!(interval > 0))
++        interval = sender.duration;
++#else
++    // A passive link fires every few refreshes; duration is one refresh.
++    double interval = sender.duration;
++#endif
++    int64_t nominal = (int64_t)llround(interval * 1e9);
++    if (nominal <= 0)
++        return;
++    // tvOS: the link's own interval until measured. Elsewhere only a grid
++    // the timestamps have confirmed: an adaptive (ProMotion) display that
++    // runs below its duration's rate never confirms one, and the snap then
++    // stays off rather than snap to refreshes that are not there.
++    int64_t period = avf_refresh_measure(&run, vsync, nominal, TARGET_OS_TV);
++    os_unfair_lock_lock(&lock);
++    vsync_ns = vsync;
++    period_ns = period;
++    nominal_ns = nominal;
++    os_unfair_lock_unlock(&lock);
++}
++@end
++
++#if !TARGET_OS_IPHONE
++// The view whose layer tree holds `layer`, if it is in one.
++static NSView *avf_layer_view(CALayer *layer)
++{
++    for (CALayer *l = layer; l; l = l.superlayer) {
++        id delegate = l.delegate;
++        if ([delegate isKindOfClass:[NSView class]])
++            return delegate;
++    }
++    return nil;
++}
++#endif
++
++// Main thread: make the clock's link, or on macOS try again in a second
++// while the layer is not in a view yet (at most a minute).
++static void avf_refresh_clock_attach(MPVDisplayRefreshClock *clock)
++{
++    if (clock->stopped || clock->link)
++        return;
++    if (@available(macOS 14.0, *)) {
++        CADisplayLink *link = nil;
++#if TARGET_OS_IPHONE
++        link = [CADisplayLink displayLinkWithTarget:clock
++                                           selector:@selector(refresh:)];
++#else
++        NSView *view = avf_layer_view(clock->layer);
++        if (view)
++            link = [view displayLinkWithTarget:clock selector:@selector(refresh:)];
++        if (!link) {
++            if (++clock->attempts < 60) {
++                [clock retain];
++                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
++                               dispatch_get_main_queue(), ^{
++                    avf_refresh_clock_attach(clock);
++                    [clock release];
++                });
++            }
++            return;
++        }
++#endif
++#if !TARGET_OS_TV
++        if (@available(iOS 15.0, *)) {
++            link.preferredFrameRateRange = CAFrameRateRangeMake(
++                AVF_REFRESH_LINK_HZ / 2, AVF_REFRESH_LINK_HZ, AVF_REFRESH_LINK_HZ);
++        }
++#endif
++        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
++        clock->link = [link retain];
++    }
++}
++// --- end avf display refresh clock
++
++static void vsync_snap_start_clock(struct priv *p)
++{
++    if (p->refresh_clock || !p->displayLayer)
++        return;
++    MPVDisplayRefreshClock *clock = [[MPVDisplayRefreshClock alloc] init];
++    clock->lock = OS_UNFAIR_LOCK_INIT;
++    clock->layer_total = clock->layer_dropped = -1;
++    clock->layer = [p->displayLayer retain];
++    p->refresh_clock = clock;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        avf_refresh_clock_attach(clock);
++    });
++}
++
++// No wait: the main queue runs this after the block that made the link.
++static void vsync_snap_stop_clock(struct priv *p)
++{
++    MPVDisplayRefreshClock *clock = p->refresh_clock;
++    if (!clock)
++        return;
++    p->refresh_clock = nil;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        clock->stopped = true;
++        if (@available(macOS 14.0, *))
++            [(CADisplayLink *)clock->link invalidate];
++        [clock->link release];
++        clock->link = nil;
++        [clock->layer release];
++        clock->layer = nil;
++    });
++    [clock release];
++}
++
++// The latest refresh and the period, if the clock has a fresh one.
++static bool vsync_snap_grid(struct priv *p, int64_t now, int64_t *vsync,
++                            int64_t *period, int64_t *nominal)
++{
++    MPVDisplayRefreshClock *clock = p->refresh_clock;
++    if (!clock)
++        return false;
++    os_unfair_lock_lock(&clock->lock);
++    *vsync = clock->vsync_ns;
++    *period = clock->period_ns;
++    *nominal = clock->nominal_ns;
++    os_unfair_lock_unlock(&clock->lock);
++    // A main thread stalled for a second (or an app in the background, whose
++    // link stops) leaves no refresh to trust.
++    return *period > 0 && *vsync > 0 && now - *vsync < MP_TIME_MS_TO_NS(1000);
++}
++
++static int64_t vsync_mod(int64_t x, int64_t period)
++{
++    x -= avf_vsync_floor_div(x, period) * period;
++    return x;
++}
++
++// The display layer's own counts of frames shown and dropped, read about once
++// a second without waiting (the answer comes on another queue and is kept by
++// the refresh clock, which the block holds).
++static void vsync_snap_ask_layer(struct priv *p, int64_t now)
++{
++    MPVDisplayRefreshClock *clock = p->refresh_clock;
++    if (!clock || !p->displayLayer ||
++        now - p->vsync_metrics_asked_ns < MP_TIME_MS_TO_NS(1000))
++        return;
++    p->vsync_metrics_asked_ns = now;
++    if (@available(iOS 17.4, tvOS 17.4, macOS 14.4, *)) {
++        AVSampleBufferVideoRenderer *renderer = p->displayLayer.sampleBufferRenderer;
++        [clock retain];
++        [renderer loadVideoPerformanceMetricsWithCompletionHandler:
++            ^(AVVideoPerformanceMetrics *metrics) {
++                if (metrics) {
++                    os_unfair_lock_lock(&clock->lock);
++                    clock->layer_total = metrics.totalNumberOfFrames;
++                    clock->layer_dropped = metrics.numberOfDroppedFrames;
++                    os_unfair_lock_unlock(&clock->lock);
++                }
++                [clock release];
++            }];
++    }
++}
++
++static void vsync_snap_layer_counts(struct priv *p, int64_t *total,
++                                    int64_t *dropped)
++{
++    MPVDisplayRefreshClock *clock = p->refresh_clock;
++    *total = *dropped = -1;
++    if (!clock)
++        return;
++    os_unfair_lock_lock(&clock->lock);
++    *total = clock->layer_total;
++    *dropped = clock->layer_dropped;
++    os_unfair_lock_unlock(&clock->lock);
++}
++
++static void vsync_snap_report(struct vo *vo, int64_t now)
++{
++    struct priv *p = vo->priv;
++    struct avf_vsync_stats *st = &p->vsync_stats;
++
++    vsync_snap_ask_layer(p, now);
++    int64_t total, dropped;
++    vsync_snap_layer_counts(p, &total, &dropped);
++
++    if (!st->window_start_ns) {
++        st->window_start_ns = now;
++        st->layer_total0 = total;
++        st->layer_dropped0 = dropped;
++        return;
++    }
++    if (now - st->window_start_ns < MP_TIME_MS_TO_NS(5000))
++        return;
++    // The layer's counts over the window (a new layer starts them again).
++    int64_t lshown = -1, ldropped = -1;
++    if (st->layer_total0 >= 0 && total >= st->layer_total0 &&
++        dropped >= st->layer_dropped0)
++    {
++        ldropped = dropped - st->layer_dropped0;
++        lshown = total - st->layer_total0 - ldropped;
++        if (lshown < 0)
++            lshown = total - st->layer_total0;
++    }
++    bool paced = p->opts->vsync_snap == AVF_VSYNC_SNAP_YES &&
++                 p->opts->vsync_snap_pace != AVF_VSYNC_PACE_NO &&
++                 p->presentation_host;
++    bool moved_pace = false;
++    if (paced && p->opts->vsync_snap_pace == AVF_VSYNC_PACE_AUTO && lshown >= 0 &&
++        st->frames - st->unsnapped >= AVF_VSYNC_PACE_MIN_FRAMES)
++        moved_pace = avf_vsync_pace_judge(&p->vsync_pace, lshown, ldropped);
++    if (st->frames) {
++        int n = MPMAX(st->frames - st->unsnapped, 1);
++        static const char *const modes[] = {"off", "on", "measure"};
++        double per = MPMAX(st->period_ns, 1);
++        // Three lines, each short enough for a host that keeps 200 characters.
++        MP_VERBOSE(vo, "vsync-snap %s: %d frames/%.1fs (%d no refresh), refresh "
++                   "%.3f ms (link %.3f), lock %+.2f ms, layer %+.3f ms, moved=%d, "
++                   "shift avg %+.2f max %.2f ms, relocks=%d reslots=%d\n",
++                   modes[p->opts->vsync_snap], st->frames,
++                   (now - st->window_start_ns) / 1e9, st->unsnapped,
++                   st->period_ns / 1e6, st->nominal_ns / 1e6,
++                   -p->vsync_snap.lock_ns / 1e6, p->vsync_tb_offset_ns / 1e6,
++                   st->moved, st->shift_sum / n / 1e6, st->shift_max / 1e6,
++                   p->vsync_snap.relocks - st->relocks0,
++                   p->vsync_snap.reslots - st->reslots0);
++        // Offsets past the link's refresh instant: mean [spread around it].
++        double pa, pl, ph, sa, sl, sh, ea = 0, el = 0, eh = 0;
++        avf_phase_get(&st->planned, per, &pa, &pl, &ph);
++        avf_phase_get(&st->stamped, per, &sa, &sl, &sh);
++        if (st->enqueued.n)
++            avf_phase_get(&st->enqueued, per, &ea, &el, &eh);
++        MP_VERBOSE(vo, "vsync-snap phase (ms past refresh): planned %.2f [%+.2f %+.2f], "
++                   "stamp %.2f [%+.2f %+.2f], enqueue %.2f [%+.2f %+.2f], refreshes "
++                   "1:%d 2:%d 0:%d, uneven A=%d B=%d S=%d\n",
++                   pa / 1e6, pl / 1e6, ph / 1e6, sa / 1e6, sl / 1e6, sh / 1e6,
++                   ea / 1e6, el / 1e6, eh / 1e6, st->occ_one, st->occ_two, st->occ_none,
++                   st->uneven_a, st->uneven_b, st->uneven_s);
++        int ne = MPMAX(st->enq, 1);
++        MP_VERBOSE(vo, "vsync-snap pace %s %.2f: lead min %.1f avg %.1f max %.1f ms, "
++                   "pace wait avg %.1f max %.1f, ready wait avg %.1f max %.1f, layer "
++                   "shown %lld dropped %lld, steps=%d%s\n",
++                   paced ? (p->opts->vsync_snap_pace == AVF_VSYNC_PACE_AUTO ? "auto" : "yes")
++                         : "off", p->vsync_pace.phase,
++                   st->lead_min / 1e6, st->lead_sum / ne / 1e6, st->lead_max / 1e6,
++                   st->pace_sum / ne / 1e6, st->pace_max / 1e6,
++                   st->ready_sum / ne / 1e6, st->ready_max / 1e6,
++                   (long long)lshown, (long long)ldropped, p->vsync_pace.steps,
++                   moved_pace ? " (moved)" : "");
++        // Lip sync and steps: the picture's offset from its sound (+: the
++        // picture late, the sound early), the drift, the resampling asked
++        // and applied, and every step by where it was hidden.
++        const struct avf_vsync_snap *sn = &p->vsync_snap;
++        static const char *const kinds[] = {"-", "cut", "black", "still", "low", "forced"};
++        MP_VERBOSE(vo, "vsync-snap sync: av %+.1f..%+.1f ms, drift %+.1f ppm, resample "
++                   "%+.1f ppm%s; steps cut %d black %d still %d low %d forced %d, "
++                   "last %s %.2f at %+.1f ms; sampled %d cuts %d flat %d unread %d\n",
++                   st->av_n ? st->av_min / 1e6 : 0, st->av_n ? st->av_max / 1e6 : 0,
++                   sn->drift * 1000, (p->vsync_speed_sent ? p->vsync_speed_sent - 1 : 0) * 1e6,
++                   vo_get_audio_speed_applied(vo) ? " on" : " off",
++                   sn->steps_by_kind[AVF_STEP_CUT], sn->steps_by_kind[AVF_STEP_BLACK],
++                   sn->steps_by_kind[AVF_STEP_STILL], sn->steps_by_kind[AVF_STEP_LOW],
++                   sn->steps_by_kind[AVF_STEP_FORCED], kinds[sn->last_kind],
++                   sn->last_score, sn->last_av_ns / 1e6, st->sampled, st->cuts, st->flats,
++                   st->unreadable);
++    }
++    struct avf_vsync_stats next = {
++        .window_start_ns = now,
++        .relocks0 = p->vsync_snap.relocks,
++        .reslots0 = p->vsync_snap.reslots,
++        .have_prev = st->have_prev,
++        .prev_err_a = st->prev_err_a,
++        .prev_err_b = st->prev_err_b,
++        .prev_err_s = st->prev_err_s,
++        .prev_relocks = st->prev_relocks,
++        .prev_shown = st->prev_shown,
++        .layer_total0 = total,
++        .layer_dropped0 = dropped,
++    };
++    *st = next;
++}
++
++// Decoded audio at one frame per refresh: ask the core to play the sound at
++// the display's pace (avf_av_servo_update) instead of stepping the picture.
++// The core declines for passthrough, and the steps then stay in charge.
++static void vsync_snap_servo(struct vo *vo, int mode, int64_t period, int64_t target_ns)
++{
++    struct priv *p = vo->priv;
++    double speed = 0;
++    // Another display mode is another clock pair: learn its mismatch anew.
++    if (llabs(period - p->vsync_servo_period) * 500 > period) {
++        p->vsync_servo = (struct avf_av_servo){0};
++        p->vsync_servo_period = period;
++    }
++    bool use = mode == AVF_VSYNC_SNAP_YES && p->presentation_host &&
++               p->opts->vsync_snap_resample_ppm > 0 &&
++               avf_vsync_one_to_one(&p->vsync_snap, (double)period) &&
++               p->vsync_snap.frames >= AVF_VSYNC_SNAP_ALPHA_DIV;
++    if (use) {
++        double dt = p->vsync_servo_t ? (target_ns - p->vsync_servo_t) / 1e9 : 0;
++        // The integral only learns while the core applies the speed.
++        if (!vo_get_audio_speed_applied(vo))
++            dt = 0;
++        speed = avf_av_servo_update(&p->vsync_servo, -p->vsync_snap.lock_ns / 1e6,
++                                    dt, p->opts->vsync_snap_resample_ppm);
++        p->vsync_servo_t = target_ns;
++    } else {
++        p->vsync_servo_t = 0;
++    }
++    // Sent on a change of 1 ppm or more (or on and off).
++    if ((speed == 0) != (p->vsync_speed_sent == 0) ||
++        fabs(speed - p->vsync_speed_sent) >= 1e-6)
++    {
++        vo_set_audio_speed_hint(vo, speed);
++        p->vsync_speed_sent = speed;
++    }
++}
++
++// Host mode: the stamp for a frame mpv planned for target_ns (see "avf vsync
++// snap"). --avfoundation-vsync-snap=measure works out and logs the same
++// stamps without using them.
++static int64_t vsync_snap_frame(struct vo *vo, int64_t target_ns)
++{
++    struct priv *p = vo->priv;
++    int mode = p->opts->vsync_snap;
++    if (mode == AVF_VSYNC_SNAP_NO) {
++        avf_vsync_snap_unlock(&p->vsync_snap);
++        p->vsync_stats.have_prev = false;
++        if (p->vsync_speed_sent) {
++            vo_set_audio_speed_hint(vo, 0);
++            p->vsync_speed_sent = 0;
++        }
++        return target_ns;
++    }
++    vsync_snap_start_clock(p);
++
++    int64_t now = mp_time_ns();
++    struct avf_vsync_stats *st = &p->vsync_stats;
++    vsync_snap_report(vo, now);
++    st->frames++;
++
++    int64_t vsync, period, nominal;
++    if (p->vsync_paused || !vsync_snap_grid(p, now, &vsync, &period, &nominal)) {
++        st->unsnapped++;
++        st->have_prev = false;
++        avf_vsync_snap_unlock(&p->vsync_snap);
++        return target_ns;
++    }
++
++    // Refreshes in the stamps' clock: the layer shows a frame on the first
++    // refresh at which its timebase (mp_time_ns() plus the offset) has
++    // reached the stamp, so a refresh at V is a boundary at V + offset.
++    // (Media mode passes host times it worked out from the timebase itself.)
++    if (p->presentation_host && p->timebase &&
++        (!p->vsync_tb_checked_ns ||
++         now - p->vsync_tb_checked_ns >= MP_TIME_MS_TO_NS(1000)))
++    {
++        int64_t before = mp_time_ns();
++        int64_t tb = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++        int64_t after = mp_time_ns();
++        p->vsync_tb_offset_ns = tb - (before + (after - before) / 2);
++        p->vsync_tb_checked_ns = now;
++    }
++    if (p->presentation_host)
++        vsync += p->vsync_tb_offset_ns;
++
++    // While the core resamples the sound to follow the display (and the
++    // servo has room), the picture's offset is held there and no step is
++    // taken by choice.
++    p->vsync_snap.hold = vo_get_audio_speed_applied(vo) && !p->vsync_servo.saturated;
++    p->vsync_snap.picture_early_ns = MP_TIME_MS_TO_NS(p->opts->vsync_snap_sound_late_ms);
++    p->vsync_snap.picture_late_ns = MP_TIME_MS_TO_NS(p->opts->vsync_snap_sound_early_ms);
++    int64_t shown = avf_vsync_snap_refresh(&p->vsync_snap, target_ns, vsync,
++                                           period);
++    int64_t stamp = shown - (int64_t)llround(period * p->opts->vsync_snap_lead);
++    int64_t used = mode == AVF_VSYNC_SNAP_YES ? stamp : target_ns;
++
++    // Diagnostics: where in the refresh the planned time and the stamp the
++    // layer gets fall, and which refresh each frame goes to.
++    st->period_ns = period;
++    st->nominal_ns = nominal;
++    st->frame_one_to_one = p->vsync_snap.frame_ns > 0 &&
++                           fabs(p->vsync_snap.frame_ns - period) * 64 < period;
++    avf_phase_add(&st->planned, vsync_mod(target_ns - vsync, period), period);
++    avf_phase_add(&st->stamped, vsync_mod(used - vsync, period), period);
++    double shift = shown - target_ns;
++    st->shift_sum += shift;
++    st->shift_max = MPMAX(st->shift_max, fabs(shift));
++    st->av_min = st->av_n ? MPMIN(st->av_min, shift) : shift;
++    st->av_max = st->av_n ? MPMAX(st->av_max, shift) : shift;
++    st->av_n++;
++    vsync_snap_servo(vo, mode, period, target_ns);
++
++    // Where each frame lands against its planned time: stamped as planned,
++    // under rule A (the first refresh at or after the stamp) and rule B (the
++    // nearest refresh), and snapped. A frame whose offset changes by 3/4 of a
++    // refresh or more from the frame before it was a refresh early or late
++    // against it: a skip or a repeat. A cadence's own steps (half a refresh
++    // at 24 fps on 60 Hz, 0.6 at 25 on 60) stay under that.
++    int64_t err_a = vsync - target_ns -
++                    avf_vsync_floor_div(vsync - target_ns, period) * period;
++    int64_t err_b = err_a > period / 2 ? err_a - period : err_a;
++    int64_t err_s = shown - target_ns;
++    if (target_ns + err_a != shown)
++        st->moved++;
++    if (st->have_prev && st->prev_relocks == p->vsync_snap.relocks) {
++        int64_t big = period * 3 / 4;
++        st->uneven_a += llabs(err_a - st->prev_err_a) >= big;
++        st->uneven_b += llabs(err_b - st->prev_err_b) >= big;
++        st->uneven_s += llabs(err_s - st->prev_err_s) >= big;
++        // The snap's refreshes, one after the other: a step of one refresh
++        // per frame is one frame each; none, two frames in one refresh; more,
++        // refreshes left without a new frame. (A cadence such as 24 fps on
++        // 60 Hz counts its own longer steps here.)
++        int64_t step = (shown - st->prev_shown + period / 2) / period;
++        if (step == 1)
++            st->occ_one++;
++        else if (step <= 0)
++            st->occ_two++;
++        else
++            st->occ_none += (int)(step - 1);
++    }
++    st->have_prev = true;
++    st->prev_err_a = err_a;
++    st->prev_err_b = err_b;
++    st->prev_err_s = err_s;
++    st->prev_relocks = p->vsync_snap.relocks;
++    st->prev_shown = shown;
++
++    if (p->presentation_host) {
++        p->vsync_frame_snapped = true;
++        p->vsync_frame_planned_ns = target_ns;
++        p->vsync_frame_stamp_ns = used - p->vsync_tb_offset_ns;
++    }
++    return used;
++}
++
++// Sample the frame's luma on a sparse grid and work out what it offers as a
++// place to hide a step (struct avf_step_cand): a cut from the frame before
++// (avf_vsync_quiet_kind), the frame before being black or uniform, and the
++// change a skip or a repeat would make. Every format mpv gives this VO is
++// read: VideoToolbox's 8- and 10-bit biplanar, packed 4:2:2 and RGB
++// outputs, and the software formats query_format() takes. Only a buffer
++// that cannot be locked (or a compressed format nothing here asks for)
++// gives no candidate (counted as unreadable), and a step then waits for the
++// end of the lip-sync range.
++static struct avf_step_cand vsync_frame_candidate(struct vo *vo, struct mp_image *img)
++{
++    struct priv *p = vo->priv;
++    struct avf_step_cand cand = {0};
++    const uint8_t *base = NULL;
++    size_t stride = 0;
++    // A luma sample: `step` bytes per pixel, the value at byte `at` (8 bit)
++    // or as a little-endian 16-bit word shifted right by `shift`.
++    int w = 0, h = 0, step = 0, at = 0, shift = -1;
++    CVPixelBufferRef pb = NULL;
++    if (!img) {
++        p->vsync_grids = 0;
++        return cand;
++    }
++    if (img->imgfmt == IMGFMT_VIDEOTOOLBOX) {
++        pb = (CVPixelBufferRef)img->planes[3];
++        int plane = 0;
++        switch (pb ? CVPixelBufferGetPixelFormatType(pb) : 0) {
++        // 8-bit Y'CbCr, biplanar 4:2:0, 4:2:2, 4:4:4 (what VideoToolbox gives
++        // for 8-bit H.264 and HEVC: FFmpeg asks it for NV12).
++        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
++        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
++        case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
++        case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
++        case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
++        case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
++            step = 1;
++            break;
++        // 10-bit, MSB-aligned in 16 bits (10-bit HEVC, HDR10 and Dolby
++        // Vision 5/8: FFmpeg asks for P010), 4:2:0, 4:2:2, 4:4:4.
++        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
++        case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
++        case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
++        case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
++        case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
++        case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
++            step = 2;
++            shift = 8;
++            break;
++        // Packed 4:2:2: Y in every second byte.
++        case kCVPixelFormatType_422YpCbCr8:         // '2vuy' (UYVY)
++            step = 2;
++            at = 1;
++            break;
++        case kCVPixelFormatType_422YpCbCr8_yuvs:    // 'yuvs' (YUYV)
++            step = 2;
++            break;
++        // RGB: green stands in for luma.
++        case kCVPixelFormatType_32BGRA:
++        case kCVPixelFormatType_32ARGB:
++            step = 4;
++            at = CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA ? 1 : 2;
++            break;
++        }
++        // Compressed (lossless/lossy AGX) and other formats are not CPU
++        // readable: FFmpeg never asks VideoToolbox for them.
++        if (step && CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
++            bool planar = CVPixelBufferIsPlanar(pb);
++            base = planar ? CVPixelBufferGetBaseAddressOfPlane(pb, plane)
++                          : CVPixelBufferGetBaseAddress(pb);
++            stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(pb, plane)
++                            : CVPixelBufferGetBytesPerRow(pb);
++            w = (int)(planar ? CVPixelBufferGetWidthOfPlane(pb, plane) : CVPixelBufferGetWidth(pb));
++            h = (int)(planar ? CVPixelBufferGetHeightOfPlane(pb, plane) : CVPixelBufferGetHeight(pb));
++        } else {
++            pb = NULL;
++        }
++    } else if (img->imgfmt == IMGFMT_NV12 || img->imgfmt == IMGFMT_420P ||
++               img->imgfmt == IMGFMT_P010 || img->imgfmt == imgfmt_420p10() ||
++               img->imgfmt == imgfmt_420p12()) {
++        // Software decoding (AV1, VP9, anything VideoToolbox does not take).
++        step = img->imgfmt == IMGFMT_NV12 || img->imgfmt == IMGFMT_420P ? 1 : 2;
++        shift = img->imgfmt == IMGFMT_P010 ? 8 : img->imgfmt == imgfmt_420p10() ? 2
++              : img->imgfmt == imgfmt_420p12() ? 4 : -1;
++        base = img->planes[0];
++        stride = img->stride[0] > 0 ? img->stride[0] : 0;
++        w = img->w;
++        h = img->h;
++    }
++    if (!base || !stride || w < AVF_QUIET_GRID_W || h < AVF_QUIET_GRID_H) {
++        if (pb)
++            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
++        p->vsync_grids = 0;
++        p->vsync_stats.unreadable++;
++        return cand;
++    }
++    enum { N = AVF_QUIET_GRID_W * AVF_QUIET_GRID_H };
++    uint8_t grid[N];
++    double sum = 0, sum2 = 0;
++    for (int y = 0; y < AVF_QUIET_GRID_H; y++) {
++        const uint8_t *row = base + stride * (size_t)((2 * y + 1) * h / (2 * AVF_QUIET_GRID_H));
++        for (int x = 0; x < AVF_QUIET_GRID_W; x++) {
++            const uint8_t *px = row + (size_t)((2 * x + 1) * w / (2 * AVF_QUIET_GRID_W)) * step;
++            uint8_t v = shift < 0 ? px[at]
++                                  : (uint8_t)MPMIN(255, (px[0] | px[1] << 8) >> shift);
++            grid[y * AVF_QUIET_GRID_W + x] = v;
++            sum += v;
++            sum2 += (double)v * v;
++        }
++    }
++    if (pb)
++        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
++    double mean = sum / N, sd = sqrt(fmax(0, sum2 / N - mean * mean));
++    // vsync_grid[0] is the frame before, [1] the one before that.
++    if (p->vsync_grids >= 2) {
++        double d1 = 0;
++        for (int i = 0; i < N; i++)
++            d1 += abs((int)grid[i] - (int)p->vsync_grid[0][i]);
++        d1 /= N;
++        int kind = avf_vsync_quiet_kind(d1, &p->vsync_typical_diff);
++        cand.valid = true;
++        cand.kind = kind == 1 ? 1 : avf_grid_flat(p->vsync_grid_mean, p->vsync_grid_sd) ? 2 : 0;
++        cand.repeat = avf_grid_score(grid, p->vsync_grid[0], N);
++        cand.skip = avf_grid_score(grid, p->vsync_grid[1], N);
++        struct avf_vsync_stats *st = &p->vsync_stats;
++        st->sampled++;
++        st->cuts += cand.kind == 1;
++        st->flats += cand.kind == 2;
++        st->stills += kind == 2;
++    }
++    memcpy(p->vsync_grid[1], p->vsync_grid[0], N);
++    memcpy(p->vsync_grid[0], grid, N);
++    p->vsync_grid_mean = mean;
++    p->vsync_grid_sd = sd;
++    p->vsync_grids = MPMIN(p->vsync_grids + 1, 2);
++    return cand;
++}
++
++// Host mode, in flip_page: hold a snapped frame until the pacing point of the
++// refresh (see avf_vsync_pace_ns()), then note where its enqueue fell. Called
++// just before the frame goes to the layer (ready_wait: how long flip_page
++// waited for the layer to take more) and, with pace, also at flip_page's start.
++#define AVF_VSYNC_PACE_MIN_LEAD_NS MP_TIME_MS_TO_NS(40)
++
++static void vsync_pace_wait(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    p->vsync_pace_wait_ns = 0;
++    if (!p->vsync_frame_snapped || p->opts->vsync_snap != AVF_VSYNC_SNAP_YES ||
++        p->opts->vsync_snap_pace == AVF_VSYNC_PACE_NO)
++        return;
++    int64_t now = mp_time_ns(), vsync, period, nominal;
++    if (!vsync_snap_grid(p, now, &vsync, &period, &nominal))
++        return;
++    // A fixed point, or auto's starting one: the option (again when set).
++    if (p->opts->vsync_snap_pace == AVF_VSYNC_PACE_YES ||
++        p->opts->vsync_snap_pace_phase != p->vsync_pace_opt)
++    {
++        p->vsync_pace.phase = p->opts->vsync_snap_pace_phase;
++        p->vsync_pace_opt = p->opts->vsync_snap_pace_phase;
++        p->vsync_pace.bad_windows = 0;
++    }
++    // Aimed early by how late the enqueue has been after the point (the
++    // OSD enqueue and the readiness check between them, a few ms).
++    int64_t phase = (int64_t)llround(period * p->vsync_pace.phase) -
++                    (int64_t)p->vsync_pace_late_ns;
++    int64_t at = avf_vsync_pace_ns(now, p->vsync_frame_stamp_ns, vsync, period,
++                                   phase, AVF_VSYNC_PACE_MIN_LEAD_NS);
++    p->vsync_pace_at_ns = at > now ? at + (int64_t)p->vsync_pace_late_ns : 0;
++    if (at > now) {
++        mp_sleep_ns(at - now);
++        p->vsync_pace_wait_ns = at - now;
++    }
++}
++
++static void vsync_note_enqueue(struct vo *vo, int64_t ready_wait_ns)
++{
++    struct priv *p = vo->priv;
++    if (!p->vsync_frame_snapped)
++        return;
++    p->vsync_frame_snapped = false;
++    struct avf_vsync_stats *st = &p->vsync_stats;
++    int64_t now = mp_time_ns(), vsync, period, nominal;
++    if (!vsync_snap_grid(p, now, &vsync, &period, &nominal))
++        return;
++    avf_phase_add(&st->enqueued, vsync_mod(now - vsync, period), period);
++    if (p->vsync_pace_at_ns) {
++        double late = (double)(now - p->vsync_pace_at_ns);
++        late = fmax(-2e6, fmin(10e6, late));
++        p->vsync_pace_late_ns = fmax(0, fmin(8e6, p->vsync_pace_late_ns +
++                                     (late - 0) / 16));
++        p->vsync_pace_at_ns = 0;
++    }
++    double lead = p->vsync_frame_stamp_ns - now;
++    st->lead_min = st->enq ? MPMIN(st->lead_min, lead) : lead;
++    st->lead_max = st->enq ? MPMAX(st->lead_max, lead) : lead;
++    st->lead_sum += lead;
++    st->pace_sum += p->vsync_pace_wait_ns;
++    st->pace_max = MPMAX(st->pace_max, p->vsync_pace_wait_ns);
++    st->ready_sum += ready_wait_ns;
++    st->ready_max = MPMAX(st->ready_max, ready_wait_ns);
++    st->enq++;
++}
++
++// Media mode: the layer shows a frame when its media timebase reaches the
++// frame's media PTS. The timebase runs at the servo's rate from its anchor,
++// so the host time that happens at is known; that host time is snapped as in
++// host mode and mapped back through the same timebase. The servo's rate
++// changes (100 ppm steps, at most every 200 ms) move it by microseconds over
++// a queue lead. Not before the timebase is anchored and running: the first
++// frame after a reset, a pause or a re-anchor keeps its PTS.
++static void vsync_snap_media_frame(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    double rate = p->timebase_applied_rate;
++    if (!p->timebase || !p->timebase_anchor_valid || p->playback_paused ||
++        !(rate > 0.0))
++    {
++        avf_vsync_snap_unlock(&p->vsync_snap);
++        p->vsync_stats.have_prev = false;
++        return;
++    }
++    int64_t before = mp_time_ns();
++    int64_t tb = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++    int64_t after = mp_time_ns();
++    int64_t now = before + (after - before) / 2;
++    int64_t target = now + (int64_t)llround((p->next_media_pts_ns - tb) / rate);
++    int64_t stamp = vsync_snap_frame(vo, target);
++    if (stamp != target) {
++        p->next_media_stamp_ns = p->next_media_pts_ns +
++                                 (int64_t)llround((stamp - target) * rate);
++        p->next_media_stamp_valid = true;
++    }
++}
++
+ static void update_media_timebase_for_frame(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -5175,7 +6607,14 @@ static void flip_page(struct vo *vo)
+ 
+         bool osd_enqueued = !osd_needed;
+ 
++        // A snapped frame waits for its point of the refresh, with its OSD
++        // and video samples made, so that what goes to the layer goes there
++        // ("avf vsync snap").
++        if (video_buf)
++            vsync_pace_wait(vo);
++        int64_t ready_start = mp_time_ns();
+         if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
++            int64_t ready_wait = mp_time_ns() - ready_start;
+             if (!p->presentation_host)
+                 update_media_timebase_for_frame(vo);
+ 
+@@ -5199,8 +6638,10 @@ static void flip_page(struct vo *vo)
+                 }
+             }
+ 
++            vsync_note_enqueue(vo, ready_wait);
+             enqueue_video_sample(vo, video_buf);
+         }
++        p->vsync_frame_snapped = false;
+ 
+         if (osd_needed && !osd_enqueued)
+             p->osd_change_id = 0;
+@@ -5265,7 +6706,14 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ 
+     p->next_pts = pts;
+     p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
++    p->vsync_frame_snapped = false;
+     if (p->presentation_host) {
++        // A redraw or a still frame (paused, stepping) is shown at once.
++        if (frame->pts > 0 && !frame->redraw && !frame->still) {
++            if (p->opts->vsync_snap != AVF_VSYNC_SNAP_NO)
++                p->vsync_snap.cand = vsync_frame_candidate(vo, frame->current);
++            p->next_present_host_ns = vsync_snap_frame(vo, p->next_present_host_ns);
++        }
+         // Queue slack lets a frame be stamped that much further ahead.
+         p->next_present_host_ns = avf_host_present_ns(
+             p->last_host_present_ns, p->next_present_host_ns,
+@@ -5288,6 +6736,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
+             &p->next_timebase_rate);
+     }
++    p->next_media_stamp_valid = false;
++    if (!p->presentation_host && p->next_media_pts_valid && !frame->redraw &&
++        !frame->still && p->opts->vsync_snap != AVF_VSYNC_SNAP_NO)
++        vsync_snap_media_frame(vo);
+     ahead_file_frame(vo, frame);
+     return true;
+ }
+@@ -5369,6 +6821,8 @@ static void uninit(struct vo *vo)
+     sample_buffer_renderer_flush(p->displayLayer);
+     sample_buffer_renderer_flush(p->osdLayer);
+ 
++    vsync_snap_stop_clock(p);
++
+     // No wait for the main thread: the host may be destroying this player
+     // from it (mpv_terminate_destroy() joins this thread). The observers,
+     // the layers' timebase and the link's own references go to a main-queue
+@@ -5505,6 +6959,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         p->geometry_render_failure_logged = false;
+         bool was_paused = p->playback_paused;
+         reset_media_timing(p);
++        avf_vsync_snap_unlock(&p->vsync_snap);
++        p->vsync_stats.have_prev = false;
++        p->vsync_tb_checked_ns = 0;
++        p->vsync_grids = 0;
+         p->playback_paused = was_paused;
+         sample_buffer_renderer_flush(p->displayLayer);
+         if (p->presentation_host && p->timebase) {
+@@ -5519,11 +6977,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         clear_osd_layer(vo);
+         return VO_TRUE;
+     case VOCTRL_PAUSE:
++        p->vsync_paused = true;
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, true);
+         ahead_set_paused(p, true);
+         return VO_TRUE;
+     case VOCTRL_RESUME:
++        // Playback resumes on a new schedule: learn its phase again.
++        p->vsync_paused = false;
++        avf_vsync_snap_unlock(&p->vsync_snap);
++        p->vsync_stats.have_prev = false;
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, false);
+         ahead_set_paused(p, false);
+@@ -5565,6 +7028,34 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     // Rasterize the OSD at the video's pixel density instead of the
+     // display's (1:1 over the on-screen video rect).
+     {"osd-video-res", OPT_BOOL(osd_video_res)},
++    // Host mode: stamp each frame a fixed share of a refresh before the
++    // refresh it is shown on, chosen with hysteresis, instead of at its
++    // planned time, and enqueue it at a fixed point of the refresh ("avf
++    // vsync snap"); measure only logs what it would do.
++    {"vsync-snap", OPT_CHOICE(vsync_snap,
++        {"no", AVF_VSYNC_SNAP_NO},
++        {"yes", AVF_VSYNC_SNAP_YES},
++        {"measure", AVF_VSYNC_SNAP_MEASURE})},
++    // How far before its refresh a snapped frame is stamped, in refreshes.
++    {"vsync-snap-lead", OPT_DOUBLE(vsync_snap_lead), M_RANGE(0.05, 0.95)},
++    // Host mode with the snap on: hand each frame to the layer at a fixed
++    // point of the refresh (yes), at one that moves on by a quarter refresh
++    // when the layer drops frames (auto), or on mpv's schedule (no).
++    {"vsync-snap-pace", OPT_CHOICE(vsync_snap_pace,
++        {"no", AVF_VSYNC_PACE_NO},
++        {"yes", AVF_VSYNC_PACE_YES},
++        {"auto", AVF_VSYNC_PACE_AUTO})},
++    // That point, as a share of a refresh past the display link's instant.
++    {"vsync-snap-pace-phase", OPT_DOUBLE(vsync_snap_pace_phase), M_RANGE(0.0, 0.99)},
++    // Decoded audio at one frame per refresh: resample the sound by up to
++    // this many ppm to follow the display, so the picture never steps
++    // (0: off; the steps then hide the drift as with passthrough).
++    {"vsync-snap-resample-ppm", OPT_DOUBLE(vsync_snap_resample_ppm), M_RANGE(0, 2000)},
++    // How far the picture may run ahead of its sound (the sound late) and
++    // behind it (the sound early) while a passthrough step waits for a
++    // place to hide; see AVF_AV_*_PICTURE_NS.
++    {"vsync-snap-sound-late-ms", OPT_INT(vsync_snap_sound_late_ms), M_RANGE(20, 90)},
++    {"vsync-snap-sound-early-ms", OPT_INT(vsync_snap_sound_early_ms), M_RANGE(10, 40)},
+     {0},
+ };
+ 
+@@ -5579,6 +7070,24 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         // against mpv's audio-slaved schedule (plezy#1776).
+         .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
+                                      : AVF_PRESENTATION_MEDIA,
++        // tvOS: an Apple TV drops frames while the VO's enqueues fall in one
++        // part of the refresh, which mpv's audio-clock schedule may put them
++        // in for minutes at a time; see "avf vsync snap". iOS and macOS run
++        // media mode, where only the stamps are snapped (there is no pacing),
++        // and on a 120 Hz iPad Pro that dropped about a quarter of the frames
++        // (the cause is not known; a ProMotion display may not show video on
++        // the grid its link reports). Off there; measure shows what it would do.
++        .vsync_snap = TARGET_OS_TV ? AVF_VSYNC_SNAP_YES : AVF_VSYNC_SNAP_NO,
++        .vsync_snap_lead = 0.25,
++        // Enqueues 9 to 27 ms past the instant were clean on both Apple TVs
++        // measured (see "avf vsync snap"); 0.42 is the middle, 17.5 ms at
++        // 23.976 Hz.
++        .vsync_snap_pace = AVF_VSYNC_PACE_AUTO,
++        .vsync_snap_pace_phase = 0.42,
++        .vsync_snap_resample_ppm = 500,
++        // EBU R37's sound-late limit, and well inside its sound-early one.
++        .vsync_snap_sound_late_ms = 60,
++        .vsync_snap_sound_early_ms = 25,
+     },
+ };
+ 

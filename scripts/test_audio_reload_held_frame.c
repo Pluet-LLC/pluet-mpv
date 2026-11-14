@@ -149,6 +149,16 @@ static void mp_output_chain_reset_harder(struct mp_output_chain *c) { c->resets+
 static void mp_decoder_wrapper_set_spdif_flag(struct mp_decoder_wrapper *d, bool f) { (void)d; (void)f; }
 static bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d) { (void)d; return true; }
 static void error_on_track(struct MPContext *mpctx, struct track *t) { (void)mpctx; (void)t; }
+#ifdef HAVE_SPDIF_BACKOFF
+// The Apple series (0303) asks whether passthrough is backed off for this
+// route before retrying it; nothing here is.
+static bool spdif_backed_off(struct MPContext *mpctx, struct track *t)
+{
+    (void)mpctx;
+    (void)t;
+    return false;
+}
+#endif
 
 static void ao_process(struct mp_filter *f);
 void reload_audio_output(struct MPContext *mpctx);
