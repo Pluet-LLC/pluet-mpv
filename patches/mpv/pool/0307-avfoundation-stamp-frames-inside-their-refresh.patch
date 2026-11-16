@@ -322,7 +322,7 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..f7fe15b 100644
+index 2b644cd..ebf2a2f 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,8 @@
@@ -1259,7 +1259,7 @@ index 2b644cd..f7fe15b 100644
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1404,47 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1404,48 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -1280,6 +1280,7 @@ index 2b644cd..f7fe15b 100644
 +    int64_t vsync_pace_wait_ns;
 +    double vsync_pace_opt;          // the pace-phase option last applied
 +    int64_t vsync_pace_period;      // the refresh period the point is for (0: none yet)
++    const char *vsync_pace_origin;  // where the starting point came from (log)
 +    // What an OSD enqueue ahead of the video's takes (smoothed), taken off
 +    // the wait of a frame that carries one.
 +    double vsync_osd_enqueue_ns;
@@ -1307,7 +1308,7 @@ index 2b644cd..f7fe15b 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +2154,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +2155,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1323,7 +1324,7 @@ index 2b644cd..f7fe15b 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2245,909 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2246,911 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -1689,11 +1690,12 @@ index 2b644cd..f7fe15b 100644
 +        int ns = MPMAX(st->sampled + st->unreadable, 1);
 +        MP_VERBOSE(vo, "vsync-snap work: start %.2f [%+.2f %+.2f] ms past refresh, "
 +                   "luma %s avg %.0f max %.0f us, layer asked %d (every %d ms), "
-+                   "drops seen at s: %s\n",
++                   "drops seen at s: %s, pace started from the %s\n",
 +                   wa / 1e6, wl / 1e6, wh / 1e6,
 +                   p->opts->vsync_snap_sample ? "read" : "not read",
 +                   st->sample_ns / (double)ns / 1e3, st->sample_max_ns / 1e3,
-+                   st->asks, p->opts->vsync_snap_ask_ms, marks);
++                   st->asks, p->opts->vsync_snap_ask_ms, marks,
++                   p->vsync_pace_origin ? p->vsync_pace_origin : "-");
 +    }
 +    struct avf_vsync_stats next = {
 +        .window_start_ns = now,
@@ -2082,11 +2084,6 @@ index 2b644cd..f7fe15b 100644
 +                avf_vsync_pace_parse(&p->vsync_pace, state);
 +    }
 +    fclose(f);
-+    if (found) {
-+        MP_VERBOSE(vo, "vsync-snap pace: starting at the saved point %.3f (%s)\n",
-+                   p->vsync_pace.phase,
-+                   p->vsync_pace.held ? "held" : p->vsync_pace.rest ? "rest" : "search");
-+    }
 +    return found;
 +}
 +
@@ -2135,9 +2132,15 @@ index 2b644cd..f7fe15b 100644
 +    p->vsync_pace_opt = opt;
 +    if (opt >= 0) {
 +        avf_vsync_pace_start(&p->vsync_pace, opt);
-+    } else if (!vsync_pace_load(vo, period)) {
++        p->vsync_pace_origin = "option";
++    } else if (vsync_pace_load(vo, period)) {
++        p->vsync_pace_origin = "file";
++    } else {
 +        avf_vsync_pace_start(&p->vsync_pace, vsync_pace_device_default());
++        p->vsync_pace_origin = "default";
 +    }
++    MP_VERBOSE(vo, "vsync-snap pace: starting at %.3f, from the %s (refresh %.3f ms)\n",
++               p->vsync_pace.phase, p->vsync_pace_origin, period / 1e6);
 +}
 +
 +static void vsync_pace_wait(struct vo *vo, bool with_osd)
@@ -2233,7 +2236,7 @@ index 2b644cd..f7fe15b 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -5175,14 +7035,25 @@ static void flip_page(struct vo *vo)
+@@ -5175,14 +7038,25 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
@@ -2260,7 +2263,7 @@ index 2b644cd..f7fe15b 100644
                  if (osd_enqueued) {
                      p->osd_needs_enqueue = false;
                      if (osd_buf_has_subtitle)
-@@ -5199,8 +7070,10 @@ static void flip_page(struct vo *vo)
+@@ -5199,8 +7073,10 @@ static void flip_page(struct vo *vo)
                  }
              }
  
@@ -2271,7 +2274,7 @@ index 2b644cd..f7fe15b 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,7 +7138,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,7 +7141,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
@@ -2296,7 +2299,7 @@ index 2b644cd..f7fe15b 100644
          // Queue slack lets a frame be stamped that much further ahead.
          p->next_present_host_ns = avf_host_present_ns(
              p->last_host_present_ns, p->next_present_host_ns,
-@@ -5288,6 +7178,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +7181,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -2307,7 +2310,7 @@ index 2b644cd..f7fe15b 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +7263,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7266,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -2316,7 +2319,7 @@ index 2b644cd..f7fe15b 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,6 +7401,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,6 +7404,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -2327,7 +2330,7 @@ index 2b644cd..f7fe15b 100644
          p->playback_paused = was_paused;
          sample_buffer_renderer_flush(p->displayLayer);
          if (p->presentation_host && p->timebase) {
-@@ -5519,11 +7419,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7422,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -2344,7 +2347,7 @@ index 2b644cd..f7fe15b 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7470,45 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7473,45 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -2390,7 +2393,7 @@ index 2b644cd..f7fe15b 100644
      {0},
  };
  
-@@ -5579,6 +7523,27 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7526,27 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,
