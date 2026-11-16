@@ -219,6 +219,8 @@ went into the same slot, leaving the next one empty. Now one frame per
 slot is a tested rule (avf_vsync_pace_slot_ns()), the wait is aimed early
 by at most 1 ms of the enqueue's learned lateness, and with the OSD sample
 ahead of the video's the video sample still waits for its point.
+The pace file's lines are now tagged "pace2"; "pace1" lines (points that
+build walked off clean ones on subtitle drops) are neither read nor kept.
 
 
 scripts/test_avf_vsync_snap.sh compiles the snap and the pacing from the
@@ -344,7 +346,7 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..42196d1 100644
+index 2b644cd..5c23cb4 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,9 @@
@@ -392,7 +394,7 @@ index 2b644cd..42196d1 100644
  };
  
  // --- avf sync servo core (host-testable; keep freestanding) ---
-@@ -476,6 +507,927 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -476,6 +507,982 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
  }
  // --- end avf sync servo core ---
  
@@ -1068,6 +1070,61 @@ index 2b644cd..42196d1 100644
 +    return true;
 +}
 +
++// --avfoundation-vsync-snap-pace-file: what auto pacing learned, one line
++// per display mode, "pace2 <refresh period, us> <state>". Lines of other
++// versions are neither read nor kept: "pace1" lines were written by a build
++// that counted subtitle drops against the point, and hold points walked off
++// clean ones (and clean ones marked bad).
++#define AVF_PACE_FILE_TAG "pace2 "
++
++static bool avf_vsync_pace_file_line(const char *line, long *us, const char **state)
++{
++    size_t tag = strlen(AVF_PACE_FILE_TAG);
++    int used = 0;
++    if (strncmp(line, AVF_PACE_FILE_TAG, tag) != 0 ||
++        sscanf(line + tag, "%ld%n", us, &used) != 1 || *us <= 0)
++        return false;
++    *state = line + tag + used;
++    return true;
++}
++
++static bool avf_vsync_pace_file_same_mode(long us, int64_t period)
++{
++    return llabs(us * 1000 - period) * 200 <= period;
++}
++
++// The state saved for the display mode with this refresh period, if any.
++static bool avf_vsync_pace_file_read(FILE *in, int64_t period, struct avf_vsync_pace *s)
++{
++    char line[512];
++    while (in && fgets(line, sizeof(line), in)) {
++        long us;
++        const char *state;
++        if (avf_vsync_pace_file_line(line, &us, &state) &&
++            avf_vsync_pace_file_same_mode(us, period) && avf_vsync_pace_parse(s, state))
++            return true;
++    }
++    return false;
++}
++
++// The file as it is to be rewritten: the other modes' lines of this
++// version kept, this mode's line replaced by s.
++static void avf_vsync_pace_file_write(FILE *in, FILE *out, int64_t period,
++                                      const struct avf_vsync_pace *s)
++{
++    char line[512];
++    while (in && fgets(line, sizeof(line), in)) {
++        long us;
++        const char *state;
++        if (avf_vsync_pace_file_line(line, &us, &state) &&
++            !avf_vsync_pace_file_same_mode(us, period))
++            fputs(line, out);
++    }
++    char state[400];
++    avf_vsync_pace_print(s, state, sizeof(state));
++    fprintf(out, AVF_PACE_FILE_TAG "%ld %s\n", (long)(period / 1000), state);
++}
++
 +// Whether a frame is one a repeat or skip can hide in, from the mean
 +// absolute difference (diff, in 8-bit luma steps over a sparse grid) between
 +// it and the frame before: a hard cut (far above the recent typical
@@ -1320,7 +1377,7 @@ index 2b644cd..42196d1 100644
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1443,57 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1498,57 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -1378,7 +1435,7 @@ index 2b644cd..42196d1 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +2203,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +2258,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1394,7 +1451,7 @@ index 2b644cd..42196d1 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2294,953 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2349,926 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -2141,20 +2198,9 @@ index 2b644cd..42196d1 100644
 +    return 0.42;
 +}
 +
-+// --avfoundation-vsync-snap-pace-file: what auto pacing learned, one line
-+// per display mode ("pace1 <refresh period, us> <state>"), so a device
-+// starts each film at the point it found clean. Read when the display's
-+// mode is first known, rewritten when the point moves or is confirmed.
-+static bool vsync_pace_file_mode(const char *line, int64_t period, const char **state)
-+{
-+    long us = 0;
-+    int used = 0;
-+    if (sscanf(line, "pace1 %ld%n", &us, &used) != 1 || us <= 0)
-+        return false;
-+    *state = line + used;
-+    return llabs(us * 1000 - period) * 200 <= period;
-+}
-+
++// --avfoundation-vsync-snap-pace-file (avf_vsync_pace_file_read()): read
++// when the display's mode is first known, rewritten when the point moves or
++// is confirmed, so a device starts each film at the point it found clean.
 +static bool vsync_pace_load(struct vo *vo, int64_t period)
 +{
 +    struct priv *p = vo->priv;
@@ -2164,13 +2210,7 @@ index 2b644cd..42196d1 100644
 +    FILE *f = fopen(path, "r");
 +    if (!f)
 +        return false;
-+    char line[512];
-+    bool found = false;
-+    while (!found && fgets(line, sizeof(line), f)) {
-+        const char *state;
-+        found = vsync_pace_file_mode(line, period, &state) &&
-+                avf_vsync_pace_parse(&p->vsync_pace, state);
-+    }
++    bool found = avf_vsync_pace_file_read(f, period, &p->vsync_pace);
 +    fclose(f);
 +    return found;
 +}
@@ -2184,20 +2224,10 @@ index 2b644cd..42196d1 100644
 +    char *tmp = talloc_asprintf(NULL, "%s.tmp", path);
 +    FILE *out = fopen(tmp, "w");
 +    if (out) {
-+        // The other modes' lines are kept.
 +        FILE *in = fopen(path, "r");
-+        char line[512];
-+        while (in && fgets(line, sizeof(line), in)) {
-+            const char *state;
-+            if (!vsync_pace_file_mode(line, p->vsync_pace_period, &state) &&
-+                strncmp(line, "pace1 ", 6) == 0)
-+                fputs(line, out);
-+        }
++        avf_vsync_pace_file_write(in, out, p->vsync_pace_period, &p->vsync_pace);
 +        if (in)
 +            fclose(in);
-+        char state[400];
-+        avf_vsync_pace_print(&p->vsync_pace, state, sizeof(state));
-+        fprintf(out, "pace1 %ld %s\n", (long)(p->vsync_pace_period / 1000), state);
 +        bool ok = fclose(out) == 0;
 +        if (!ok || rename(tmp, path) != 0)
 +            unlink(tmp);
@@ -2348,7 +2378,7 @@ index 2b644cd..42196d1 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -1467,6 +3420,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
+@@ -1467,6 +3448,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
  
      sample_buffer_renderer_flush(displayLayer);
      sample_buffer_renderer_flush(osdLayer);
@@ -2356,7 +2386,7 @@ index 2b644cd..42196d1 100644
  
      MP_WARN(vo, "Recovered AVFoundation display layer after %s "
                  "(status=%ld, requiresFlush=%s, ready=%s, "
-@@ -5092,6 +7046,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+@@ -5092,6 +7074,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
      }
  }
  
@@ -2385,7 +2415,7 @@ index 2b644cd..42196d1 100644
  static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
  {
      struct priv *p = vo->priv;
-@@ -5099,6 +7075,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+@@ -5099,6 +7103,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
      if (!buf)
          return false;
  
@@ -2394,7 +2424,7 @@ index 2b644cd..42196d1 100644
      sample_buffer_renderer_enqueue(p->displayLayer, buf);
      p->last_video_enqueue_ns = mp_time_ns();
      return true;
-@@ -5151,14 +7129,28 @@ static void flip_page(struct vo *vo)
+@@ -5151,14 +7157,28 @@ static void flip_page(struct vo *vo)
  
      report_presentation_diagnostics(vo);
  
@@ -2427,7 +2457,7 @@ index 2b644cd..42196d1 100644
          if (p->ahead.started) {
              ahead_present(vo);
          } else {
-@@ -5175,14 +7167,37 @@ static void flip_page(struct vo *vo)
+@@ -5175,14 +7195,37 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
@@ -2466,7 +2496,7 @@ index 2b644cd..42196d1 100644
                  if (osd_enqueued) {
                      p->osd_needs_enqueue = false;
                      if (osd_buf_has_subtitle)
-@@ -5199,8 +7214,13 @@ static void flip_page(struct vo *vo)
+@@ -5199,8 +7242,13 @@ static void flip_page(struct vo *vo)
                  }
              }
  
@@ -2481,7 +2511,7 @@ index 2b644cd..42196d1 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,7 +7285,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,7 +7313,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
@@ -2506,7 +2536,7 @@ index 2b644cd..42196d1 100644
          // Queue slack lets a frame be stamped that much further ahead.
          p->next_present_host_ns = avf_host_present_ns(
              p->last_host_present_ns, p->next_present_host_ns,
-@@ -5288,6 +7325,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +7353,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -2517,7 +2547,7 @@ index 2b644cd..42196d1 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +7410,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7438,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -2526,7 +2556,7 @@ index 2b644cd..42196d1 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,8 +7548,14 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,8 +7576,14 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -2541,7 +2571,7 @@ index 2b644cd..42196d1 100644
          if (p->presentation_host && p->timebase) {
              // Fresh host-time samples arrive with future timestamps; the
              // free-running timebase needs no correction.
-@@ -5519,11 +7568,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7596,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -2558,7 +2588,7 @@ index 2b644cd..42196d1 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7619,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7647,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -2608,7 +2638,7 @@ index 2b644cd..42196d1 100644
      {0},
  };
  
-@@ -5579,6 +7676,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7704,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,

@@ -627,6 +627,63 @@ static int pace_cases(void)
         check(!avf_vsync_pace_parse(&s, "nonsense") && !avf_vsync_pace_parse(&s, "1.5 0 0 1"),
               "pace: a damaged saved state is refused");
     }
+
+    // The pace file: only "pace2" lines are read; a save keeps the other
+    // modes' pace2 lines, replaces this mode's and drops pace1 lines (next4's
+    // points, walked off clean ones on subtitle drops).
+    {
+        const int64_t p24 = 41709000;
+        struct avf_vsync_pace held = {0};
+        avf_vsync_pace_start(&held, 0.0417);
+        held.held = true;
+        char state[400], line[512];
+        avf_vsync_pace_print(&held, state, sizeof(state));
+        long us;
+        const char *st;
+        snprintf(line, sizeof(line), "pace1 41709 %s\n", state);
+        check(!avf_vsync_pace_file_line(line, &us, &st), "pace file: a pace1 line is refused");
+        snprintf(line, sizeof(line), "pace2 41709 %s\n", state);
+        check(avf_vsync_pace_file_line(line, &us, &st) && us == 41709 &&
+              avf_vsync_pace_file_same_mode(us, p24) &&
+              !avf_vsync_pace_file_same_mode(us, 16666667),
+              "pace file: a pace2 line is read, for its own mode");
+
+        FILE *in = tmpfile(), *out = tmpfile();
+        check(in && out, "pace file: temporary files");
+        if (in && out) {
+            fprintf(in, "pace1 41709 %s\n", state);
+            fprintf(in, "pace1 16667 %s\n", state);
+            fprintf(in, "pace2 16667 %s\n", state);
+            fprintf(in, "something else\n");
+            rewind(in);
+            struct avf_vsync_pace got = {0};
+            check(!avf_vsync_pace_file_read(in, p24, &got),
+                  "pace file: a file with only a pace1 line for the mode gives nothing");
+            rewind(in);
+            struct avf_vsync_pace now = {0};
+            avf_vsync_pace_start(&now, 0.42);
+            avf_vsync_pace_file_write(in, out, p24, &now);
+            rewind(out);
+            int pace1 = 0, pace2 = 0, other = 0;
+            while (fgets(line, sizeof(line), out)) {
+                pace1 += strncmp(line, "pace1 ", 6) == 0;
+                pace2 += strncmp(line, "pace2 ", 6) == 0;
+                other += strncmp(line, "pace", 4) != 0;
+            }
+            check(pace1 == 0 && pace2 == 2 && other == 0,
+                  "pace file: a save keeps only pace2 lines, one per mode");
+            rewind(out);
+            check(avf_vsync_pace_file_read(out, p24, &got) && fabs(got.phase - 0.42) < 1e-9 &&
+                  !got.held, "pace file: the saved line reads back");
+            rewind(out);
+            check(avf_vsync_pace_file_read(out, 16666667, &got) && got.held,
+                  "pace file: the other mode's pace2 line is kept");
+        }
+        if (in)
+            fclose(in);
+        if (out)
+            fclose(out);
+    }
     return failures - before;
 }
 
