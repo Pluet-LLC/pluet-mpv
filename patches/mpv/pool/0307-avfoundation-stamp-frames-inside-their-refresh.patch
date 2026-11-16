@@ -157,6 +157,20 @@ since the file opened by where they were hidden, the last one's kind,
 score and offset, and how many frames were sampled, cuts, flat frames
 and frames that could not be read.
 
+Field switches (2026-11-16), for telling apart what the snap does besides
+stamping and pacing when a display still drops frames with both in place
+(Apple TV 4K 1st generation, tvOS 26: about one frame in 200, whatever the
+planned phase, the lock, the lead or the subtitle layer's size):
+--avfoundation-vsync-snap-sample=no leaves the frames' luma unread (a
+step then waits for the end of the lip-sync range), and
+--avfoundation-vsync-snap-ask-ms sets how often the layer is asked for its
+counts (default 1000; 0 never, and auto pacing then keeps its point). A
+fifth log line, "vsync-snap work", gives where in the refresh the VO
+starts on a frame (mpv's schedule, before the pacing wait), the cost of
+reading the luma, the asks in the window, and the seconds into it at
+which the layer's dropped count was seen to rise. Defaults unchanged.
+
+
 scripts/test_avf_vsync_snap.sh compiles the snap and the pacing from the
 final Apple series and drives them with synthetic clocks: every phase at
 23.976 on 23.976 Hz, drift, the 60/50 Hz cadences, 24 fps on 120 and 48
@@ -278,10 +292,10 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..0d332af 100644
+index 2b644cd..1a2cd3f 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
-@@ -269,6 +269,29 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
+@@ -269,6 +269,31 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
      int presentation;
      int osd_max_height;
      bool osd_video_res;
@@ -291,6 +305,8 @@ index 2b644cd..0d332af 100644
 +    double vsync_snap_pace_phase;
 +    double vsync_snap_resample_ppm;
 +    int vsync_snap_sound_late_ms, vsync_snap_sound_early_ms;
++    bool vsync_snap_sample;
++    int vsync_snap_ask_ms;
 +};
 +
 +// --avfoundation-vsync-snap: stamps placed inside their refresh (yes), left
@@ -311,7 +327,7 @@ index 2b644cd..0d332af 100644
  };
  
  // --- avf sync servo core (host-testable; keep freestanding) ---
-@@ -476,6 +499,660 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -476,6 +501,670 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
  }
  // --- end avf sync servo core ---
  
@@ -967,12 +983,22 @@ index 2b644cd..0d332af 100644
 +    bool frame_one_to_one;
 +    double av_min, av_max;          // shown - planned, ns
 +    int av_n;
++    // Where in the refresh the VO starts on a frame (draw_frame: mpv's own
++    // schedule, before any pacing), what reading the frame's luma cost, how
++    // often the layer was asked for its counts, and when in the window its
++    // dropped count was seen to rise (to the second, with asks a second
++    // apart), so a drop can be set beside whatever else happened then.
++    struct avf_phase_stat prep;
++    int64_t sample_ns, sample_max_ns;
++    int asks;
++    int drop_marks;
++    float drop_at_s[6];
 +};
 +
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1168,41 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1180,42 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -989,6 +1015,7 @@ index 2b644cd..0d332af 100644
 +    bool vsync_frame_snapped;
 +    int64_t vsync_frame_planned_ns, vsync_frame_stamp_ns;
 +    int64_t vsync_metrics_asked_ns;
++    int64_t vsync_layer_dropped_seen;   // the layer's dropped count last seen (-1: none)
 +    int64_t vsync_pace_wait_ns;
 +    double vsync_pace_opt;          // the pace-phase option last applied
 +    // A sparse luma grid of the last frame, to find cuts and still pictures
@@ -1014,7 +1041,7 @@ index 2b644cd..0d332af 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +1912,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +1925,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1030,7 +1057,7 @@ index 2b644cd..0d332af 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2003,723 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2016,763 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -1224,10 +1251,23 @@ index 2b644cd..0d332af 100644
 +static void vsync_snap_ask_layer(struct priv *p, int64_t now)
 +{
 +    MPVDisplayRefreshClock *clock = p->refresh_clock;
-+    if (!clock || !p->displayLayer ||
-+        now - p->vsync_metrics_asked_ns < MP_TIME_MS_TO_NS(1000))
++    if (!clock || !p->displayLayer)
++        return;
++    // --avfoundation-vsync-snap-ask-ms=0: the layer is never asked (auto
++    // pacing then keeps its point, as on a system without the counts).
++    int every_ms = p->opts->vsync_snap_ask_ms;
++    if (every_ms <= 0) {
++        os_unfair_lock_lock(&clock->lock);
++        clock->layer_total = clock->layer_dropped = -1;
++        os_unfair_lock_unlock(&clock->lock);
++        p->vsync_metrics_asked_ns = 0;
++        return;
++    }
++    if (p->vsync_metrics_asked_ns &&
++        now - p->vsync_metrics_asked_ns < MP_TIME_MS_TO_NS(every_ms))
 +        return;
 +    p->vsync_metrics_asked_ns = now;
++    p->vsync_stats.asks++;
 +    if (@available(iOS 17.4, tvOS 17.4, macOS 14.4, *)) {
 +        AVSampleBufferVideoRenderer *renderer = p->displayLayer.sampleBufferRenderer;
 +        [clock retain];
@@ -1270,8 +1310,17 @@ index 2b644cd..0d332af 100644
 +        st->window_start_ns = now;
 +        st->layer_total0 = total;
 +        st->layer_dropped0 = dropped;
++        p->vsync_layer_dropped_seen = dropped;
 +        return;
 +    }
++    // When the layer's dropped count rose (as far as the asks resolve it).
++    if (dropped >= 0 && p->vsync_layer_dropped_seen >= 0 &&
++        dropped > p->vsync_layer_dropped_seen &&
++        st->drop_marks < (int)MP_ARRAY_SIZE(st->drop_at_s))
++    {
++        st->drop_at_s[st->drop_marks++] = (now - st->window_start_ns) / 1e9;
++    }
++    p->vsync_layer_dropped_seen = dropped;
 +    if (now - st->window_start_ns < MP_TIME_MS_TO_NS(5000))
 +        return;
 +    // The layer's counts over the window (a new layer starts them again).
@@ -1345,6 +1394,23 @@ index 2b644cd..0d332af 100644
 +                   sn->steps_by_kind[AVF_STEP_FORCED], kinds[sn->last_kind],
 +                   sn->last_score, sn->last_av_ns / 1e6, st->sampled, st->cuts, st->flats,
 +                   st->unreadable);
++        // The VO's own work: where in the refresh it starts on a frame, the
++        // cost of reading the luma, the asks, and when drops were seen.
++        double wa = 0, wl = 0, wh = 0;
++        if (st->prep.n)
++            avf_phase_get(&st->prep, per, &wa, &wl, &wh);
++        char marks[64] = "-";
++        for (int i = 0, at = 0; i < st->drop_marks && at < (int)sizeof(marks) - 8; i++)
++            at += snprintf(marks + at, sizeof(marks) - at, "%s%.1f", i ? "," : "",
++                           st->drop_at_s[i]);
++        int ns = MPMAX(st->sampled + st->unreadable, 1);
++        MP_VERBOSE(vo, "vsync-snap work: start %.2f [%+.2f %+.2f] ms past refresh, "
++                   "luma %s avg %.0f max %.0f us, layer asked %d (every %d ms), "
++                   "drops seen at s: %s\n",
++                   wa / 1e6, wl / 1e6, wh / 1e6,
++                   p->opts->vsync_snap_sample ? "read" : "not read",
++                   st->sample_ns / (double)ns / 1e3, st->sample_max_ns / 1e3,
++                   st->asks, p->opts->vsync_snap_ask_ms, marks);
 +    }
 +    struct avf_vsync_stats next = {
 +        .window_start_ns = now,
@@ -1443,6 +1509,7 @@ index 2b644cd..0d332af 100644
 +        p->vsync_tb_offset_ns = tb - (before + (after - before) / 2);
 +        p->vsync_tb_checked_ns = now;
 +    }
++    avf_phase_add(&st->prep, vsync_mod(now - vsync, period), period);
 +    if (p->presentation_host)
 +        vsync += p->vsync_tb_offset_ns;
 +
@@ -1754,7 +1821,7 @@ index 2b644cd..0d332af 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -5175,7 +6607,14 @@ static void flip_page(struct vo *vo)
+@@ -5175,7 +6660,14 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
@@ -1769,7 +1836,7 @@ index 2b644cd..0d332af 100644
              if (!p->presentation_host)
                  update_media_timebase_for_frame(vo);
  
-@@ -5199,8 +6638,10 @@ static void flip_page(struct vo *vo)
+@@ -5199,8 +6691,10 @@ static void flip_page(struct vo *vo)
                  }
              }
  
@@ -1780,7 +1847,7 @@ index 2b644cd..0d332af 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,7 +6706,14 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,7 +6759,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
@@ -1788,14 +1855,24 @@ index 2b644cd..0d332af 100644
      if (p->presentation_host) {
 +        // A redraw or a still frame (paused, stepping) is shown at once.
 +        if (frame->pts > 0 && !frame->redraw && !frame->still) {
-+            if (p->opts->vsync_snap != AVF_VSYNC_SNAP_NO)
++            // --avfoundation-vsync-snap-sample=no: the frame is not read,
++            // and a step then has no hiding place to wait for (it is taken
++            // at the end of the lip-sync range, as for an unreadable frame).
++            if (p->opts->vsync_snap != AVF_VSYNC_SNAP_NO && p->opts->vsync_snap_sample) {
++                int64_t t0 = mp_time_ns();
 +                p->vsync_snap.cand = vsync_frame_candidate(vo, frame->current);
++                int64_t dt = mp_time_ns() - t0;
++                p->vsync_stats.sample_ns += dt;
++                p->vsync_stats.sample_max_ns = MPMAX(p->vsync_stats.sample_max_ns, dt);
++            } else if (p->opts->vsync_snap != AVF_VSYNC_SNAP_NO) {
++                p->vsync_snap.cand = vsync_frame_candidate(vo, NULL);
++            }
 +            p->next_present_host_ns = vsync_snap_frame(vo, p->next_present_host_ns);
 +        }
          // Queue slack lets a frame be stamped that much further ahead.
          p->next_present_host_ns = avf_host_present_ns(
              p->last_host_present_ns, p->next_present_host_ns,
-@@ -5288,6 +6736,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +6799,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -1806,7 +1883,7 @@ index 2b644cd..0d332af 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +6821,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +6884,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -1815,7 +1892,7 @@ index 2b644cd..0d332af 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,6 +6959,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,6 +7022,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -1826,7 +1903,7 @@ index 2b644cd..0d332af 100644
          p->playback_paused = was_paused;
          sample_buffer_renderer_flush(p->displayLayer);
          if (p->presentation_host && p->timebase) {
-@@ -5519,11 +6977,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7040,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -1843,7 +1920,7 @@ index 2b644cd..0d332af 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7028,34 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7091,41 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -1875,10 +1952,17 @@ index 2b644cd..0d332af 100644
 +    // place to hide; see AVF_AV_*_PICTURE_NS.
 +    {"vsync-snap-sound-late-ms", OPT_INT(vsync_snap_sound_late_ms), M_RANGE(20, 90)},
 +    {"vsync-snap-sound-early-ms", OPT_INT(vsync_snap_sound_early_ms), M_RANGE(10, 40)},
++    // Field switches, to tell apart what the snap does besides stamping and
++    // pacing: reading each frame's luma for a place to hide a step (no: not
++    // read; a step is then taken only at the end of the lip-sync range),
++    // and how often the layer is asked for its frame counts (0: never; auto
++    // pacing then keeps its point).
++    {"vsync-snap-sample", OPT_BOOL(vsync_snap_sample)},
++    {"vsync-snap-ask-ms", OPT_INT(vsync_snap_ask_ms), M_RANGE(0, 60000)},
      {0},
  };
  
-@@ -5579,6 +7070,24 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7140,26 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,
@@ -1900,6 +1984,8 @@ index 2b644cd..0d332af 100644
 +        // EBU R37's sound-late limit, and well inside its sound-early one.
 +        .vsync_snap_sound_late_ms = 60,
 +        .vsync_snap_sound_early_ms = 25,
++        .vsync_snap_sample = true,
++        .vsync_snap_ask_ms = 1000,
      },
  };
  
