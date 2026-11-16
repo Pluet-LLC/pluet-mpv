@@ -532,21 +532,22 @@ static int pace_cases(void)
         const char *name;
         double (*map)(double);
         double start;
+        int dir;
         int max_moves, max_heavy, max_heavy_run;
         long max_drops;
     } cases[] = {
         // name, map, start, most moves, most windows with 4+ drops in all
         // and in a row, most frames dropped in four hours (of 345,600)
-        {"1st gen from its default", map_lr, 0.05, 0, 0, 0, 40},
-        {"2nd gen from the default", map_master, 0.42, 0, 0, 0, 2},
-        {"1st gen from the middle (0.42)", map_lr, 0.42, 14, 2, 1, 250},
-        {"1st gen from inside its band (0.57)", map_lr, 0.57, 14, 3, 2, 250},
-        {"2nd gen from inside its band (0.05)", map_master, 0.05, 14, 3, 2, 300},
-        {"2nd gen from its band's edge (0.94)", map_master, 0.94, 14, 3, 2, 300},
+        {"1st gen from its default", map_lr, 0.05, 1, 0, 0, 0, 40},
+        {"2nd gen from the default", map_master, 0.42, -1, 0, 0, 0, 2},
+        {"1st gen from the middle (0.42)", map_lr, 0.42, -1, 14, 2, 1, 250},
+        {"1st gen from inside its band (0.57)", map_lr, 0.57, -1, 14, 3, 2, 250},
+        {"2nd gen from inside its band (0.05)", map_master, 0.05, -1, 14, 3, 2, 300},
+        {"2nd gen from its band's edge (0.94)", map_master, 0.94, -1, 14, 3, 2, 300},
     };
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
         struct avf_vsync_pace s = {0};
-        avf_vsync_pace_start(&s, cases[c].start);
+        avf_vsync_pace_start(&s, cases[c].start, cases[c].dir);
         struct pace_run r = pace_run(&s, cases[c].map, 2880);
         double left = cases[c].map(r.final_ms);
         printf("pace %s: %d moves, held from %d s at %.1f ms, %ld frames dropped in "
@@ -578,7 +579,7 @@ static int pace_cases(void)
         late_every = 50;
         late_harsh = true;
         struct avf_vsync_pace s = {0};
-        avf_vsync_pace_start(&s, 0.42);
+        avf_vsync_pace_start(&s, 0.42, -1);
         struct pace_run r = pace_run(&s, map_lr, 2880);
         struct pace_run r2 = pace_run(&s, map_lr, 2880);
         printf("pace 1st gen from the middle, late enqueues: %d moves, %s at %.1f ms, "
@@ -596,7 +597,7 @@ static int pace_cases(void)
     // and what little trying of neighbours it causes ends.
     {
         struct avf_vsync_pace s = {0};
-        avf_vsync_pace_start(&s, 0.42);
+        avf_vsync_pace_start(&s, 0.42, -1);
         int w = 0, moved = 0;
         for (; w < 200 && !moved; w++)
             moved = avf_vsync_pace_feed(&s, 120 - (w % 5 % 2 == 0), w % 5 % 2 == 0) == 1;
@@ -604,7 +605,7 @@ static int pace_cases(void)
               "pace: 0.5% moves the point one bin earlier within two minutes");
 
         struct avf_vsync_pace n = {0};
-        avf_vsync_pace_start(&n, 0.42);
+        avf_vsync_pace_start(&n, 0.42, -1);
         struct pace_run r = pace_run(&n, map_noise, 8640);
         printf("pace, a frame in 3,300 at every point, 12 h: %d moves, %d windows with "
                "4 or more drops, %s at %.1f ms\n", r.moves, r.heavy,
@@ -616,7 +617,7 @@ static int pace_cases(void)
     // judged; a held point that turns bad is left and another found.
     {
         struct avf_vsync_pace s = {0};
-        avf_vsync_pace_start(&s, 0.42);
+        avf_vsync_pace_start(&s, 0.42, -1);
         check(!avf_vsync_pace_feed(&s, 20, 10) && !avf_vsync_pace_feed(&s, 120, -1) &&
               s.frames == 0, "pace: too few frames to judge");
         struct pace_run r = pace_run(&s, map_master, 120);
@@ -628,6 +629,29 @@ static int pace_cases(void)
               "pace: a damaged saved state is refused");
     }
 
+    // The 1st generation's default start (0.05) walks later first, towards
+    // 4.8 ms (measured clean), not earlier into the unmeasured 36 to 41 ms;
+    // the others' walk earlier first, as before.
+    {
+        struct avf_vsync_pace s = {0};
+        avf_vsync_pace_start(&s, 0.05, 1);
+        int w = 0, moved = 0;
+        for (; w < 200 && !moved; w++)
+            moved = avf_vsync_pace_feed(&s, 120 - (w % 5 % 2 == 0), w % 5 % 2 == 0) == 1;
+        check(moved && s.phase > 0.05 && s.phase < 0.15 && s.dir == 1,
+              "pace: the 1st gen's default start walks later first");
+        struct avf_vsync_pace e = {0};
+        avf_vsync_pace_start(&e, 0.42, -1);
+        for (w = 0, moved = 0; w < 200 && !moved; w++)
+            moved = avf_vsync_pace_feed(&e, 120 - (w % 5 % 2 == 0), w % 5 % 2 == 0) == 1;
+        check(moved && e.phase < 0.42, "pace: a start with dir -1 walks earlier first");
+        char line[400];
+        struct avf_vsync_pace back = {0};
+        check(avf_vsync_pace_print(&s, line, sizeof(line)) > 0 &&
+              avf_vsync_pace_parse(&back, line) && back.dir == 1,
+              "pace: the direction reads back");
+    }
+
     // The judgement (avf_vsync_pace_judge()): drops beside a subtitle
     // enqueue, in a slot-irregular window, or in the two windows after an
     // unsteady one are not the point's.
@@ -636,7 +660,7 @@ static int pace_cases(void)
         // enqueue, the drop seen 0.2 to 2.4 s after it, sometimes across the
         // window's edge (the subtitle in the window before).
         struct avf_vsync_pace s = {0};
-        avf_vsync_pace_start(&s, 0.42);
+        avf_vsync_pace_start(&s, 0.42, -1);
         int moves = 0, excused = 0, held_at = -1;
         for (int w = 0; w < 720; w++) {
             struct avf_pace_window win = {.shown = 119, .dropped = 1, .steady = true,
@@ -665,7 +689,7 @@ static int pace_cases(void)
 
         // 0.5% with no subtitle marks still moves within two minutes.
         struct avf_vsync_pace m = {0};
-        avf_vsync_pace_start(&m, 0.42);
+        avf_vsync_pace_start(&m, 0.42, -1);
         int w = 0, moved = 0;
         for (; w < 200 && !moved; w++) {
             int d = w % 5 % 2 == 0;
@@ -684,7 +708,7 @@ static int pace_cases(void)
                                           .drop_n = {1}, .osd_marks = 2,
                                           .osd_at_s = {-3.0f, 1.0f}};
             struct avf_vsync_pace t = {0};
-            avf_vsync_pace_start(&t, 0.42);
+            avf_vsync_pace_start(&t, 0.42, -1);
             int ex = 0;
             avf_vsync_pace_judge(&t, &win, &ex);
             check(ex == 0 && t.drops == 1, "pace judge: a drop away from subtitles counts");
@@ -700,7 +724,7 @@ static int pace_cases(void)
                 win.drop_n[i] = 1;
             }
             struct avf_vsync_pace t = {0};
-            avf_vsync_pace_start(&t, 0.42);
+            avf_vsync_pace_start(&t, 0.42, -1);
             int ex = 0;
             check(avf_vsync_pace_judge(&t, &win, &ex) == 1 && ex == 0,
                   "pace judge: six drop marks count in full and move the point");
@@ -709,7 +733,7 @@ static int pace_cases(void)
         // After an unsteady window two are skipped, the third is judged.
         {
             struct avf_vsync_pace t = {0};
-            avf_vsync_pace_start(&t, 0.42);
+            avf_vsync_pace_start(&t, 0.42, -1);
             struct avf_pace_window bad = {.shown = 110, .dropped = 10, .steady = true};
             struct avf_pace_window pause = bad;
             pause.steady = false;
@@ -725,7 +749,7 @@ static int pace_cases(void)
         // A slot-irregular window is not judged.
         {
             struct avf_vsync_pace t = {0};
-            avf_vsync_pace_start(&t, 0.42);
+            avf_vsync_pace_start(&t, 0.42, -1);
             struct avf_pace_window irr = {.shown = 110, .dropped = 10, .steady = true,
                                           .slot_irregular = true};
             int ex = 0;
@@ -740,7 +764,7 @@ static int pace_cases(void)
     {
         const int64_t p24 = 41709000;
         struct avf_vsync_pace held = {0};
-        avf_vsync_pace_start(&held, 0.0417);
+        avf_vsync_pace_start(&held, 0.0417, -1);
         held.held = true;
         char state[400], line[512];
         avf_vsync_pace_print(&held, state, sizeof(state));
@@ -767,7 +791,7 @@ static int pace_cases(void)
                   "pace file: a file with only a pace1 line for the mode gives nothing");
             rewind(in);
             struct avf_vsync_pace now = {0};
-            avf_vsync_pace_start(&now, 0.42);
+            avf_vsync_pace_start(&now, 0.42, -1);
             avf_vsync_pace_file_write(in, out, p24, &now);
             rewind(out);
             int pace1 = 0, pace2 = 0, other = 0;

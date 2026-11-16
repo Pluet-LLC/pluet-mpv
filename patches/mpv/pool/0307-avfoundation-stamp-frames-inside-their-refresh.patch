@@ -229,7 +229,10 @@ refresh over the rest is not judged; and two windows, not one, are
 skipped after a start, a seek or a pause. The "vsync-snap osd" line
 also gives, at one frame per refresh, the enqueue-to-enqueue gaps of no
 refresh ("slots two") and of two or more ("empty"), and the drops auto set
-aside.
+aside. A device's default start now carries the way auto walks from it
+first: the 1st generation Apple TV 4K (0.05) walks later, towards 4.8 ms
+measured clean, not into its unmeasured 36 to 41 ms; others start at 0.42
+and walk earlier, as before.
 
 
 scripts/test_avf_vsync_snap.sh compiles the snap and the pacing from the
@@ -355,7 +358,7 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..9b7c285 100644
+index 2b644cd..8eb255a 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,9 @@
@@ -403,7 +406,7 @@ index 2b644cd..9b7c285 100644
  };
  
  // --- avf sync servo core (host-testable; keep freestanding) ---
-@@ -476,6 +507,1061 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -476,6 +507,1062 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
  }
  // --- end avf sync servo core ---
  
@@ -886,12 +889,14 @@ index 2b644cd..9b7c285 100644
 +    return ((b % AVF_PACE_BINS) + AVF_PACE_BINS) % AVF_PACE_BINS;
 +}
 +
-+// Start (or start again) at phase with nothing known.
-+static void avf_vsync_pace_start(struct avf_vsync_pace *s, double phase)
++// Start (or start again) at phase with nothing known, the walk going
++// first towards dir: -1 earlier, +1 later (a device's default start says
++// which side of it was measured clean).
++static void avf_vsync_pace_start(struct avf_vsync_pace *s, double phase, int dir)
 +{
 +    int steps = s->steps;
 +    *s = (struct avf_vsync_pace){.phase = phase, .steps = steps, .init = true,
-+                                 .dir = -1};
++                                 .dir = dir > 0 ? 1 : -1};
 +    for (int i = 0; i < AVF_PACE_BINS; i++)
 +        s->rate[i] = -1;
 +}
@@ -983,7 +988,7 @@ index 2b644cd..9b7c285 100644
 +                               int64_t dropped)
 +{
 +    if (!s->init)
-+        avf_vsync_pace_start(s, s->phase);
++        avf_vsync_pace_start(s, s->phase, -1);
 +    int64_t n = shown + dropped;
 +    if (n < AVF_PACE_MIN_FRAMES || dropped < 0)
 +        return 0;
@@ -1010,7 +1015,7 @@ index 2b644cd..9b7c285 100644
 +        if (fast && (s->held || s->rest)) {
 +            // It was good and is very bad now: the display's timing changed,
 +            // and what was learned no longer holds.
-+            avf_vsync_pace_start(s, s->phase);
++            avf_vsync_pace_start(s, s->phase, -1);
 +        }
 +        s->held = s->rest = false;
 +        s->rate[cur] = (float)r;
@@ -1130,10 +1135,9 @@ index 2b644cd..9b7c285 100644
 +        !(phase >= 0 && phase < 1))
 +        return false;
 +    struct avf_vsync_pace r = {.steps = s->steps};
-+    avf_vsync_pace_start(&r, phase);
++    avf_vsync_pace_start(&r, phase, dir);
 +    r.held = held == 1;
 +    r.rest = rest == 1 && !r.held;
-+    r.dir = dir > 0 ? 1 : -1;
 +    const char *at = text + used;
 +    for (int i = 0; i < AVF_PACE_BINS; i++) {
 +        long v;
@@ -1465,7 +1469,7 @@ index 2b644cd..9b7c285 100644
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1577,58 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1578,58 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -1524,7 +1528,7 @@ index 2b644cd..9b7c285 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +2338,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +2339,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1540,7 +1544,7 @@ index 2b644cd..9b7c285 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2429,953 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2430,962 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -2288,19 +2292,26 @@ index 2b644cd..9b7c285 100644
 +    }
 +}
 +
-+// The point a device starts from when nothing was saved for it: the middle
-+// of what was measured clean on it (see "avf vsync snap": the 1st generation
-+// Apple TV 4K takes hand-overs near the display link's instant, the 2nd in
-+// the middle of the refresh). Other devices start in the middle and auto
-+// pacing moves the point if the layer drops frames there.
-+static double vsync_pace_device_default(void)
++// The point a device starts from when nothing was saved for it, and the way
++// auto pacing walks from it first (*dir). The 1st generation Apple TV 4K
++// (AppleTV6,2) takes hand-overs near the display link's instant: 0.05 (2.1
++// ms past it), its band about 20 to 36 ms, clean from about 37 ms round to
++// 19, 36 to 41 unmeasured; it walks later first, towards the 4.8 ms measured
++// clean, not earlier into the unmeasured stretch. Every other device starts
++// at 0.42 (17.5 ms on 23.976 Hz; the 2nd generation is clean from 8.6 to 39
++// ms) and walks earlier first, as before.
++static double vsync_pace_device_default(int *dir)
 +{
++    *dir = -1;
 +#if TARGET_OS_TV
 +    char model[64] = {0};
 +    size_t size = sizeof(model) - 1;
 +    if (sysctlbyname("hw.machine", model, &size, NULL, 0) == 0 &&
 +        strcmp(model, "AppleTV6,2") == 0)
++    {
++        *dir = 1;
 +        return 0.05;
++    }
 +#endif
 +    return 0.42;
 +}
@@ -2356,12 +2367,14 @@ index 2b644cd..9b7c285 100644
 +    p->vsync_pace_period = period;
 +    p->vsync_pace_opt = opt;
 +    if (opt >= 0) {
-+        avf_vsync_pace_start(&p->vsync_pace, opt);
++        avf_vsync_pace_start(&p->vsync_pace, opt, -1);
 +        p->vsync_pace_origin = "option";
 +    } else if (vsync_pace_load(vo, period)) {
 +        p->vsync_pace_origin = "file";
 +    } else {
-+        avf_vsync_pace_start(&p->vsync_pace, vsync_pace_device_default());
++        int dir;
++        double phase = vsync_pace_device_default(&dir);
++        avf_vsync_pace_start(&p->vsync_pace, phase, dir);
 +        p->vsync_pace_origin = "default";
 +    }
 +    MP_VERBOSE(vo, "vsync-snap pace: starting at %.3f, from the %s (refresh %.3f ms)\n",
@@ -2494,7 +2507,7 @@ index 2b644cd..9b7c285 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -1467,6 +3555,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
+@@ -1467,6 +3565,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
  
      sample_buffer_renderer_flush(displayLayer);
      sample_buffer_renderer_flush(osdLayer);
@@ -2502,7 +2515,7 @@ index 2b644cd..9b7c285 100644
  
      MP_WARN(vo, "Recovered AVFoundation display layer after %s "
                  "(status=%ld, requiresFlush=%s, ready=%s, "
-@@ -5092,6 +7181,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+@@ -5092,6 +7191,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
      }
  }
  
@@ -2531,7 +2544,7 @@ index 2b644cd..9b7c285 100644
  static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
  {
      struct priv *p = vo->priv;
-@@ -5099,6 +7210,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+@@ -5099,6 +7220,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
      if (!buf)
          return false;
  
@@ -2540,7 +2553,7 @@ index 2b644cd..9b7c285 100644
      sample_buffer_renderer_enqueue(p->displayLayer, buf);
      p->last_video_enqueue_ns = mp_time_ns();
      return true;
-@@ -5151,14 +7264,28 @@ static void flip_page(struct vo *vo)
+@@ -5151,14 +7274,28 @@ static void flip_page(struct vo *vo)
  
      report_presentation_diagnostics(vo);
  
@@ -2573,7 +2586,7 @@ index 2b644cd..9b7c285 100644
          if (p->ahead.started) {
              ahead_present(vo);
          } else {
-@@ -5175,14 +7302,37 @@ static void flip_page(struct vo *vo)
+@@ -5175,14 +7312,37 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
@@ -2612,7 +2625,7 @@ index 2b644cd..9b7c285 100644
                  if (osd_enqueued) {
                      p->osd_needs_enqueue = false;
                      if (osd_buf_has_subtitle)
-@@ -5199,8 +7349,13 @@ static void flip_page(struct vo *vo)
+@@ -5199,8 +7359,13 @@ static void flip_page(struct vo *vo)
                  }
              }
  
@@ -2627,7 +2640,7 @@ index 2b644cd..9b7c285 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,7 +7420,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,7 +7430,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
@@ -2652,7 +2665,7 @@ index 2b644cd..9b7c285 100644
          // Queue slack lets a frame be stamped that much further ahead.
          p->next_present_host_ns = avf_host_present_ns(
              p->last_host_present_ns, p->next_present_host_ns,
-@@ -5288,6 +7460,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +7470,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -2663,7 +2676,7 @@ index 2b644cd..9b7c285 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +7545,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7555,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -2672,7 +2685,7 @@ index 2b644cd..9b7c285 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,8 +7683,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,8 +7693,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -2688,7 +2701,7 @@ index 2b644cd..9b7c285 100644
          if (p->presentation_host && p->timebase) {
              // Fresh host-time samples arrive with future timestamps; the
              // free-running timebase needs no correction.
-@@ -5519,11 +7704,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7714,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -2705,7 +2718,7 @@ index 2b644cd..9b7c285 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7755,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7765,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -2755,7 +2768,7 @@ index 2b644cd..9b7c285 100644
      {0},
  };
  
-@@ -5579,6 +7812,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7822,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,
