@@ -628,6 +628,112 @@ static int pace_cases(void)
               "pace: a damaged saved state is refused");
     }
 
+    // The judgement (avf_vsync_pace_judge()): drops beside a subtitle
+    // enqueue, in a slot-irregular window, or in the two windows after an
+    // unsteady one are not the point's.
+    {
+        // An hour at a clean point with one drop beside each subtitle
+        // enqueue, the drop seen 0.2 to 2.4 s after it, sometimes across the
+        // window's edge (the subtitle in the window before).
+        struct avf_vsync_pace s = {0};
+        avf_vsync_pace_start(&s, 0.42);
+        int moves = 0, excused = 0, held_at = -1;
+        for (int w = 0; w < 720; w++) {
+            struct avf_pace_window win = {.shown = 119, .dropped = 1, .steady = true,
+                                          .drop_marks = 1, .drop_n = {1}};
+            double osd = 0.5 + 4.0 * (rnd() + 1) / 2, after = 0.2 + 2.2 * (rnd() + 1) / 2;
+            if (w % 7 == 3) {
+                // The subtitle late in the window before, the drop seen early in this one.
+                double prev = -0.2 - 1.5 * (rnd() + 1) / 2;
+                win.osd_at_s[win.osd_marks++] = (float)prev;
+                win.drop_at_s[0] = (float)(0.1 + (prev + 2.3) * (rnd() + 1) / 2);
+            } else {
+                win.osd_at_s[win.osd_marks++] = (float)osd;
+                win.drop_at_s[0] = (float)fmin(4.9, osd + after);
+            }
+            win.osd_at_s[win.osd_marks++] = (float)(0.3 + 4.4 * (rnd() + 1) / 2);
+            int ex = 0;
+            moves += avf_vsync_pace_judge(&s, &win, &ex) == 1;
+            excused += ex;
+            if (s.held && held_at < 0)
+                held_at = w;
+        }
+        printf("pace judge, an hour of one drop beside each subtitle change: %d moves, "
+               "%d set aside, held from %d s\n", moves, excused, held_at * 5);
+        check(moves == 0 && excused == 720 && s.held && fabs(s.phase - 0.42) < 1e-9,
+              "pace judge: drops beside subtitle changes leave a clean point held");
+
+        // 0.5% with no subtitle marks still moves within two minutes.
+        struct avf_vsync_pace m = {0};
+        avf_vsync_pace_start(&m, 0.42);
+        int w = 0, moved = 0;
+        for (; w < 200 && !moved; w++) {
+            int d = w % 5 % 2 == 0;
+            struct avf_pace_window win = {.shown = 120 - d, .dropped = d, .steady = true,
+                                          .drop_marks = d, .drop_at_s = {2.0f},
+                                          .drop_n = {1}};
+            int ex = 0;
+            moved = avf_vsync_pace_judge(&m, &win, &ex) == 1;
+        }
+        check(moved && w <= 24, "pace judge: 0.5% without subtitles still moves within two minutes");
+
+        // A drop well away from any subtitle enqueue counts.
+        {
+            struct avf_pace_window win = {.shown = 119, .dropped = 1, .steady = true,
+                                          .drop_marks = 1, .drop_at_s = {4.0f},
+                                          .drop_n = {1}, .osd_marks = 2,
+                                          .osd_at_s = {-3.0f, 1.0f}};
+            struct avf_vsync_pace t = {0};
+            avf_vsync_pace_start(&t, 0.42);
+            int ex = 0;
+            avf_vsync_pace_judge(&t, &win, &ex);
+            check(ex == 0 && t.drops == 1, "pace judge: a drop away from subtitles counts");
+        }
+
+        // Overflowing drop marks count in full, subtitles or not.
+        {
+            struct avf_pace_window win = {.shown = 114, .dropped = 6, .steady = true,
+                                          .drop_marks = AVF_PACE_DROP_MARKS,
+                                          .osd_marks = 1, .osd_at_s = {0.5f}};
+            for (int i = 0; i < AVF_PACE_DROP_MARKS; i++) {
+                win.drop_at_s[i] = 0.6f + 0.3f * i;
+                win.drop_n[i] = 1;
+            }
+            struct avf_vsync_pace t = {0};
+            avf_vsync_pace_start(&t, 0.42);
+            int ex = 0;
+            check(avf_vsync_pace_judge(&t, &win, &ex) == 1 && ex == 0,
+                  "pace judge: six drop marks count in full and move the point");
+        }
+
+        // After an unsteady window two are skipped, the third is judged.
+        {
+            struct avf_vsync_pace t = {0};
+            avf_vsync_pace_start(&t, 0.42);
+            struct avf_pace_window bad = {.shown = 110, .dropped = 10, .steady = true};
+            struct avf_pace_window pause = bad;
+            pause.steady = false;
+            int ex = 0;
+            int r0 = avf_vsync_pace_judge(&t, &pause, &ex);
+            int r1 = avf_vsync_pace_judge(&t, &bad, &ex);
+            int r2 = avf_vsync_pace_judge(&t, &bad, &ex);
+            int r3 = avf_vsync_pace_judge(&t, &bad, &ex);
+            check(r0 == 0 && r1 == 0 && r2 == 0 && r3 == 1,
+                  "pace judge: the two windows after a pause are not judged");
+        }
+
+        // A slot-irregular window is not judged.
+        {
+            struct avf_vsync_pace t = {0};
+            avf_vsync_pace_start(&t, 0.42);
+            struct avf_pace_window irr = {.shown = 110, .dropped = 10, .steady = true,
+                                          .slot_irregular = true};
+            int ex = 0;
+            check(avf_vsync_pace_judge(&t, &irr, &ex) == 0 && t.frames == 0,
+                  "pace judge: a slot-irregular window is not judged");
+        }
+    }
+
     // The pace file: only "pace2" lines are read; a save keeps the other
     // modes' pace2 lines, replaces this mode's and drops pace1 lines (next4's
     // points, walked off clean ones on subtitle drops).
