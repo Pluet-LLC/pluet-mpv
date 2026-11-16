@@ -22,10 +22,11 @@
 
 #define MS 1000000.0
 
-static int failures;
+static int failures, checks;
 
 static void check(bool ok, const char *what)
 {
+    checks++;
     if (!ok) {
         fprintf(stderr, "FAIL: %s\n", what);
         failures++;
@@ -629,6 +630,160 @@ static int pace_cases(void)
     return failures - before;
 }
 
+// --- one frame per slot (avf_vsync_pace_slot_ns) ---
+// A VO paced at one frame per refresh, 23.976 fps on 23.976 Hz, the point
+// at `phase` of the refresh past the grid's instant (0 here), and `lead` ms
+// between a frame's point and its stamp when it goes in on time (55.5 on the
+// 2nd generation Apple TV 4K, 73 on the 1st). Two ways mpv hands frames over:
+//   - waiting: each frame started 2 ms after the last enqueue (the regime
+//     both TVs run in); every `early_every`th frame's enqueue lands 1 to 6
+//     ms before its point (as the subtitle frames' did in build 49) and the
+//     next start comes 0.5 ms after it;
+//   - jittered: each frame started 3 ms either side of its own point.
+// Optionally a drift step from frame `step_at` on moves every stamp
+// `step_dir` refreshes (the skip or repeat the snap hides at a cut).
+// Each enqueue is counted in the slot of the point nearest it.
+struct slot_case {
+    double phase, lead_ms;
+    bool jittered;
+    int early_every;
+    int step_at, step_dir;
+    bool no_rule;           // without avf_vsync_pace_slot_ns() (the fault)
+};
+
+struct slot_res {
+    int frames, irregular;  // irregular: early enqueues or late starts
+    int doubles;            // two enqueues in one slot
+    int doubles_apart;      // ... of frames stamped for different refreshes
+    int empties;            // slots with no enqueue
+    double lead_min_ms;
+};
+
+static struct slot_res slot_run(const struct slot_case *c, int frames)
+{
+    const int64_t p = 41709000, min_lead = 20000000;
+    const int64_t ph = (int64_t)llround(p * c->phase);
+    struct slot_res r = {.frames = frames, .lead_min_ms = 1e9};
+    int64_t last_slot = 0, enq_prev = 0, gap = 2000000, k_prev = 0, ref_prev = 0;
+    for (int n = 0; n < frames; n++) {
+        int64_t point = (1000 + (int64_t)n) * p + ph;
+        int64_t stamp = point + (int64_t)llround(c->lead_ms * MS) +
+                        (c->step_dir && n >= c->step_at ? c->step_dir * p : 0);
+        bool early_frame = !c->jittered && c->early_every &&
+                           n % c->early_every == c->early_every - 1;
+        int64_t start;
+        if (c->jittered) {
+            start = point + (int64_t)llround(3 * MS * rnd());
+            r.irregular += start > point;
+        } else {
+            start = n ? enq_prev + gap : point - 2000000;
+        }
+        r.irregular += early_frame;
+        int64_t early = early_frame ? (int64_t)llround((3.5 + 2.5 * rnd()) * MS)
+                                    : 500000;
+        int64_t at = avf_vsync_pace_ns(start, stamp, 0, p, ph - early, min_lead);
+        if (!c->no_rule)
+            at = avf_vsync_pace_slot_ns(start, at, last_slot, p, early, stamp, min_lead);
+        last_slot = at > start ? at + early : 0;
+        // A held frame's enqueue lands on its point (the learned lateness),
+        // an early one where its wait ended, one not held at once.
+        int64_t enq = at > start ? (early_frame ? at : at + early) : start;
+        gap = early_frame ? 500000 : 2000000;
+        r.lead_min_ms = fmin(r.lead_min_ms, (stamp - enq) / MS);
+        int64_t k = (enq - ph + p / 2) / p, ref = stamp / p;
+        if (n) {
+            if (k <= k_prev) {
+                r.doubles++;
+                r.doubles_apart += ref != ref_prev;
+            } else {
+                r.empties += (int)(k - k_prev - 1);
+            }
+        }
+        k_prev = k;
+        ref_prev = ref;
+        enq_prev = enq;
+    }
+    return r;
+}
+
+static int slot_cases(void)
+{
+    int before = failures;
+    char what[200];
+    const int64_t t = 41709000;
+    // The rule on its own: nothing to do without a slot before or a wait; a
+    // frame that would take the last frame's slot is held for the next; not
+    // when that leaves under the minimum lead, or would be over a refresh
+    // and a half away.
+    check(avf_vsync_pace_slot_ns(10 * t, 10 * t + 5, 0, t, 0, 20 * t, 0) == 10 * t + 5,
+          "slot: no slot before, no change");
+    check(avf_vsync_pace_slot_ns(10 * t, 10 * t, 9 * t, t, 0, 20 * t, 0) == 10 * t,
+          "slot: a frame going in at once is left alone");
+    check(avf_vsync_pace_slot_ns(10 * t - 3000000, 10 * t - 500000, 10 * t, t, 500000,
+                                 12 * t, 20000000) == 11 * t - 500000,
+          "slot: a frame for the last frame's slot is held for the next");
+    check(avf_vsync_pace_slot_ns(10 * t - 3000000, 10 * t - 500000, 10 * t, t, 500000,
+                                 11 * t + 15000000, 20000000) == 10 * t - 500000,
+          "slot: not held when that leaves under the minimum lead");
+    check(avf_vsync_pace_slot_ns(10 * t + 2000000, 11 * t, 10 * t, t, 0, 20 * t, 0) == 11 * t,
+          "slot: a frame already for the next slot is left there");
+    check(avf_vsync_pace_slot_ns(10 * t - 3000000, 10 * t - 500000, 8 * t, t, 0,
+                                 20 * t, 0) == 10 * t - 500000,
+          "slot: a slot before from long ago is not followed");
+
+    struct { const char *name; struct slot_case c; } cases[] = {
+        {"2nd gen, waiting, every 70th early", {.phase = 0.42, .lead_ms = 55.5, .early_every = 70}},
+        {"1st gen, waiting, every 70th early", {.phase = 0.05, .lead_ms = 73, .early_every = 70}},
+        {"2nd gen, starts +-3 ms around the point", {.phase = 0.42, .lead_ms = 55.5, .jittered = true}},
+        {"1st gen, starts +-3 ms around the point", {.phase = 0.05, .lead_ms = 73, .jittered = true}},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct slot_res r = slot_run(&cases[i].c, 20000);
+        printf("slot %s: %d frames, %d early or late, %d two in a slot, %d empty "
+               "slots, lead >= %.1f ms\n", cases[i].name, r.frames, r.irregular,
+               r.doubles, r.empties, r.lead_min_ms);
+        snprintf(what, sizeof(what), "slot %s: never two in a slot, at most one empty "
+                 "slot per early or late frame, lead kept", cases[i].name);
+        check(r.doubles == 0 && r.empties <= r.irregular && r.irregular > 0 &&
+              r.lead_min_ms >= 20, what);
+    }
+    // The fault the rule cures: without it the early frames put two in a slot.
+    {
+        struct slot_case c = {.phase = 0.42, .lead_ms = 55.5, .early_every = 70, .no_rule = true};
+        struct slot_res r = slot_run(&c, 20000);
+        printf("slot 2nd gen, waiting, every 70th early, without the rule: %d two in a "
+               "slot, %d empty slots\n", r.doubles, r.empties);
+        check(r.doubles >= r.irregular && r.irregular > 0,
+              "slot: without the rule an early frame puts two in a slot");
+    }
+    // A drift step (the stamps move a whole refresh) in the waiting regime,
+    // either way on both TVs. A skip stamps two frames for one refresh; on
+    // the 2nd generation the second of them cannot wait for the next point
+    // (13.8 ms of lead) and goes in at once, beside the first: that pair is
+    // the skip itself, and the layer shows one of them. No two frames for
+    // different refreshes share a slot, at most one slot is left empty, and
+    // there is one irregular slot at most.
+    struct { const char *name; struct slot_case c; } steps[] = {
+        {"2nd gen, skip", {.phase = 0.42, .lead_ms = 55.5, .step_at = 5000, .step_dir = -1}},
+        {"2nd gen, repeat", {.phase = 0.42, .lead_ms = 55.5, .step_at = 5000, .step_dir = 1}},
+        {"1st gen, skip", {.phase = 0.05, .lead_ms = 73, .step_at = 5000, .step_dir = -1}},
+        {"1st gen, repeat", {.phase = 0.05, .lead_ms = 73, .step_at = 5000, .step_dir = 1}},
+        {"2nd gen, skip, every 70th early", {.phase = 0.42, .lead_ms = 55.5, .early_every = 70, .step_at = 5000, .step_dir = -1}},
+    };
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+        struct slot_res r = slot_run(&steps[i].c, 10000);
+        int allowed = steps[i].c.early_every ? r.irregular : 0;
+        printf("slot drift step, %s: %d two in a slot (%d for different refreshes), "
+               "%d empty slots, lead >= %.1f ms\n", steps[i].name, r.doubles,
+               r.doubles_apart, r.empties, r.lead_min_ms);
+        snprintf(what, sizeof(what), "slot drift step, %s: one irregular slot at most, "
+                 "never two refreshes' frames in one slot", steps[i].name);
+        check(r.doubles_apart == 0 && r.empties <= 1 + allowed &&
+              r.doubles + r.empties <= 1 + allowed && r.lead_min_ms >= 20, what);
+    }
+    return failures - before;
+}
+
 int main(void)
 {
     const double p24 = 1001.0 / 24000.0 * 1e9;   // 23.976 Hz, ns
@@ -1191,6 +1346,9 @@ int main(void)
               "pace: a frame due soon is not held");
     }
 
+    // 17b. One frame per slot: slot_cases().
+    failures += slot_cases();
+
     // 18. The refresh clock: the period from the link's timestamps, through
     //     the link stopping (background, a sleeping display), coming back on
     //     its grid or at another phase, and display mode changes.
@@ -1299,6 +1457,6 @@ int main(void)
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
     }
-    printf("test_avf_vsync_snap: all passed\n");
+    printf("test_avf_vsync_snap: all %d checks passed\n", checks);
     return 0;
 }
