@@ -9,8 +9,8 @@
 // refresh each frame lands on must keep the content's cadence: at the same
 // rate, one frame per refresh, never a skip next to a repeat. The pacing of
 // enqueues (avf_vsync_pace_ns) must hold them at one point of the refresh
-// while mpv's schedule drifts, and the auto rule must move that point only
-// after the layer drops frames in two windows in a row.
+// while mpv's schedule drifts, and auto pacing must find and hold a clean
+// enqueue point on each Apple TV's measured map without dwelling in a bad one.
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -440,6 +440,193 @@ static int sim_cases(void)
         }
     }
     return bad;
+}
+
+// --- auto pacing against a device's map ---
+// Drops per hand-over at e ms past the display link's instant (23.976 Hz).
+// Apple TV 4K 1st generation (tvOS 26), 2026-11-14 and -16: 8% at 23.5, 7%
+// at 32 to 34, about 1 to 3% at the band's edges, none worth the name
+// outside. 2nd generation (tvOS 27), 2026-11-15: 10 to 23% from 40 to 8.
+static double map_lr(double e)
+{
+    if (e >= 22 && e < 34)
+        return 0.08;
+    if ((e >= 19 && e < 22) || (e >= 34 && e < 36.5))
+        return 0.02;
+    return 0;
+}
+
+static double map_master(double e)
+{
+    if (e >= 40 || e < 8)
+        return 0.2;
+    if (e >= 38.5)
+        return 0.03;
+    return 0;
+}
+
+static double map_noise(double e)
+{
+    (void)e;
+    return 0.0003;      // a device that drops a frame in 3,300 wherever
+}
+
+struct pace_run {
+    int moves, heavy, heavy_run, held_at;   // windows; held_at: window it was first held
+    long drops;
+    double final_ms;
+};
+
+// `windows` 5 s windows of 120 frames, each frame handed over at the point
+// plus 1 ms of jitter and, one time in `late_every`, 2 to 10 ms late (or,
+// `harsh`, 4 to 20 ms: the tail build 48 had on the 1st generation).
+static int late_every = 200;
+static bool late_harsh;
+
+static struct pace_run pace_run(struct avf_vsync_pace *s, double (*map)(double),
+                                int windows)
+{
+    const double period = 41.708;
+    struct pace_run r = {.held_at = -1};
+    int run = 0;
+    for (int w = 0; w < windows; w++) {
+        int dropped = 0;
+        for (int i = 0; i < 120; i++) {
+            double e = s->phase * period + rnd();
+            if ((rnd() + 1) * late_every < 2)
+                e += late_harsh ? 12 + 8 * rnd() : 6 + 4 * rnd();
+            e = fmod(e + period, period);
+            if ((rnd() + 1) / 2 < map(e))
+                dropped++;
+        }
+        r.drops += dropped;
+        bool heavy = dropped >= 4;
+        run = heavy ? run + 1 : 0;
+        r.heavy += heavy;
+        if (run > r.heavy_run)
+            r.heavy_run = run;
+        if (avf_vsync_pace_feed(s, 120 - dropped, dropped) == 1)
+            r.moves++;
+        if (s->held && r.held_at < 0)
+            r.held_at = w;
+    }
+    r.final_ms = s->phase * period;
+    return r;
+}
+
+static bool rates_match(const struct avf_vsync_pace *a, const struct avf_vsync_pace *b)
+{
+    for (int i = 0; i < AVF_PACE_BINS; i++) {
+        if (fabs(a->rate[i] - b->rate[i]) > 1e-6)
+            return false;
+    }
+    return true;
+}
+
+static int pace_cases(void)
+{
+    int before = failures;
+    char what[200];
+    struct {
+        const char *name;
+        double (*map)(double);
+        double start;
+        int max_moves, max_heavy, max_heavy_run;
+        long max_drops;
+    } cases[] = {
+        // name, map, start, most moves, most windows with 4+ drops in all
+        // and in a row, most frames dropped in four hours (of 345,600)
+        {"1st gen from its default", map_lr, 0.05, 0, 0, 0, 40},
+        {"2nd gen from the default", map_master, 0.42, 0, 0, 0, 2},
+        {"1st gen from the middle (0.42)", map_lr, 0.42, 14, 2, 1, 250},
+        {"1st gen from inside its band (0.57)", map_lr, 0.57, 14, 3, 2, 250},
+        {"2nd gen from inside its band (0.05)", map_master, 0.05, 14, 3, 2, 300},
+        {"2nd gen from its band's edge (0.94)", map_master, 0.94, 14, 3, 2, 300},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        struct avf_vsync_pace s = {0};
+        avf_vsync_pace_start(&s, cases[c].start);
+        struct pace_run r = pace_run(&s, cases[c].map, 2880);
+        double left = cases[c].map(r.final_ms);
+        printf("pace %s: %d moves, held from %d s at %.1f ms, %ld frames dropped in "
+               "4 h (%d windows with 4 or more, %d in a row)\n", cases[c].name,
+               r.moves, r.held_at * 5, r.final_ms, r.drops, r.heavy, r.heavy_run);
+        snprintf(what, sizeof(what), "pace %s: held at a clean point, with little "
+                 "hunting", cases[c].name);
+        check(s.held && left == 0 && r.moves <= cases[c].max_moves &&
+              r.heavy <= cases[c].max_heavy && r.heavy_run <= cases[c].max_heavy_run &&
+              r.drops <= cases[c].max_drops, what);
+
+        // Saved and read back, the next film starts held there and stays.
+        char line[400];
+        struct avf_vsync_pace again = {0};
+        check(avf_vsync_pace_print(&s, line, sizeof(line)) > 0 &&
+              avf_vsync_pace_parse(&again, line) && again.held == s.held &&
+              again.rest == s.rest && fabs(again.phase - s.phase) < 1e-4 &&
+              again.dir == s.dir && rates_match(&again, &s),
+              "pace: the state reads back as written");
+        struct pace_run r2 = pace_run(&again, cases[c].map, 720);
+        snprintf(what, sizeof(what), "pace %s: the saved point holds", cases[c].name);
+        check(r2.moves == 0 && again.held, what);
+    }
+
+    // With build 48's late tail (a frame in 50, 4 to 20 ms late) no point
+    // near the band is spotless: the search still ends, on a point that
+    // drops under a frame in 1,000, without walking into the band.
+    {
+        late_every = 50;
+        late_harsh = true;
+        struct avf_vsync_pace s = {0};
+        avf_vsync_pace_start(&s, 0.42);
+        struct pace_run r = pace_run(&s, map_lr, 2880);
+        struct pace_run r2 = pace_run(&s, map_lr, 2880);
+        printf("pace 1st gen from the middle, late enqueues: %d moves, %s at %.1f ms, "
+               "%ld then %ld frames dropped in 4 h each (%d windows with 4 or more)\n",
+               r.moves + r2.moves, s.held ? "held" : s.rest ? "at rest" : "searching",
+               r2.final_ms, r.drops, r2.drops, r.heavy + r2.heavy);
+        check((s.held || s.rest) && r.moves + r2.moves <= 16 && r.heavy_run <= 2 &&
+              r2.drops <= 345, "pace: late enqueues leave it on a good point, at rest");
+        late_every = 200;
+        late_harsh = false;
+    }
+
+    // A steady 0.5% (the 1st generation at 17.2 ms) is acted on within two
+    // minutes; a frame in 3,300 everywhere is never taken for a bad point,
+    // and what little trying of neighbours it causes ends.
+    {
+        struct avf_vsync_pace s = {0};
+        avf_vsync_pace_start(&s, 0.42);
+        int w = 0, moved = 0;
+        for (; w < 200 && !moved; w++)
+            moved = avf_vsync_pace_feed(&s, 120 - (w % 5 % 2 == 0), w % 5 % 2 == 0) == 1;
+        check(moved && w <= 24 && fabs(s.phase - 9.0 / 24) < 1e-9,
+              "pace: 0.5% moves the point one bin earlier within two minutes");
+
+        struct avf_vsync_pace n = {0};
+        avf_vsync_pace_start(&n, 0.42);
+        struct pace_run r = pace_run(&n, map_noise, 8640);
+        printf("pace, a frame in 3,300 at every point, 12 h: %d moves, %d windows with "
+               "4 or more drops, %s at %.1f ms\n", r.moves, r.heavy,
+               n.held ? "held" : n.rest ? "at rest" : "searching", r.final_ms);
+        check(r.moves <= 30 && r.heavy == 0 && (n.held || n.rest), "pace: scattered drops end at rest, each bin tried at most once");
+    }
+
+    // Too few frames, a negative count, and the window after a move are not
+    // judged; a held point that turns bad is left and another found.
+    {
+        struct avf_vsync_pace s = {0};
+        avf_vsync_pace_start(&s, 0.42);
+        check(!avf_vsync_pace_feed(&s, 20, 10) && !avf_vsync_pace_feed(&s, 120, -1) &&
+              s.frames == 0, "pace: too few frames to judge");
+        struct pace_run r = pace_run(&s, map_master, 120);
+        check(s.held && r.moves == 0, "pace: held on the 2nd gen");
+        r = pace_run(&s, map_lr, 1440);
+        check(s.held && map_lr(r.final_ms) == 0 && r.moves >= 1 && r.heavy_run <= 2,
+              "pace: a held point that turns bad is left for a clean one");
+        check(!avf_vsync_pace_parse(&s, "nonsense") && !avf_vsync_pace_parse(&s, "1.5 0 0 1"),
+              "pace: a damaged saved state is refused");
+    }
+    return failures - before;
 }
 
 int main(void)
@@ -901,27 +1088,9 @@ int main(void)
         }
     }
 
-    // 12. auto: clean windows never move the point; one bad window alone
-    //     does not; two in a row move it a quarter refresh, wrapping at one.
-    {
-        struct avf_vsync_pace s = {.phase = 0.42};
-        bool still = true;
-        for (int i = 0; i < 100; i++)
-            still = still && !avf_vsync_pace_judge(&s, 120, i % 3 == 0 ? 1 : 0);
-        check(still && s.phase == 0.42 && s.steps == 0, "auto: clean windows keep the point");
-        check(!avf_vsync_pace_judge(&s, 110, 10) && !avf_vsync_pace_judge(&s, 120, 0) &&
-              !avf_vsync_pace_judge(&s, 110, 10), "auto: one bad window alone keeps it");
-        check(avf_vsync_pace_judge(&s, 110, 10) && fabs(s.phase - 0.67) < 1e-9 &&
-              s.steps == 1, "auto: two bad windows move it a quarter");
-        avf_vsync_pace_judge(&s, 110, 10);
-        avf_vsync_pace_judge(&s, 110, 10);
-        check(fabs(s.phase - 0.92) < 1e-9, "auto: and again");
-        avf_vsync_pace_judge(&s, 110, 10);
-        avf_vsync_pace_judge(&s, 110, 10);
-        check(fabs(s.phase - 0.17) < 1e-9, "auto: wraps past a whole refresh");
-        check(!avf_vsync_pace_judge(&s, 20, 10) && !avf_vsync_pace_judge(&s, 20, 10),
-              "auto: too few frames to judge");
-    }
+    // 12. auto: the search for a device's clean enqueue point, against the
+    //     two Apple TVs' measured maps (pace_cases()).
+    failures += pace_cases();
 
     // 13: see sim_cases() (content, passthrough and decoded audio).
     failures += sim_cases();

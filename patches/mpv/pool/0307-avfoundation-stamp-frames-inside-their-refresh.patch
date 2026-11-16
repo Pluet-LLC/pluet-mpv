@@ -157,6 +157,34 @@ since the file opened by where they were hidden, the last one's kind,
 score and offset, and how many frames were sampled, cuts, flat frames
 and frames that could not be read.
 
+Per-device enqueue point (2026-11-16). With the enqueue held at chosen
+points on the 1st generation Apple TV 4K (tvOS 26), the layer dropped 8%
+of frames at 23.5 ms past the instant, 0.5% at 17.2 (0.42, the old
+default), 0.06% at 4.8 and none seen at 2.8; the 2nd generation's band is
+40 to 8 ms, and it is clean at 21 to 22. No one point serves both, and
+the old auto rule (a quarter refresh on, after two windows over 2%) took
+the point from 23.5 to 34 ms, the band's far edge, and left it there for
+two minutes at 1.2%. Now:
+
+- the point starts from what auto pacing saved for the display mode
+  (--avfoundation-vsync-snap-pace-file, one line per mode), else from the
+  device's default (0.05 on the 1st generation Apple TV 4K, 0.42
+  elsewhere); --avfoundation-vsync-snap-pace-phase defaults to -1 (not
+  set) and still overrides both when given;
+- auto pacing searches on the layer's own counts (avf_vsync_pace_feed()):
+  it leaves a point after 4 drops in 1,200 frames, or 4 drops and 3% in
+  one window, holds one after 7,200 frames without a drop, and walks a
+  24th of a refresh at a time away from the bins it measured as worse,
+  stopping at a band's flank instead of walking into it (a quarter
+  refresh at a time only while every bin it knows is very bad). Windows
+  with a new lock or frames without a refresh are not judged;
+- the wait ends on short sleeps (one long sleep overshot by up to 5 ms,
+  more the longer it was), a frame carrying an OSD sample is aimed early
+  by what that sample's enqueue takes, and a frame that comes too late
+  for its point waits for the next one when that leaves 20 ms before its
+  stamp (40 before), rather than going in wherever mpv's schedule was:
+  half the drops left at 4.8 ms came with an enqueue 14 to 26 ms late.
+
 Field switches (2026-11-16), for telling apart what the snap does besides
 stamping and pacing when a display still drops frames with both in place
 (Apple TV 4K 1st generation, tvOS 26: about one frame in 200, whatever the
@@ -177,7 +205,9 @@ final Apple series and drives them with synthetic clocks: every phase at
 Hz, refresh-rate changes mid-play, a window moved to another display, a
 seek, no refresh clock, 55 minutes of the second TV's drift (one frame
 per refresh but for one clean step, stamps at one point, enqueues held at
-one point and out of both TVs' late ranges), the auto rule; three hours
+one point), auto pacing against both TVs' measured maps (from each one's
+default, from the middle, from inside each band, with late enqueues, with
+scattered drops, saved and read back); three hours
 at 14 ppm, passthrough, of a film, a pan with no cut, a static shot,
 talking heads, fades, unreadable frames and slow pans alternating with a
 still camera (4 steps each, at cuts, blacks, stills, the pan's calmest
@@ -292,10 +322,19 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..1a2cd3f 100644
+index 2b644cd..f7fe15b 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
-@@ -269,6 +269,31 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
+@@ -49,6 +49,8 @@
+ #import <Metal/Metal.h>
+ #import <TargetConditionals.h>
+ #include <os/lock.h>
++#include <sys/sysctl.h>
++#include <unistd.h>
+ 
+ #if TARGET_OS_IPHONE
+ #import <UIKit/UIKit.h>
+@@ -269,6 +271,32 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
      int presentation;
      int osd_max_height;
      bool osd_video_res;
@@ -307,6 +346,7 @@ index 2b644cd..1a2cd3f 100644
 +    int vsync_snap_sound_late_ms, vsync_snap_sound_early_ms;
 +    bool vsync_snap_sample;
 +    int vsync_snap_ask_ms;
++    char *vsync_snap_pace_file;
 +};
 +
 +// --avfoundation-vsync-snap: stamps placed inside their refresh (yes), left
@@ -327,7 +367,7 @@ index 2b644cd..1a2cd3f 100644
  };
  
  // --- avf sync servo core (host-testable; keep freestanding) ---
-@@ -476,6 +501,670 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -476,6 +504,891 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
  }
  // --- end avf sync servo core ---
  
@@ -351,12 +391,13 @@ index 2b644cd..1a2cd3f 100644
 +//     the whole refresh every 49 minutes, and the layer dropped frames for the
 +//     ~6 minutes of each sweep in which they sat from ~7 ms before the instant
 +//     to ~2 ms after it, none elsewhere; the stamps never moved.
-+// The stamp's place in the refresh is therefore not what decides it. The
-+// reading that fits both (a hypothesis: the layer's internals are not
-+// documented) is that an enqueue (about 119 ms ahead of the planned time)
-+// landing in the ~10 ms before the display takes its next frame costs a
-+// frame: that is 30 to 40 ms past the instant on the first, 40 to 8 on the
-+// second, and enqueues from ~9 to ~27 ms past it were clean on both.
++// The stamp's place in the refresh is therefore not what decides it. What
++// does is where in the refresh the frame is handed to the layer (enqueued),
++// and each device has its own band where a hand-over costs a frame. With
++// the enqueue held at chosen points (2026-11-16): on the first, 8% of
++// frames at 23.5 ms past the instant, 0.5% at 17.2, 0.06% at 4.8; on the
++// second, none at 21 to 22 ms, where its own band is 40 to 8. No one
++// point is clean on both (see the pace search below).
 +//
 +// So the VO decides each frame's refresh itself and keeps both its stamp and
 +// its enqueue at fixed points of the refresh, never where the audio clock
@@ -718,37 +759,257 @@ index 2b644cd..1a2cd3f 100644
 +    return stamp_ns - at < min_lead_ns ? now_ns : at;
 +}
 +
-+// --avfoundation-vsync-snap-pace=auto: the enqueue point moves on by a quarter
-+// refresh after two 5 s windows in a row in which the layer dropped frames
-+// (at least AVF_VSYNC_PACE_BAD_DROPS, and 2% of what it showed). Moving it
-+// shows nothing on screen (the stamps stay); it only stops an enqueue point
-+// that a display with another timing than the two measured ones does not
-+// take. Clean playback drops none in minutes.
++// --avfoundation-vsync-snap-pace=auto: finding and keeping the enqueue point.
++// Where in the refresh a hand-over costs frames differs by device, and no
++// one point is clean on all of them. Measured, 23.976 fps on 23.976 Hz, in
++// ms past the display link's instant:
++//   - Apple TV 4K (1st generation), tvOS 26: 8% of frames dropped at 23.5
++//     ms, 7% at 32 to 34, about 1% at 34 once the enqueues spread by 4 ms;
++//     0.5% at 17.2 (the late tail of its enqueues reaching the band); 0.06%
++//     at 4.8 and none seen at 2.8. So a band from about 20 to 36 ms.
++//   - Apple TV 4K (2nd generation), tvOS 27: 10 to 23% from about 40 ms to
++//     8 ms (across the instant), none from 8.6 to 39 (25,182 frames at 21
++//     to 22 ms).
++// The two bands nearly complement each other. So the point starts from the
++// device's own (the VO's table, or the one this search saved for the display
++// mode) and moves only on the layer's own evidence, one bin of a 24th of a
++// refresh at a time (1.7 ms at 23.976 Hz), and never back into a bin it
++// has measured, but to rest on the best (avf_vsync_pace_move()):
++//   - bad: 4 drops and 3% in one 5 s window, or 4 drops within 1,200
++//     frames (0.33%: a steady 0.5% is caught in under a minute, a point
++//     that drops a frame a minute is not mistaken for it). The bin's rate
++//     is recorded and the point moves on. A very bad bin is left after
++//     one judged window, and the walk turns round after it;
++//   - clean: 7,200 frames (5 minutes at 24 fps) with no drop. The point is
++//     held, until it turns bad or drops 3 frames within 15 minutes;
++//   - neither (a drop now and then): after 7,200 frames with 3 drops or
++//     more, or 21,600 with any, the rate is recorded and the next bin
++//     tried.
++// A point that turns bad while held or at rest is searched from again; when
++// it turns very bad (the first rule), with the map forgotten: the display's
++// timing changed.
++// Moving the point shows nothing by itself: the stamps decide the refresh.
++#define AVF_PACE_BINS 24
++#define AVF_PACE_MIN_FRAMES 48
++#define AVF_PACE_FAST_DROPS 4
++#define AVF_PACE_FAST_RATE 0.03
++#define AVF_PACE_BLOCK_FRAMES 1200
++#define AVF_PACE_BLOCK_DROPS 4
++#define AVF_PACE_CLEAN_FRAMES 7200
++#define AVF_PACE_SLOW_FRAMES 21600
++#define AVF_PACE_SLOW_DROPS 3
++
 +struct avf_vsync_pace {
 +    double phase;           // enqueue point, share of a refresh past it
-+    int bad_windows;
-+    int steps;
++    int steps;              // moves made (diagnostics)
++    bool init;              // rate[] is set up
++    bool held;              // no drop here in AVF_PACE_CLEAN_FRAMES
++    bool rest;              // the best point known, though not spotless
++    int dir;                // direction of the walk, -1 (earlier) or +1
++    int settle;             // windows still to skip (counts read after a move)
++    int64_t frames, drops;  // here, since arriving
++    int64_t clean_run;      // frames since the last drop here
++    int64_t block_frames, block_drops;
++    // Drops per frame measured in each bin, -1 where not measured.
++    float rate[AVF_PACE_BINS];
 +};
 +
-+#define AVF_VSYNC_PACE_BAD_DROPS 3
-+#define AVF_VSYNC_PACE_MIN_FRAMES 48
-+
-+// One window of the layer's own counts; true when the point moved.
-+static bool avf_vsync_pace_judge(struct avf_vsync_pace *s, int64_t shown,
-+                                 int64_t dropped)
++static int avf_vsync_pace_bin(double phase)
 +{
-+    if (shown + dropped < AVF_VSYNC_PACE_MIN_FRAMES)
-+        return false;
-+    bool bad = dropped >= AVF_VSYNC_PACE_BAD_DROPS &&
-+               dropped * 50 >= shown + dropped;
-+    s->bad_windows = bad ? s->bad_windows + 1 : 0;
-+    if (s->bad_windows < 2)
-+        return false;
-+    s->bad_windows = 0;
-+    s->phase += 0.25;
-+    if (s->phase >= 1.0)
-+        s->phase -= 1.0;
++    int b = (int)floor(phase * AVF_PACE_BINS + 0.5);
++    return ((b % AVF_PACE_BINS) + AVF_PACE_BINS) % AVF_PACE_BINS;
++}
++
++// Start (or start again) at phase with nothing known.
++static void avf_vsync_pace_start(struct avf_vsync_pace *s, double phase)
++{
++    int steps = s->steps;
++    *s = (struct avf_vsync_pace){.phase = phase, .steps = steps, .init = true,
++                                 .dir = -1};
++    for (int i = 0; i < AVF_PACE_BINS; i++)
++        s->rate[i] = -1;
++}
++
++static void avf_vsync_pace_arrive(struct avf_vsync_pace *s)
++{
++    s->frames = s->drops = s->clean_run = 0;
++    s->block_frames = s->block_drops = 0;
++    s->settle = 1;
++}
++
++static int avf_vsync_pace_wrap(int bin)
++{
++    return ((bin % AVF_PACE_BINS) + AVF_PACE_BINS) % AVF_PACE_BINS;
++}
++
++// The bin to try next on side d (-1 or +1) of the best bin, or -1 when that
++// side is done: the first bin not yet measured past the ones known there,
++// unless the last one known is clearly worse than the best (over twice its
++// rate and 0.05% more: the band's flank, so the band is not walked into),
++// or AVF_PACE_PLATEAU bins there have already failed to beat the best.
++// Rates a little apart are not told apart: over a few minutes they are
++// noise.
++#define AVF_PACE_PLATEAU 3
++
++static int avf_vsync_pace_side(const struct avf_vsync_pace *s, int best, int d)
++{
++    int last = best, k = 1;
++    for (; k < AVF_PACE_BINS; k++) {
++        int n = avf_vsync_pace_wrap(best + d * k);
++        if (s->rate[n] < 0)
++            break;
++        last = n;
++    }
++    if (k >= AVF_PACE_BINS || k > AVF_PACE_PLATEAU)
++        return -1;
++    if (last != best && s->rate[last] > 2 * s->rate[best] + 0.0005)
++        return -1;
++    return avf_vsync_pace_wrap(best + d * k);
++}
++
++// Leave the current bin (its rate recorded by the caller) for the next one
++// to try; false when there is none and the search rests where it is.
++//   - While every bin known is very bad (AVF_PACE_FAST_RATE: the stutter
++//     shows), the point jumps a quarter refresh at a time, to get out of
++//     the band at once rather than walk through it.
++//   - Otherwise it goes to the next bin on one side of the best bin known
++//     (avf_vsync_pace_side()), the side it was walking towards first.
++//   - With neither side left it goes back to the best bin and rests.
++static bool avf_vsync_pace_move(struct avf_vsync_pace *s)
++{
++    int cur = avf_vsync_pace_bin(s->phase), best = cur;
++    for (int i = 0; i < AVF_PACE_BINS; i++) {
++        if (s->rate[i] >= 0 && s->rate[i] < s->rate[best])
++            best = i;
++    }
++    int to = -1;
++    if (s->rate[best] >= AVF_PACE_FAST_RATE) {
++        for (int k = 1; k < 4 && to < 0; k++) {
++            int n = avf_vsync_pace_wrap(cur + s->dir * k * (AVF_PACE_BINS / 4));
++            if (s->rate[n] < 0)
++                to = n;
++        }
++    }
++    for (int k = 0; k < 2 && to < 0; k++) {
++        int d = k ? -s->dir : s->dir;
++        to = avf_vsync_pace_side(s, best, d);
++        if (to >= 0)
++            s->dir = d;
++    }
++    s->held = false;
++    if (to < 0) {
++        s->rest = true;
++        if (best == cur)
++            return false;
++        to = best;
++        s->held = s->rate[best] == 0;
++    }
++    s->phase = (double)to / AVF_PACE_BINS;
 +    s->steps++;
++    avf_vsync_pace_arrive(s);
++    return true;
++}
++
++// One report window of the layer's own counts (frames shown and dropped)
++// while frames went in at the point. Returns 1 when the point moved, 2 when
++// its state changed without a move (held or at rest: worth saving), else 0.
++static int avf_vsync_pace_feed(struct avf_vsync_pace *s, int64_t shown,
++                               int64_t dropped)
++{
++    if (!s->init)
++        avf_vsync_pace_start(s, s->phase);
++    int64_t n = shown + dropped;
++    if (n < AVF_PACE_MIN_FRAMES || dropped < 0)
++        return 0;
++    if (s->settle > 0) {
++        s->settle--;
++        return 0;
++    }
++    s->frames += n;
++    s->drops += dropped;
++    s->clean_run = dropped ? 0 : s->clean_run + n;
++    if (s->block_frames >= AVF_PACE_BLOCK_FRAMES)
++        s->block_frames = s->block_drops = 0;
++    s->block_frames += n;
++    s->block_drops += dropped;
++
++    int cur = avf_vsync_pace_bin(s->phase);
++    bool fast = dropped >= AVF_PACE_FAST_DROPS && dropped >= n * AVF_PACE_FAST_RATE;
++    if (fast || s->block_drops >= AVF_PACE_BLOCK_DROPS) {
++        // The rate here: the window's when it is that bad, else over the
++        // whole stay once that is long enough to say, else the block's.
++        double r = fast ? (double)dropped / n
++                 : s->frames >= AVF_PACE_CLEAN_FRAMES ? (double)s->drops / s->frames
++                 : (double)s->block_drops / s->block_frames;
++        if (fast && (s->held || s->rest)) {
++            // It was good and is very bad now: the display's timing changed,
++            // and what was learned no longer holds.
++            avf_vsync_pace_start(s, s->phase);
++        }
++        s->held = s->rest = false;
++        s->rate[cur] = (float)r;
++        if (avf_vsync_pace_move(s))
++            return 1;
++        avf_vsync_pace_arrive(s);
++        s->settle = 0;
++        return 2;
++    }
++    if (!s->held && s->clean_run >= AVF_PACE_CLEAN_FRAMES) {
++        s->held = true;
++        s->rest = false;
++        s->rate[cur] = 0;
++        s->frames = s->drops = 0;
++        return 2;
++    }
++    // A drop now and then, also at a point that was held: 3 in 7,200 to
++    // 21,600 frames, or (not held) any by 21,600.
++    if (!s->rest && s->drops > 0 &&
++        ((s->frames >= AVF_PACE_CLEAN_FRAMES && s->drops >= AVF_PACE_SLOW_DROPS) ||
++         (!s->held && s->frames >= AVF_PACE_SLOW_FRAMES)))
++    {
++        s->rate[cur] = (float)((double)s->drops / s->frames);
++        return avf_vsync_pace_move(s) ? 1 : 2;
++    }
++    if (s->held && s->frames >= AVF_PACE_SLOW_FRAMES)
++        s->frames = s->drops = 0;
++    return 0;
++}
++
++// The search's state as one line of text (no newline), for the VO to keep
++// between runs per display mode, and back. Rates are per million frames.
++static int avf_vsync_pace_print(const struct avf_vsync_pace *s, char *buf, size_t size)
++{
++    int at = snprintf(buf, size, "%.4f %d %d %d", s->phase, s->held ? 1 : 0,
++                      s->rest ? 1 : 0, s->dir);
++    for (int i = 0; i < AVF_PACE_BINS && at > 0 && (size_t)at < size; i++) {
++        at += snprintf(buf + at, size - at, " %ld",
++                       !s->init || s->rate[i] < 0 ? -1L : lround(s->rate[i] * 1e6));
++    }
++    return at;
++}
++
++static bool avf_vsync_pace_parse(struct avf_vsync_pace *s, const char *text)
++{
++    double phase;
++    int held, rest, dir, used = 0;
++    if (sscanf(text, "%lf %d %d %d%n", &phase, &held, &rest, &dir, &used) != 4 ||
++        !(phase >= 0 && phase < 1))
++        return false;
++    struct avf_vsync_pace r = {.steps = s->steps};
++    avf_vsync_pace_start(&r, phase);
++    r.held = held == 1;
++    r.rest = rest == 1 && !r.held;
++    r.dir = dir > 0 ? 1 : -1;
++    const char *at = text + used;
++    for (int i = 0; i < AVF_PACE_BINS; i++) {
++        long v;
++        int n = 0;
++        if (sscanf(at, " %ld%n", &v, &n) != 1)
++            return false;
++        at += n;
++        r.rate[i] = v < 0 ? -1 : (float)(v / 1e6);
++    }
++    *s = r;
 +    return true;
 +}
 +
@@ -998,7 +1259,7 @@ index 2b644cd..1a2cd3f 100644
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1180,42 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1404,47 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -1018,6 +1279,11 @@ index 2b644cd..1a2cd3f 100644
 +    int64_t vsync_layer_dropped_seen;   // the layer's dropped count last seen (-1: none)
 +    int64_t vsync_pace_wait_ns;
 +    double vsync_pace_opt;          // the pace-phase option last applied
++    int64_t vsync_pace_period;      // the refresh period the point is for (0: none yet)
++    // What an OSD enqueue ahead of the video's takes (smoothed), taken off
++    // the wait of a frame that carries one.
++    double vsync_osd_enqueue_ns;
++    bool vsync_pace_with_osd;
 +    // A sparse luma grid of the last frame, to find cuts and still pictures
 +    // (vsync_frame_candidate).
 +    uint8_t vsync_grid[2][AVF_QUIET_GRID_W * AVF_QUIET_GRID_H];
@@ -1041,7 +1307,7 @@ index 2b644cd..1a2cd3f 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +1925,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +2154,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1057,7 +1323,7 @@ index 2b644cd..1a2cd3f 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2016,763 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2245,909 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -1297,6 +1563,8 @@ index 2b644cd..1a2cd3f 100644
 +    os_unfair_lock_unlock(&clock->lock);
 +}
 +
++static void vsync_pace_save(struct vo *vo);
++
 +static void vsync_snap_report(struct vo *vo, int64_t now)
 +{
 +    struct priv *p = vo->priv;
@@ -1336,10 +1604,24 @@ index 2b644cd..1a2cd3f 100644
 +    bool paced = p->opts->vsync_snap == AVF_VSYNC_SNAP_YES &&
 +                 p->opts->vsync_snap_pace != AVF_VSYNC_PACE_NO &&
 +                 p->presentation_host;
++    // Auto pacing judges steady windows only: a start, a seek or a pause
++    // (a new lock, frames without a refresh) drops frames of its own, and
++    // the counts read just after one still hold them.
 +    bool moved_pace = false;
 +    if (paced && p->opts->vsync_snap_pace == AVF_VSYNC_PACE_AUTO && lshown >= 0 &&
-+        st->frames - st->unsnapped >= AVF_VSYNC_PACE_MIN_FRAMES)
-+        moved_pace = avf_vsync_pace_judge(&p->vsync_pace, lshown, ldropped);
++        p->vsync_pace_period)
++    {
++        bool steady = st->unsnapped == 0 && p->vsync_snap.relocks == st->relocks0 &&
++                      st->frames >= AVF_PACE_MIN_FRAMES;
++        if (!steady) {
++            p->vsync_pace.settle = MPMAX(p->vsync_pace.settle, 1);
++        } else {
++            int r = avf_vsync_pace_feed(&p->vsync_pace, lshown, ldropped);
++            moved_pace = r == 1;
++            if (r)
++                vsync_pace_save(vo);
++        }
++    }
 +    if (st->frames) {
 +        int n = MPMAX(st->frames - st->unsnapped, 1);
 +        static const char *const modes[] = {"off", "on", "measure"};
@@ -1370,13 +1652,14 @@ index 2b644cd..1a2cd3f 100644
 +        int ne = MPMAX(st->enq, 1);
 +        MP_VERBOSE(vo, "vsync-snap pace %s %.2f: lead min %.1f avg %.1f max %.1f ms, "
 +                   "pace wait avg %.1f max %.1f, ready wait avg %.1f max %.1f, layer "
-+                   "shown %lld dropped %lld, steps=%d%s\n",
++                   "shown %lld dropped %lld, steps=%d %s%s\n",
 +                   paced ? (p->opts->vsync_snap_pace == AVF_VSYNC_PACE_AUTO ? "auto" : "yes")
 +                         : "off", p->vsync_pace.phase,
 +                   st->lead_min / 1e6, st->lead_sum / ne / 1e6, st->lead_max / 1e6,
 +                   st->pace_sum / ne / 1e6, st->pace_max / 1e6,
 +                   st->ready_sum / ne / 1e6, st->ready_max / 1e6,
 +                   (long long)lshown, (long long)ldropped, p->vsync_pace.steps,
++                   p->vsync_pace.held ? "held" : p->vsync_pace.rest ? "rest" : "search",
 +                   moved_pace ? " (moved)" : "");
 +        // Lip sync and steps: the picture's offset from its sound (+: the
 +        // picture late, the sound early), the drift, the resampling asked
@@ -1725,35 +2008,164 @@ index 2b644cd..1a2cd3f 100644
 +// refresh (see avf_vsync_pace_ns()), then note where its enqueue fell. Called
 +// just before the frame goes to the layer (ready_wait: how long flip_page
 +// waited for the layer to take more) and, with pace, also at flip_page's start.
-+#define AVF_VSYNC_PACE_MIN_LEAD_NS MP_TIME_MS_TO_NS(40)
++// A frame that comes to the VO too late for its point is held for the next
++// one when that still leaves it this long before its stamp: 20 ms, which is
++// 30 ms before the refresh it is shown on. Going in at once instead put it
++// wherever mpv's schedule was, and on the 1st generation Apple TV 4K that
++// is inside the band that drops frames (half the drops left at its clean
++// point came with an enqueue 14 to 26 ms late).
++#define AVF_VSYNC_PACE_MIN_LEAD_NS MP_TIME_MS_TO_NS(20)
 +
-+static void vsync_pace_wait(struct vo *vo)
++// Sleep until `at` (mp_time_ns). One long sleep overshoots by milliseconds
++// on an Apple TV (the longer the sleep, the more: enqueues spread -4 to +5
++// ms after 33 ms waits, -2 to +2 after 7 ms ones), so the last stretch is
++// taken in short hops and the last 0.3 ms without sleeping.
++static void vsync_wait_until(int64_t at)
++{
++    for (;;) {
++        int64_t left = at - mp_time_ns();
++        if (left <= 0)
++            return;
++        if (left > MP_TIME_MS_TO_NS(3)) {
++            mp_sleep_ns(left - MPMAX(MP_TIME_MS_TO_NS(2), left / 6));
++        } else if (left > MP_TIME_US_TO_NS(300)) {
++            mp_sleep_ns(MP_TIME_US_TO_NS(150));
++        }
++    }
++}
++
++// The point a device starts from when nothing was saved for it: the middle
++// of what was measured clean on it (see "avf vsync snap": the 1st generation
++// Apple TV 4K takes hand-overs near the display link's instant, the 2nd in
++// the middle of the refresh). Other devices start in the middle and auto
++// pacing moves the point if the layer drops frames there.
++static double vsync_pace_device_default(void)
++{
++#if TARGET_OS_TV
++    char model[64] = {0};
++    size_t size = sizeof(model) - 1;
++    if (sysctlbyname("hw.machine", model, &size, NULL, 0) == 0 &&
++        strcmp(model, "AppleTV6,2") == 0)
++        return 0.05;
++#endif
++    return 0.42;
++}
++
++// --avfoundation-vsync-snap-pace-file: what auto pacing learned, one line
++// per display mode ("pace1 <refresh period, us> <state>"), so a device
++// starts each film at the point it found clean. Read when the display's
++// mode is first known, rewritten when the point moves or is confirmed.
++static bool vsync_pace_file_mode(const char *line, int64_t period, const char **state)
++{
++    long us = 0;
++    int used = 0;
++    if (sscanf(line, "pace1 %ld%n", &us, &used) != 1 || us <= 0)
++        return false;
++    *state = line + used;
++    return llabs(us * 1000 - period) * 200 <= period;
++}
++
++static bool vsync_pace_load(struct vo *vo, int64_t period)
++{
++    struct priv *p = vo->priv;
++    const char *path = p->opts->vsync_snap_pace_file;
++    if (!path || !path[0])
++        return false;
++    FILE *f = fopen(path, "r");
++    if (!f)
++        return false;
++    char line[512];
++    bool found = false;
++    while (!found && fgets(line, sizeof(line), f)) {
++        const char *state;
++        found = vsync_pace_file_mode(line, period, &state) &&
++                avf_vsync_pace_parse(&p->vsync_pace, state);
++    }
++    fclose(f);
++    if (found) {
++        MP_VERBOSE(vo, "vsync-snap pace: starting at the saved point %.3f (%s)\n",
++                   p->vsync_pace.phase,
++                   p->vsync_pace.held ? "held" : p->vsync_pace.rest ? "rest" : "search");
++    }
++    return found;
++}
++
++static void vsync_pace_save(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    const char *path = p->opts->vsync_snap_pace_file;
++    if (!path || !path[0] || !p->vsync_pace_period)
++        return;
++    char *tmp = talloc_asprintf(NULL, "%s.tmp", path);
++    FILE *out = fopen(tmp, "w");
++    if (out) {
++        // The other modes' lines are kept.
++        FILE *in = fopen(path, "r");
++        char line[512];
++        while (in && fgets(line, sizeof(line), in)) {
++            const char *state;
++            if (!vsync_pace_file_mode(line, p->vsync_pace_period, &state) &&
++                strncmp(line, "pace1 ", 6) == 0)
++                fputs(line, out);
++        }
++        if (in)
++            fclose(in);
++        char state[400];
++        avf_vsync_pace_print(&p->vsync_pace, state, sizeof(state));
++        fprintf(out, "pace1 %ld %s\n", (long)(p->vsync_pace_period / 1000), state);
++        bool ok = fclose(out) == 0;
++        if (!ok || rename(tmp, path) != 0)
++            unlink(tmp);
++    }
++    talloc_free(tmp);
++}
++
++// The point for this display mode: the option when it is set (again when it
++// is set while playing, which also starts auto's search afresh there), else
++// what was saved for the mode, else the device's default.
++static void vsync_pace_setup(struct vo *vo, int64_t period)
++{
++    struct priv *p = vo->priv;
++    double opt = p->opts->vsync_snap_pace_phase;
++    bool new_mode = !p->vsync_pace_period ||
++                    llabs(period - p->vsync_pace_period) * 200 > p->vsync_pace_period;
++    if (!new_mode && opt == p->vsync_pace_opt)
++        return;
++    p->vsync_pace_period = period;
++    p->vsync_pace_opt = opt;
++    if (opt >= 0) {
++        avf_vsync_pace_start(&p->vsync_pace, opt);
++    } else if (!vsync_pace_load(vo, period)) {
++        avf_vsync_pace_start(&p->vsync_pace, vsync_pace_device_default());
++    }
++}
++
++static void vsync_pace_wait(struct vo *vo, bool with_osd)
 +{
 +    struct priv *p = vo->priv;
 +    p->vsync_pace_wait_ns = 0;
++    p->vsync_pace_at_ns = 0;
++    p->vsync_pace_with_osd = with_osd;
 +    if (!p->vsync_frame_snapped || p->opts->vsync_snap != AVF_VSYNC_SNAP_YES ||
 +        p->opts->vsync_snap_pace == AVF_VSYNC_PACE_NO)
 +        return;
 +    int64_t now = mp_time_ns(), vsync, period, nominal;
 +    if (!vsync_snap_grid(p, now, &vsync, &period, &nominal))
 +        return;
-+    // A fixed point, or auto's starting one: the option (again when set).
-+    if (p->opts->vsync_snap_pace == AVF_VSYNC_PACE_YES ||
-+        p->opts->vsync_snap_pace_phase != p->vsync_pace_opt)
-+    {
-+        p->vsync_pace.phase = p->opts->vsync_snap_pace_phase;
-+        p->vsync_pace_opt = p->opts->vsync_snap_pace_phase;
-+        p->vsync_pace.bad_windows = 0;
-+    }
-+    // Aimed early by how late the enqueue has been after the point (the
-+    // OSD enqueue and the readiness check between them, a few ms).
-+    int64_t phase = (int64_t)llround(period * p->vsync_pace.phase) -
-+                    (int64_t)p->vsync_pace_late_ns;
++    vsync_pace_setup(vo, period);
++    // Aimed early by how late the video enqueue has been after the point
++    // (the readiness check), and on a frame that carries an OSD sample by
++    // what that sample's enqueue takes (3 to 9 ms on an Apple TV): it goes
++    // in first, and the video's is the one that must fall on the point.
++    int64_t early = (int64_t)p->vsync_pace_late_ns +
++                    (with_osd ? (int64_t)p->vsync_osd_enqueue_ns : 0);
++    int64_t phase = (int64_t)llround(period * p->vsync_pace.phase) - early;
 +    int64_t at = avf_vsync_pace_ns(now, p->vsync_frame_stamp_ns, vsync, period,
 +                                   phase, AVF_VSYNC_PACE_MIN_LEAD_NS);
-+    p->vsync_pace_at_ns = at > now ? at + (int64_t)p->vsync_pace_late_ns : 0;
++    // Lateness is learned from frames without an OSD sample only.
++    p->vsync_pace_at_ns = at > now && !with_osd ? at + (int64_t)p->vsync_pace_late_ns : 0;
 +    if (at > now) {
-+        mp_sleep_ns(at - now);
++        vsync_wait_until(at);
 +        p->vsync_pace_wait_ns = at - now;
 +    }
 +}
@@ -1821,7 +2233,7 @@ index 2b644cd..1a2cd3f 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -5175,7 +6660,14 @@ static void flip_page(struct vo *vo)
+@@ -5175,14 +7035,25 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
@@ -1829,14 +2241,26 @@ index 2b644cd..1a2cd3f 100644
 +        // and video samples made, so that what goes to the layer goes there
 +        // ("avf vsync snap").
 +        if (video_buf)
-+            vsync_pace_wait(vo);
++            vsync_pace_wait(vo, osd_buf != NULL);
 +        int64_t ready_start = mp_time_ns();
          if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
 +            int64_t ready_wait = mp_time_ns() - ready_start;
              if (!p->presentation_host)
                  update_media_timebase_for_frame(vo);
  
-@@ -5199,8 +6691,10 @@ static void flip_page(struct vo *vo)
+             if (osd_buf) {
+                 t = mp_time_ns();
+                 osd_enqueued = enqueue_osd_sample(vo, osd_buf);
+-                p->perf.enqueue_ns += mp_time_ns() - t;
++                int64_t osd_ns = mp_time_ns() - t;
++                p->perf.enqueue_ns += osd_ns;
++                p->vsync_osd_enqueue_ns = p->vsync_osd_enqueue_ns > 0
++                    ? p->vsync_osd_enqueue_ns + (MPMIN(osd_ns, 12e6) - p->vsync_osd_enqueue_ns) / 4
++                    : MPMIN(osd_ns, 12e6);
+                 if (osd_enqueued) {
+                     p->osd_needs_enqueue = false;
+                     if (osd_buf_has_subtitle)
+@@ -5199,8 +7070,10 @@ static void flip_page(struct vo *vo)
                  }
              }
  
@@ -1847,7 +2271,7 @@ index 2b644cd..1a2cd3f 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,7 +6759,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,7 +7138,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
@@ -1872,7 +2296,7 @@ index 2b644cd..1a2cd3f 100644
          // Queue slack lets a frame be stamped that much further ahead.
          p->next_present_host_ns = avf_host_present_ns(
              p->last_host_present_ns, p->next_present_host_ns,
-@@ -5288,6 +6799,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +7178,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -1883,7 +2307,7 @@ index 2b644cd..1a2cd3f 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +6884,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7263,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -1892,7 +2316,7 @@ index 2b644cd..1a2cd3f 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,6 +7022,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,6 +7401,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -1903,7 +2327,7 @@ index 2b644cd..1a2cd3f 100644
          p->playback_paused = was_paused;
          sample_buffer_renderer_flush(p->displayLayer);
          if (p->presentation_host && p->timebase) {
-@@ -5519,11 +7040,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7419,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -1920,7 +2344,7 @@ index 2b644cd..1a2cd3f 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7091,41 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7470,45 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -1942,7 +2366,11 @@ index 2b644cd..1a2cd3f 100644
 +        {"yes", AVF_VSYNC_PACE_YES},
 +        {"auto", AVF_VSYNC_PACE_AUTO})},
 +    // That point, as a share of a refresh past the display link's instant.
-+    {"vsync-snap-pace-phase", OPT_DOUBLE(vsync_snap_pace_phase), M_RANGE(0.0, 0.99)},
++    // -1 (the default): where auto pacing last held it for this display mode
++    // (-pace-file), else the device's own default.
++    {"vsync-snap-pace-phase", OPT_DOUBLE(vsync_snap_pace_phase), M_RANGE(-1.0, 0.99)},
++    // Where auto pacing keeps what it learned, per display mode.
++    {"vsync-snap-pace-file", OPT_STRING(vsync_snap_pace_file), .flags = M_OPT_FILE},
 +    // Decoded audio at one frame per refresh: resample the sound by up to
 +    // this many ppm to follow the display, so the picture never steps
 +    // (0: off; the steps then hide the drift as with passthrough).
@@ -1962,7 +2390,7 @@ index 2b644cd..1a2cd3f 100644
      {0},
  };
  
-@@ -5579,6 +7140,26 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7523,27 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,
@@ -1975,11 +2403,12 @@ index 2b644cd..1a2cd3f 100644
 +        // the grid its link reports). Off there; measure shows what it would do.
 +        .vsync_snap = TARGET_OS_TV ? AVF_VSYNC_SNAP_YES : AVF_VSYNC_SNAP_NO,
 +        .vsync_snap_lead = 0.25,
-+        // Enqueues 9 to 27 ms past the instant were clean on both Apple TVs
-+        // measured (see "avf vsync snap"); 0.42 is the middle, 17.5 ms at
-+        // 23.976 Hz.
++        // No one enqueue point is clean on every Apple TV (see "avf vsync
++        // snap"): the point is the one auto pacing saved for the display
++        // mode, else the device's default (vsync_pace_device_default()),
++        // and auto moves it when the layer drops frames there.
 +        .vsync_snap_pace = AVF_VSYNC_PACE_AUTO,
-+        .vsync_snap_pace_phase = 0.42,
++        .vsync_snap_pace_phase = -1,
 +        .vsync_snap_resample_ppm = 500,
 +        // EBU R37's sound-late limit, and well inside its sound-early one.
 +        .vsync_snap_sound_late_ms = 60,
