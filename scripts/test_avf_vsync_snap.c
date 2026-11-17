@@ -1623,6 +1623,79 @@ int main(void)
     // 17b. One frame per slot: slot_cases().
     failures += slot_cases();
 
+    // 17c. The drop recorder: the ring keeps the newest 96 in order; every
+    //      line it writes is under 200 characters whatever the values; dumps
+    //      are limited to one per 3 s and 12 a minute, the rest counted.
+    {
+        static struct avf_rec_ring ring;
+        memset(&ring, 0, sizeof(ring));
+        for (int i = 0; i < 250; i++)
+            avf_rec_push(&ring)->pos_ms = i;
+        bool order = ring.count == AVF_REC_RING;
+        for (int i = 0; i < AVF_REC_RING; i++) {
+            const struct avf_rec_frame *f = avf_rec_newest(&ring, AVF_REC_RING, i);
+            order = order && f && f->pos_ms == 250 - AVF_REC_RING + i &&
+                    f->serial == (uint32_t)(250 - AVF_REC_RING + i + 1);
+        }
+        const struct avf_rec_frame *last = avf_rec_newest(&ring, AVF_REC_SHOW, AVF_REC_SHOW - 1);
+        order = order && last && last->pos_ms == 249 &&
+                avf_rec_newest(&ring, AVF_REC_SHOW, 0)->pos_ms == 250 - AVF_REC_SHOW &&
+                !avf_rec_newest(&ring, AVF_REC_SHOW, AVF_REC_SHOW);
+        check(order, "recorder: the ring keeps the newest 96 in order across wrap-around");
+
+        char line[512];
+        int longest = 0;
+        double big[] = {0, 1e12, -1e12, NAN, 123.456, -0.001};
+        for (int k = 0; k < 6; k++) {
+            double v = big[k];
+            struct avf_rec_frame f = {
+                .serial = 4294967295u, .w = (int32_t)fmax(-2e9, fmin(2e9, v)), .h = 99999999,
+                .pos_ms = (int64_t)fmax(-9e15, fmin(9e15, v != v ? 0 : v)), .type = k,
+                .gap_ms = (float)v, .start_ms = (float)v, .luma_us = (int32_t)fmax(-2e9, fmin(2e9, v)),
+                .make_us = 2000000000, .wait_ms = (float)v, .over_us = (float)v,
+                .enq_ms = (float)v, .lead_ms = (float)v, .ready_ms = (float)v,
+                .slot = 1000000, .step = -1000000, .osd_ms = (float)v, .flags = 15,
+            };
+            int n = avf_rec_format(&f, 1 << 30, line, sizeof(line));
+            longest = n > longest ? n : longest;
+            struct avf_rec_header h = {
+                .drop_no = 1 << 30, .rise = 1 << 30, .film_s = v, .since_ask_s = v,
+                .status = "unknownstatus", .ready = true, .flush = true, .av_ms = v,
+                .lock_ms = v, .point = v, .state = "search-long", .timebase_ms = v,
+                .shown = 48, .kept = 96, .after_seek = k & 1,
+            };
+            n = avf_rec_format_header(&h, line, sizeof(line));
+            longest = n > longest ? n : longest;
+        }
+        struct avf_rec_frame typical = {
+            .serial = 131201, .w = 1920, .h = 1080, .pos_ms = 5529612, .type = 2,
+            .gap_ms = 2.1f, .start_ms = 19.6f, .luma_us = 80, .make_us = 240, .wait_ms = 39.2f,
+            .over_us = 30, .enq_ms = 17.52f, .lead_ms = 55.5f, .slot = 1, .step = 1,
+        };
+        avf_rec_format(&typical, 7, line, sizeof(line));
+        printf("recorder: longest line %d characters; a typical one:\n  %s\n", longest, line);
+        check(longest < 200, "recorder: every line under 200 characters with extreme values");
+
+        struct avf_rec_limit lim = {0};
+        int64_t t = 1000000000000LL;
+        int written = 0;
+        for (int i = 0; i < 60; i++)    // a drop a second for a minute
+            written += avf_rec_allow(&lim, t + (int64_t)i * 1000000000LL);
+        int held = lim.held;
+        printf("recorder: a drop a second for a minute: %d dumps, %d held\n", written, held);
+        // 3 s apart for two minutes: 12 in each minute at most.
+        struct avf_rec_limit l2 = {0};
+        int per_min[2] = {0};
+        for (int i = 0; i < 40; i++) {
+            int64_t at = t + (int64_t)i * 3000000000LL;
+            if (avf_rec_allow(&l2, at))
+                per_min[i * 3 >= 60]++;
+        }
+        check(written <= 12 && held == 60 - written && !avf_rec_allow(&lim, t + 60500000000LL - 1000000000LL) &&
+              per_min[0] == 12 && per_min[1] <= 12 && l2.held == 40 - per_min[0] - per_min[1],
+              "recorder: one dump per 3 s, 12 a minute, the rest counted");
+    }
+
     // 18. The refresh clock: the period from the link's timestamps, through
     //     the link stopping (background, a sleeping display), coming back on
     //     its grid or at another phase, and display mode changes.

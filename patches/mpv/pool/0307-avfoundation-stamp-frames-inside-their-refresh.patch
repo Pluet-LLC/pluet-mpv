@@ -243,6 +243,13 @@ lead; the "sync" line counts them ("unsent N").
 sample when the VO starts on the frame, a slot ahead of its video, when
 that is over half a refresh before the frame's point; its stamp is the
 frame's. The "sync" line's resample figure is the one applied (0 off).
+A drop recorder (--avfoundation-vsync-snap-record, default yes, filled
+only at the verbose log level) keeps the last 96 frames' hand-over (film
+position, frame type and size, hand-off gap, work start, luma read,
+sample make, pacing wait and overshoot, enqueue point, lead, ready wait,
+slot and stamp steps, subtitle enqueue, flags) and writes the 48 newest
+under a header line when the layer's dropped count rises; one dump per 3 s
+and 12 a minute, none in the two windows after a start, seek or pause.
 
 
 scripts/test_avf_vsync_snap.sh compiles the snap and the pacing from the
@@ -368,7 +375,7 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..00835c2 100644
+index 2b644cd..ea6dae0 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,9 @@
@@ -381,7 +388,7 @@ index 2b644cd..00835c2 100644
  
  #if TARGET_OS_IPHONE
  #import <UIKit/UIKit.h>
-@@ -269,6 +272,35 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
+@@ -269,6 +272,36 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
      int presentation;
      int osd_max_height;
      bool osd_video_res;
@@ -396,6 +403,7 @@ index 2b644cd..00835c2 100644
 +    char *vsync_snap_pace_file;
 +    bool osd_after_video;
 +    bool osd_slots_ahead;
++    bool vsync_snap_record;
 +    bool expect_monotonic;
 +};
 +
@@ -417,7 +425,7 @@ index 2b644cd..00835c2 100644
  };
  
  // --- avf sync servo core (host-testable; keep freestanding) ---
-@@ -476,6 +508,1099 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -476,6 +509,1253 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
  }
  // --- end avf sync servo core ---
  
@@ -873,6 +881,160 @@ index 2b644cd..00835c2 100644
 +static bool avf_osd_slot_ahead(int64_t now_ns, int64_t point_ns, int64_t period_ns)
 +{
 +    return period_ns > 0 && point_ns > 0 && point_ns - now_ns > period_ns / 2;
++}
++
++// The drop recorder (--avfoundation-vsync-snap-record): what the VO did with
++// each of the last AVF_REC_RING frames (4 s at 24 fps; the layer's dropped
++// count is read once a second and arrives late), written out when the
++// layer's dropped count rises, so a single drop the window lines cannot
++// explain can be set beside the frames around it: a late decode or a late
++// core (hand-off gap large, work start late, wait short), a late VO thread
++// (gap normal, overshoot large), or a clean hand-over the layer dropped
++// anyway (all normal).
++#define AVF_REC_RING 96
++#define AVF_REC_SHOW 48
++enum {
++    AVF_REC_UNSENT = 1,     // left out by a skip
++    AVF_REC_NO_REFRESH = 2, // no refresh clock: not snapped
++    AVF_REC_NEW_LOCK = 4,   // a new lock was taken on it
++    AVF_REC_AT_ONCE = 8,    // too late for its point: sent at once
++};
++
++struct avf_rec_frame {
++    uint32_t serial;
++    int32_t w, h;
++    int64_t pos_ms;         // film position
++    int type;               // mp_image pict_type: 1 I, 2 P, 3 B, else unknown
++    float gap_ms;           // from the last flip_page's return to draw_frame
++    float start_ms;         // where in the refresh the VO started on it
++    int32_t luma_us, make_us;
++    float wait_ms;          // pacing wait asked
++    float over_us;          // woken this long after it
++    float enq_ms;           // where in the refresh the video went in
++    float lead_ms, ready_ms;
++    int slot;               // refreshes since the last enqueue (-1: unknown)
++    int step;               // refreshes from the last frame's stamp
++    float osd_ms;           // its OSD sample's enqueue time, 0: none
++    int flags;
++};
++
++struct avf_rec_ring {
++    struct avf_rec_frame f[AVF_REC_RING];
++    uint32_t next_serial;
++    int head;               // where the next frame goes
++    int count;
++};
++
++// A new record for the next frame, cleared and numbered.
++static struct avf_rec_frame *avf_rec_push(struct avf_rec_ring *r)
++{
++    struct avf_rec_frame *f = &r->f[r->head];
++    *f = (struct avf_rec_frame){.serial = ++r->next_serial, .slot = -1};
++    r->head = (r->head + 1) % AVF_REC_RING;
++    if (r->count < AVF_REC_RING)
++        r->count++;
++    return f;
++}
++
++// The i-th of the n newest records, oldest first (NULL past them).
++static const struct avf_rec_frame *avf_rec_newest(const struct avf_rec_ring *r,
++                                                  int n, int i)
++{
++    if (n > r->count)
++        n = r->count;
++    if (i < 0 || i >= n)
++        return NULL;
++    int at = r->head - n + i;
++    return &r->f[(at % AVF_REC_RING + AVF_REC_RING) % AVF_REC_RING];
++}
++
++static double avf_rec_clamp(double v, double lo, double hi)
++{
++    return v != v ? 0 : v < lo ? lo : v > hi ? hi : v;
++}
++
++// One record as a log line, under 200 characters whatever the values.
++static int avf_rec_format(const struct avf_rec_frame *f, int drop_no, char *buf,
++                          size_t size)
++{
++    static const char types[] = "?IPB";
++    char flags[8] = "-";
++    int nf = 0;
++    if (f->flags & AVF_REC_UNSENT)
++        flags[nf++] = 'U';
++    if (f->flags & AVF_REC_NO_REFRESH)
++        flags[nf++] = 'N';
++    if (f->flags & AVF_REC_NEW_LOCK)
++        flags[nf++] = 'L';
++    if (f->flags & AVF_REC_AT_ONCE)
++        flags[nf++] = 'A';
++    if (nf)
++        flags[nf] = '\0';
++    return snprintf(buf, size,
++        "vsync-snap drop #%d f %u pos %.3f %c %dx%d gap %.1f start %.1f luma %d "
++        "make %d wait %.1f+%.2f enq %.2f lead %.1f rdy %.1f slot %d step %d osd %.1f %s",
++        (int)avf_rec_clamp(drop_no, 0, 99999), (unsigned)(f->serial % 10000000u),
++        avf_rec_clamp(f->pos_ms / 1000.0, -99999, 99999),
++        types[f->type >= 1 && f->type <= 3 ? f->type : 0],
++        (int)avf_rec_clamp(f->w, 0, 99999), (int)avf_rec_clamp(f->h, 0, 99999),
++        avf_rec_clamp(f->gap_ms, -999, 9999), avf_rec_clamp(f->start_ms, -99, 999),
++        (int)avf_rec_clamp(f->luma_us, 0, 999999), (int)avf_rec_clamp(f->make_us, 0, 999999),
++        avf_rec_clamp(f->wait_ms, -99, 999), avf_rec_clamp(f->over_us / 1000.0, -99, 999),
++        avf_rec_clamp(f->enq_ms, -99, 999), avf_rec_clamp(f->lead_ms, -999, 9999),
++        avf_rec_clamp(f->ready_ms, -99, 999), (int)avf_rec_clamp(f->slot, -1, 99),
++        (int)avf_rec_clamp(f->step, -99, 99), avf_rec_clamp(f->osd_ms, 0, 999), flags);
++}
++
++// What the header line of a dump says.
++struct avf_rec_header {
++    int drop_no, rise;
++    double film_s, since_ask_s;
++    const char *status;     // the layer's: ok, failed, unknown
++    bool ready, flush;
++    double av_ms, lock_ms, point;
++    const char *state;      // auto's: held, rest, search
++    double timebase_ms;
++    int shown, kept;        // records written, records kept
++    bool after_seek;        // in the two windows after a start, seek or pause
++};
++
++static int avf_rec_format_header(const struct avf_rec_header *h, char *buf, size_t size)
++{
++    return snprintf(buf, size,
++        "vsync-snap drop #%d (+%d) seen at film %.1f s, %.1f s after an ask; layer %.8s "
++        "ready %s flush %s; av %+.1f ms; lock %+.2f; point %.2f %.6s; "
++        "timebase %+.3f ms; %s",
++        (int)avf_rec_clamp(h->drop_no, 0, 99999), (int)avf_rec_clamp(h->rise, 0, 999),
++        avf_rec_clamp(h->film_s, 0, 99999), avf_rec_clamp(h->since_ask_s, 0, 99),
++        h->status ? h->status : "-", h->ready ? "yes" : "no", h->flush ? "yes" : "no",
++        avf_rec_clamp(h->av_ms, -999, 999), avf_rec_clamp(h->lock_ms, -999, 999),
++        avf_rec_clamp(h->point, 0, 1), h->state ? h->state : "-",
++        avf_rec_clamp(h->timebase_ms, -999, 999),
++        h->after_seek ? "(after a seek)" : h->shown < h->kept ? "newest shown" : "all shown");
++}
++
++// Dumps are limited to one per 3 s and 12 a minute; the rest are counted.
++struct avf_rec_limit {
++    int64_t last_ns;
++    int64_t at_ns[12];      // the last 12 dumps
++    int n;
++    int held;               // dumps not written since the last one
++};
++
++static bool avf_rec_allow(struct avf_rec_limit *l, int64_t now_ns)
++{
++    const int64_t s3 = INT64_C(3000000000), min = INT64_C(60000000000);
++    bool ok = !l->last_ns || now_ns - l->last_ns >= s3;
++    if (ok && l->n >= 12 && now_ns - l->at_ns[l->n % 12] < min)
++        ok = false;
++    if (!ok) {
++        l->held++;
++        return false;
++    }
++    l->at_ns[l->n % 12] = now_ns;
++    l->n++;
++    l->last_ns = now_ns;
++    return true;
 +}
 +
 +// --avfoundation-vsync-snap-pace=auto: finding and keeping the enqueue point.
@@ -1517,7 +1679,7 @@ index 2b644cd..00835c2 100644
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1616,64 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1771,74 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -1574,6 +1736,16 @@ index 2b644cd..00835c2 100644
 +    // when, on which refresh period.
 +    int64_t vsync_pace_until_ns, vsync_pace_planned_at_ns, vsync_pace_period_ns;
 +    int64_t vsync_last_enqueue_ns;  // the last snapped video enqueue (0: none since a flush)
++    // The drop recorder (avf_rec_ring): filled only at the verbose log level
++    // and with --avfoundation-vsync-snap-record; rec_cur is this frame's
++    // record (NULL: none).
++    struct avf_rec_ring rec;
++    struct avf_rec_frame *rec_cur;
++    struct avf_rec_limit rec_limit;
++    int64_t rec_flip_return_ns;
++    int64_t rec_prev_shown;
++    int rec_drops;                  // rises of the layer's dropped count seen
++    int rec_quiet_windows;          // windows still to come after a start, seek or pause
 +    // Media mode: the snapped stamp for the next frame, in media time.
 +    int64_t next_media_stamp_ns;
 +    bool next_media_stamp_valid;
@@ -1582,7 +1754,7 @@ index 2b644cd..00835c2 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +2383,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +2548,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1598,7 +1770,7 @@ index 2b644cd..00835c2 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2474,1000 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2639,1092 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -1840,11 +2012,66 @@ index 2b644cd..00835c2 100644
 +
 +static void vsync_pace_save(struct vo *vo);
 +
++static bool vsync_rec_on(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    return p->opts->vsync_snap_record && p->presentation_host &&
++           mp_msg_test(vo->log, MSGL_V);
++}
++
++// The layer's dropped count rose by `rise`: the recorder's header line and,
++// unless limited or just after a start, seek or pause, its newest records.
++static void vsync_rec_dump(struct vo *vo, int64_t now, int rise, int64_t since_ask)
++{
++    struct priv *p = vo->priv;
++    struct avf_vsync_stats *st = &p->vsync_stats;
++    p->rec_drops++;
++    bool after_seek = p->rec_quiet_windows > 0 || st->unsnapped ||
++                      p->vsync_snap.relocks != st->relocks0;
++    bool allowed = !after_seek && avf_rec_allow(&p->rec_limit, now);
++    if (!after_seek && !allowed)
++        return;     // counted in rec_limit.held
++    if (allowed && p->rec_limit.held) {
++        MP_VERBOSE(vo, "vsync-snap drop: %d more not shown\n", p->rec_limit.held);
++        p->rec_limit.held = 0;
++    }
++    const struct avf_rec_frame *newest = avf_rec_newest(&p->rec, 1, 0);
++    struct avf_rec_header h = {
++        .drop_no = p->rec_drops,
++        .rise = rise,
++        .film_s = newest ? newest->pos_ms / 1000.0 : 0,
++        .since_ask_s = since_ask / 1e9,
++        .ready = sample_buffer_renderer_is_ready(p->displayLayer),
++        .flush = sample_buffer_renderer_requires_flush(p->displayLayer),
++        .av_ms = st->av_n ? st->av_max / 1e6 : 0,
++        .lock_ms = -p->vsync_snap.lock_ns / 1e6,
++        .point = p->vsync_pace.phase,
++        .state = p->vsync_pace.held ? "held" : p->vsync_pace.rest ? "rest" : "search",
++        .timebase_ms = p->vsync_tb_offset_ns / 1e6,
++        .shown = allowed ? MPMIN(p->rec.count, AVF_REC_SHOW) : 0,
++        .kept = p->rec.count,
++        .after_seek = after_seek,
++    };
++    switch (sample_buffer_renderer_status(p->displayLayer)) {
++    case AVQueuedSampleBufferRenderingStatusRendering: h.status = "ok"; break;
++    case AVQueuedSampleBufferRenderingStatusFailed: h.status = "failed"; break;
++    default: h.status = "unknown"; break;
++    }
++    char line[256];
++    avf_rec_format_header(&h, line, sizeof(line));
++    MP_VERBOSE(vo, "%s\n", line);
++    for (int i = 0; i < h.shown; i++) {
++        avf_rec_format(avf_rec_newest(&p->rec, h.shown, i), p->rec_drops, line, sizeof(line));
++        MP_VERBOSE(vo, "%s\n", line);
++    }
++}
++
 +static void vsync_snap_report(struct vo *vo, int64_t now)
 +{
 +    struct priv *p = vo->priv;
 +    struct avf_vsync_stats *st = &p->vsync_stats;
 +
++    int64_t asked_before = p->vsync_metrics_asked_ns;
 +    vsync_snap_ask_layer(p, now);
 +    int64_t total, dropped;
 +    vsync_snap_layer_counts(p, &total, &dropped);
@@ -1863,6 +2090,12 @@ index 2b644cd..00835c2 100644
 +    {
 +        st->drop_n[st->drop_marks] = (int)(dropped - p->vsync_layer_dropped_seen);
 +        st->drop_at_s[st->drop_marks++] = (now - st->window_start_ns) / 1e9;
++    }
++    if (dropped >= 0 && p->vsync_layer_dropped_seen >= 0 &&
++        dropped > p->vsync_layer_dropped_seen && p->rec.count)
++    {
++        vsync_rec_dump(vo, now, (int)(dropped - p->vsync_layer_dropped_seen),
++                       asked_before ? now - asked_before : 0);
 +    }
 +    p->vsync_layer_dropped_seen = dropped;
 +    if (now - st->window_start_ns < MP_TIME_MS_TO_NS(5000))
@@ -2004,6 +2237,12 @@ index 2b644cd..00835c2 100644
 +                   st->osd_enq_max_ns / 1e6, osd_marks, st->slot_two, st->slot_empty,
 +                   st->pace_excused, st->pace_irregular ? " (irregular)" : "");
 +    }
++    // The recorder writes no dump in the two windows after a start, a seek
++    // or a pause (they drop frames of their own).
++    if (st->unsnapped || p->vsync_snap.relocks != st->relocks0)
++        p->rec_quiet_windows = 2;
++    else if (p->rec_quiet_windows > 0)
++        p->rec_quiet_windows--;
 +    struct avf_vsync_stats next = {
 +        .window_start_ns = now,
 +        .relocks0 = p->vsync_snap.relocks,
@@ -2084,6 +2323,9 @@ index 2b644cd..00835c2 100644
 +
 +    int64_t vsync, period, nominal;
 +    if (p->vsync_paused || !vsync_snap_grid(p, now, &vsync, &period, &nominal)) {
++        if (p->rec_cur)
++            p->rec_cur->flags |= AVF_REC_NO_REFRESH;
++        p->rec_prev_shown = 0;
 +        st->unsnapped++;
 +        st->have_prev = false;
 +        avf_vsync_snap_unlock(&p->vsync_snap);
@@ -2114,8 +2356,22 @@ index 2b644cd..00835c2 100644
 +    p->vsync_snap.hold = vo_get_audio_speed_applied(vo) && !p->vsync_servo.saturated;
 +    p->vsync_snap.picture_early_ns = MP_TIME_MS_TO_NS(p->opts->vsync_snap_sound_late_ms);
 +    p->vsync_snap.picture_late_ns = MP_TIME_MS_TO_NS(p->opts->vsync_snap_sound_early_ms);
++    int relocks_before = p->vsync_snap.relocks;
 +    int64_t shown = avf_vsync_snap_refresh(&p->vsync_snap, target_ns, vsync,
 +                                           period);
++    if (p->rec_cur) {
++        struct avf_rec_frame *r = p->rec_cur;
++        r->start_ms = vsync_mod(now - (vsync - (p->presentation_host ? p->vsync_tb_offset_ns : 0)),
++                                period) / 1e6;
++        if (p->vsync_snap.relocks != relocks_before)
++            r->flags |= AVF_REC_NEW_LOCK;
++        if (p->rec_prev_shown)
++            r->step = (int)((shown - p->rec_prev_shown + period / 2) / period);
++        if (p->vsync_snap.unsent)
++            r->flags |= AVF_REC_UNSENT;
++        else
++            p->rec_prev_shown = shown;
++    }
 +    int64_t stamp = shown - (int64_t)llround(period * p->opts->vsync_snap_lead);
 +    int64_t used = mode == AVF_VSYNC_SNAP_YES ? stamp : target_ns;
 +    if (p->vsync_snap.unsent && mode == AVF_VSYNC_SNAP_YES && p->presentation_host) {
@@ -2544,6 +2800,8 @@ index 2b644cd..00835c2 100644
 +            int64_t k = (gap + period / 2) / period;
 +            st->slot_two += k == 0;
 +            st->slot_empty += k >= 2;
++            if (p->rec_cur)
++                p->rec_cur->slot = (int)MPMIN(k, 99);
 +        }
 +    }
 +    p->vsync_last_enqueue_ns = now;
@@ -2555,6 +2813,12 @@ index 2b644cd..00835c2 100644
 +        p->vsync_pace_at_ns = 0;
 +    }
 +    double lead = p->vsync_frame_stamp_ns - now;
++    if (p->rec_cur) {
++        struct avf_rec_frame *r = p->rec_cur;
++        r->enq_ms = vsync_mod(now - vsync, period) / 1e6;
++        r->lead_ms = lead / 1e6;
++        r->ready_ms = ready_wait_ns / 1e6;
++    }
 +    st->lead_min = st->enq ? MPMIN(st->lead_min, lead) : lead;
 +    st->lead_max = st->enq ? MPMAX(st->lead_max, lead) : lead;
 +    st->lead_sum += lead;
@@ -2599,7 +2863,7 @@ index 2b644cd..00835c2 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -1467,6 +3647,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
+@@ -1467,6 +3904,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
  
      sample_buffer_renderer_flush(displayLayer);
      sample_buffer_renderer_flush(osdLayer);
@@ -2607,7 +2871,7 @@ index 2b644cd..00835c2 100644
  
      MP_WARN(vo, "Recovered AVFoundation display layer after %s "
                  "(status=%ld, requiresFlush=%s, ready=%s, "
-@@ -5092,6 +7273,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+@@ -5092,6 +7530,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
      }
  }
  
@@ -2636,7 +2900,7 @@ index 2b644cd..00835c2 100644
  static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
  {
      struct priv *p = vo->priv;
-@@ -5099,6 +7302,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+@@ -5099,6 +7559,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
      if (!buf)
          return false;
  
@@ -2645,7 +2909,7 @@ index 2b644cd..00835c2 100644
      sample_buffer_renderer_enqueue(p->displayLayer, buf);
      p->last_video_enqueue_ns = mp_time_ns();
      return true;
-@@ -5142,6 +7347,41 @@ static void report_osd_perf(struct vo *vo)
+@@ -5142,6 +7604,43 @@ static void report_osd_perf(struct vo *vo)
      memset(&p->perf, 0, sizeof(p->perf));
  }
  
@@ -2657,6 +2921,8 @@ index 2b644cd..00835c2 100644
 +    int64_t t = mp_time_ns();
 +    bool osd_enqueued = enqueue_osd_sample(vo, osd_buf);
 +    int64_t osd_ns = mp_time_ns() - t;
++    if (p->rec_cur)
++        p->rec_cur->osd_ms = osd_ns / 1e6;
 +    p->perf.enqueue_ns += osd_ns;
 +    struct avf_vsync_stats *vst = &p->vsync_stats;
 +    vst->osd_enq++;
@@ -2687,7 +2953,7 @@ index 2b644cd..00835c2 100644
  static void flip_page(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -5151,14 +7391,42 @@ static void flip_page(struct vo *vo)
+@@ -5151,14 +7650,42 @@ static void flip_page(struct vo *vo)
  
      report_presentation_diagnostics(vo);
  
@@ -2735,7 +3001,12 @@ index 2b644cd..00835c2 100644
          if (p->ahead.started) {
              ahead_present(vo);
          } else {
-@@ -5175,32 +7443,44 @@ static void flip_page(struct vo *vo)
+@@ -5172,35 +7699,57 @@ static void flip_page(struct vo *vo)
+         int64_t t = mp_time_ns();
+         CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
+         p->perf.video_sample_ns += mp_time_ns() - t;
++        if (p->rec_cur)
++            p->rec_cur->make_us = (int32_t)((mp_time_ns() - t) / 1000);
  
          bool osd_enqueued = !osd_needed;
  
@@ -2756,6 +3027,14 @@ index 2b644cd..00835c2 100644
 +        }
 +        if (video_buf)
 +            vsync_pace_sleep(vo);
++        if (p->rec_cur && p->vsync_frame_snapped) {
++            if (p->vsync_pace_until_ns) {
++                p->rec_cur->wait_ms = (p->vsync_pace_until_ns - p->vsync_pace_planned_at_ns) / 1e6;
++                p->rec_cur->over_us = (mp_time_ns() - p->vsync_pace_until_ns) / 1e3;
++            } else {
++                p->rec_cur->flags |= AVF_REC_AT_ONCE;
++            }
++        }
 +        int64_t ready_start = mp_time_ns();
          if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
 +            int64_t ready_wait = mp_time_ns() - ready_start;
@@ -2799,12 +3078,32 @@ index 2b644cd..00835c2 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,13 +7545,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5239,6 +7788,8 @@ static void flip_page(struct vo *vo)
+         p->ahead_shown_image = p->next_image;
+         p->next_image = NULL;
+     }
++    p->rec_cur = NULL;
++    p->rec_flip_return_ns = mp_time_ns();
+ }
+ 
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,13 +7816,47 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
 +    p->vsync_frame_snapped = false;
 +    p->vsync_frame_unsent = false;
++    p->rec_cur = NULL;
++    if (frame->pts > 0 && !frame->redraw && !frame->still && vsync_rec_on(vo)) {
++        int64_t t = mp_time_ns();
++        struct avf_rec_frame *r = avf_rec_push(&p->rec);
++        r->pos_ms = pts != MP_NOPTS_VALUE ? (int64_t)llround(pts * 1000) : 0;
++        r->type = frame->current->pict_type;
++        r->w = frame->current->w;
++        r->h = frame->current->h;
++        r->gap_ms = p->rec_flip_return_ns ? (t - p->rec_flip_return_ns) / 1e6 : 0;
++        p->rec_cur = r;
++    }
      if (p->presentation_host) {
 -        // Queue slack lets a frame be stamped that much further ahead.
 -        p->next_present_host_ns = avf_host_present_ns(
@@ -2823,6 +3122,8 @@ index 2b644cd..00835c2 100644
 +                int64_t dt = mp_time_ns() - t0;
 +                p->vsync_stats.sample_ns += dt;
 +                p->vsync_stats.sample_max_ns = MPMAX(p->vsync_stats.sample_max_ns, dt);
++                if (p->rec_cur)
++                    p->rec_cur->luma_us = (int32_t)(dt / 1000);
 +            } else if (p->opts->vsync_snap != AVF_VSYNC_SNAP_NO) {
 +                p->vsync_snap.cand = vsync_frame_candidate(vo, NULL);
 +            }
@@ -2840,7 +3141,7 @@ index 2b644cd..00835c2 100644
      }
      p->next_media_pts_valid = media_pts_is_valid(pts);
      p->next_media_pts_ns = p->next_media_pts_valid
-@@ -5288,6 +7589,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +7873,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -2851,7 +3152,7 @@ index 2b644cd..00835c2 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +7674,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7958,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -2860,7 +3161,7 @@ index 2b644cd..00835c2 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,8 +7812,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,8 +8096,17 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -2873,10 +3174,12 @@ index 2b644cd..00835c2 100644
 +        p->monotonic_told = false;
 +        p->vsync_pace_slot_ns = 0;
 +        p->vsync_last_enqueue_ns = 0;
++        p->rec_prev_shown = 0;
++        p->rec_flip_return_ns = 0;
          if (p->presentation_host && p->timebase) {
              // Fresh host-time samples arrive with future timestamps; the
              // free-running timebase needs no correction.
-@@ -5519,11 +7833,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +8119,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -2893,7 +3196,7 @@ index 2b644cd..00835c2 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7884,50 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +8170,51 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -2923,6 +3226,7 @@ index 2b644cd..00835c2 100644
 +    // The OSD sample goes to its layer after the video sample (no: before).
 +    {"osd-after-video", OPT_BOOL(osd_after_video)},
 +    {"osd-slots-ahead", OPT_BOOL(osd_slots_ahead)},
++    {"vsync-snap-record", OPT_BOOL(vsync_snap_record)},
 +    // Promise the video renderer monotonically increasing stamps.
 +    {"expect-monotonic", OPT_BOOL(expect_monotonic)},
 +    // Decoded audio at one frame per refresh: resample the sound by up to
@@ -2944,7 +3248,7 @@ index 2b644cd..00835c2 100644
      {0},
  };
  
-@@ -5579,6 +7942,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +8229,29 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,
@@ -2968,6 +3272,7 @@ index 2b644cd..00835c2 100644
 +        .vsync_snap_sound_late_ms = 60,
 +        .vsync_snap_sound_early_ms = 25,
 +        .vsync_snap_sample = true,
++        .vsync_snap_record = true,
 +        .vsync_snap_ask_ms = 1000,
 +        .osd_after_video = true,
      },
