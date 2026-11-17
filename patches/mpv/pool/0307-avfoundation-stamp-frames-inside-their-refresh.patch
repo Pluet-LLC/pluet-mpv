@@ -234,6 +234,12 @@ first: the 1st generation Apple TV 4K (0.05) walks later, towards 4.8 ms
 measured clean, not into its unmeasured 36 to 41 ms; others start at 0.42
 and walk earlier, as before.
 
+Build 51: at one frame per refresh a skip leaves out the frame it gives
+the refresh the frame before already has. That frame is not sent (no
+sample, no pacing wait, no enqueue), so no refresh gets two frames, the
+layer has nothing to drop at a step, and the next frame keeps its slot and
+lead; the "sync" line counts them ("unsent N").
+
 
 scripts/test_avf_vsync_snap.sh compiles the snap and the pacing from the
 final Apple series and drives them with synthetic clocks: every phase at
@@ -358,7 +364,7 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..8eb255a 100644
+index 2b644cd..486fd1c 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,9 @@
@@ -406,7 +412,7 @@ index 2b644cd..8eb255a 100644
  };
  
  // --- avf sync servo core (host-testable; keep freestanding) ---
-@@ -476,6 +507,1062 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -476,6 +507,1083 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
  }
  // --- end avf sync servo core ---
  
@@ -528,6 +534,10 @@ index 2b644cd..8eb255a 100644
 +    int steps_by_kind[6];
 +    int last_kind;
 +    double last_score, last_av_ns;
++    // Out, per frame: this frame is the one a skip leaves out, and is not to
++    // be sent (avf_vsync_snap_refresh()); and how many were.
++    bool unsent;
++    int steps_unsent;
 +};
 +
 +#define AVF_VSYNC_SNAP_HYST_DIV 16
@@ -625,6 +635,7 @@ index 2b644cd..8eb255a 100644
 +                                      int64_t target_ns, int64_t vsync_ns,
 +                                      int64_t period_ns)
 +{
++    s->unsent = false;
 +    if (period_ns <= 0) {
 +        s->locked = false;
 +        return target_ns;
@@ -748,6 +759,22 @@ index 2b644cd..8eb255a 100644
 +            s->last_kind = kind;
 +            s->last_score = score;
 +            s->last_av_ns = av;
++            // At one frame per refresh a skip gives this frame the refresh
++            // the frame before already has. Sending both put two frames in
++            // one refresh: the layer dropped one, and in the regime where
++            // the VO waits almost a refresh for its point this one went in
++            // with 14 ms of lead, off the point. This frame is left out
++            // instead (the caller does not send it): no refresh gets two,
++            // and the next frame, with the lock stepped, gets the refresh
++            // after the one before's, the one this frame would have had.
++            // For a cut, black or still frame it shows the same whichever of
++            // the two is left out; a "low" score was measured for leaving
++            // out the frame before and is kept as the estimate for this one.
++            // A repeat removes nothing.
++            if (dir > 0 && avf_vsync_one_to_one(s, period)) {
++                s->unsent = true;
++                s->steps_unsent++;
++            }
 +        }
 +    }
 +    avf_step_note_scores(s);
@@ -1413,7 +1440,7 @@ index 2b644cd..8eb255a 100644
 +// The vsync snap's pacing lines, logged every 5 s (vsync_snap_report).
 +struct avf_vsync_stats {
 +    int64_t window_start_ns;
-+    int frames, unsnapped, moved, uneven_a, uneven_b, uneven_s;
++    int frames, unsnapped, unsent, moved, uneven_a, uneven_b, uneven_s;
 +    double shift_sum, shift_max;
 +    int64_t period_ns, nominal_ns;
 +    int relocks0, reslots0;
@@ -1469,7 +1496,7 @@ index 2b644cd..8eb255a 100644
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1578,58 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1599,61 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -1484,6 +1511,9 @@ index 2b644cd..8eb255a 100644
 +    // The frame flip_page will enqueue was snapped (host mode, a timed
 +    // frame with a refresh clock): its planned time and stamp (mp_time_ns).
 +    bool vsync_frame_snapped;
++    // The frame flip_page has is the one a skip leaves out: nothing of it is
++    // sent (avf_vsync_snap_refresh()).
++    bool vsync_frame_unsent;
 +    int64_t vsync_frame_planned_ns, vsync_frame_stamp_ns;
 +    int64_t vsync_metrics_asked_ns;
 +    int64_t vsync_layer_dropped_seen;   // the layer's dropped count last seen (-1: none)
@@ -1528,7 +1558,7 @@ index 2b644cd..8eb255a 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +2339,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +2363,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1544,7 +1574,7 @@ index 2b644cd..8eb255a 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2430,962 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2454,971 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -1900,14 +1930,14 @@ index 2b644cd..8eb255a 100644
 +        const struct avf_vsync_snap *sn = &p->vsync_snap;
 +        static const char *const kinds[] = {"-", "cut", "black", "still", "low", "forced"};
 +        MP_VERBOSE(vo, "vsync-snap sync: av %+.1f..%+.1f ms, drift %+.1f ppm, resample "
-+                   "%+.1f ppm%s; steps cut %d black %d still %d low %d forced %d, "
-+                   "last %s %.2f at %+.1f ms; sampled %d cuts %d flat %d unread %d\n",
++                   "%+.1f ppm%s; steps cut %d black %d still %d low %d forced %d unsent "
++                   "%d, last %s %.2f at %+.1f ms; sampled %d cuts %d flat %d unread %d\n",
 +                   st->av_n ? st->av_min / 1e6 : 0, st->av_n ? st->av_max / 1e6 : 0,
 +                   sn->drift * 1000, (p->vsync_speed_sent ? p->vsync_speed_sent - 1 : 0) * 1e6,
 +                   vo_get_audio_speed_applied(vo) ? " on" : " off",
 +                   sn->steps_by_kind[AVF_STEP_CUT], sn->steps_by_kind[AVF_STEP_BLACK],
 +                   sn->steps_by_kind[AVF_STEP_STILL], sn->steps_by_kind[AVF_STEP_LOW],
-+                   sn->steps_by_kind[AVF_STEP_FORCED], kinds[sn->last_kind],
++                   sn->steps_by_kind[AVF_STEP_FORCED], sn->steps_unsent, kinds[sn->last_kind],
 +                   sn->last_score, sn->last_av_ns / 1e6, st->sampled, st->cuts, st->flats,
 +                   st->unreadable);
 +        // The VO's own work: where in the refresh it starts on a frame, the
@@ -2057,6 +2087,15 @@ index 2b644cd..8eb255a 100644
 +                                           period);
 +    int64_t stamp = shown - (int64_t)llround(period * p->opts->vsync_snap_lead);
 +    int64_t used = mode == AVF_VSYNC_SNAP_YES ? stamp : target_ns;
++    if (p->vsync_snap.unsent && mode == AVF_VSYNC_SNAP_YES && p->presentation_host) {
++        // Left out by a skip: not sent, so not counted among the frames'
++        // refreshes or phases either; the next frame is counted against the
++        // frame before this one.
++        p->vsync_frame_unsent = true;
++        st->unsent++;
++        vsync_snap_servo(vo, mode, period, target_ns);
++        return used;
++    }
 +
 +    // Diagnostics: where in the refresh the planned time and the stamp the
 +    // layer gets fall, and which refresh each frame goes to.
@@ -2507,7 +2546,7 @@ index 2b644cd..8eb255a 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -1467,6 +3565,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
+@@ -1467,6 +3598,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
  
      sample_buffer_renderer_flush(displayLayer);
      sample_buffer_renderer_flush(osdLayer);
@@ -2515,7 +2554,7 @@ index 2b644cd..8eb255a 100644
  
      MP_WARN(vo, "Recovered AVFoundation display layer after %s "
                  "(status=%ld, requiresFlush=%s, ready=%s, "
-@@ -5092,6 +7191,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+@@ -5092,6 +7224,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
      }
  }
  
@@ -2544,7 +2583,7 @@ index 2b644cd..8eb255a 100644
  static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
  {
      struct priv *p = vo->priv;
-@@ -5099,6 +7220,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+@@ -5099,6 +7253,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
      if (!buf)
          return false;
  
@@ -2553,10 +2592,11 @@ index 2b644cd..8eb255a 100644
      sample_buffer_renderer_enqueue(p->displayLayer, buf);
      p->last_video_enqueue_ns = mp_time_ns();
      return true;
-@@ -5151,14 +7274,28 @@ static void flip_page(struct vo *vo)
+@@ -5151,14 +7307,42 @@ static void flip_page(struct vo *vo)
  
      report_presentation_diagnostics(vo);
  
+-    if (p->next_image) {
 +    // The VO thread's wake-ups decide where in the refresh a frame goes to
 +    // the layer: at the default class they came up to 17 ms late on an Apple
 +    // TV 4K (1st generation) while it decoded and read ahead.
@@ -2565,7 +2605,21 @@ index 2b644cd..8eb255a 100644
 +        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 +    }
 +
-     if (p->next_image) {
++    // The frame a skip leaves out: no sample made, no pacing wait, nothing
++    // enqueued, the pacing slot left as the frame before set it. Its
++    // subtitles are still taken from the renderer (so the ahead renderer's
++    // requests and releases stay in step), and a change due on it stays
++    // pending (osd_needs_enqueue) for the next frame. It stays the frame
++    // shown for a redraw (a pause straight after has a picture).
++    if (p->next_image && p->vsync_frame_unsent) {
++        if (p->ahead.started) {
++            ahead_present(vo);
++        } else {
++            render_osd(vo, p->next_pts);
++        }
++        p->vsync_frame_unsent = false;
++        p->vsync_frame_snapped = false;
++    } else if (p->next_image) {
          CMSampleBufferRef osd_buf = NULL;
          bool osd_needed = false;
  
@@ -2586,7 +2640,7 @@ index 2b644cd..8eb255a 100644
          if (p->ahead.started) {
              ahead_present(vo);
          } else {
-@@ -5175,14 +7312,37 @@ static void flip_page(struct vo *vo)
+@@ -5175,14 +7359,37 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
@@ -2625,7 +2679,7 @@ index 2b644cd..8eb255a 100644
                  if (osd_enqueued) {
                      p->osd_needs_enqueue = false;
                      if (osd_buf_has_subtitle)
-@@ -5199,8 +7359,13 @@ static void flip_page(struct vo *vo)
+@@ -5199,8 +7406,13 @@ static void flip_page(struct vo *vo)
                  }
              }
  
@@ -2640,12 +2694,19 @@ index 2b644cd..8eb255a 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,7 +7430,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,13 +7477,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
 +    p->vsync_frame_snapped = false;
++    p->vsync_frame_unsent = false;
      if (p->presentation_host) {
+-        // Queue slack lets a frame be stamped that much further ahead.
+-        p->next_present_host_ns = avf_host_present_ns(
+-            p->last_host_present_ns, p->next_present_host_ns,
+-            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms + p->opts->queue_slack_ms) +
+-            AVF_HOST_PRESENT_SLACK_NS);
+-        p->last_host_present_ns = p->next_present_host_ns;
 +        // A redraw or a still frame (paused, stepping) is shown at once.
 +        if (frame->pts > 0 && !frame->redraw && !frame->still) {
 +            // --avfoundation-vsync-snap-sample=no: the frame is not read,
@@ -2662,10 +2723,19 @@ index 2b644cd..8eb255a 100644
 +            }
 +            p->next_present_host_ns = vsync_snap_frame(vo, p->next_present_host_ns);
 +        }
-         // Queue slack lets a frame be stamped that much further ahead.
-         p->next_present_host_ns = avf_host_present_ns(
-             p->last_host_present_ns, p->next_present_host_ns,
-@@ -5288,6 +7470,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
++        // Queue slack lets a frame be stamped that much further ahead. A
++        // frame a skip leaves out is not sent, so its stamp is not the last.
++        if (!p->vsync_frame_unsent) {
++            p->next_present_host_ns = avf_host_present_ns(
++                p->last_host_present_ns, p->next_present_host_ns,
++                MP_TIME_MS_TO_NS(p->opts->queue_lead_ms + p->opts->queue_slack_ms) +
++                AVF_HOST_PRESENT_SLACK_NS);
++            p->last_host_present_ns = p->next_present_host_ns;
++        }
+     }
+     p->next_media_pts_valid = media_pts_is_valid(pts);
+     p->next_media_pts_ns = p->next_media_pts_valid
+@@ -5288,6 +7521,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -2676,7 +2746,7 @@ index 2b644cd..8eb255a 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +7555,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7606,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -2685,7 +2755,7 @@ index 2b644cd..8eb255a 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,8 +7693,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,8 +7744,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -2701,7 +2771,7 @@ index 2b644cd..8eb255a 100644
          if (p->presentation_host && p->timebase) {
              // Fresh host-time samples arrive with future timestamps; the
              // free-running timebase needs no correction.
-@@ -5519,11 +7714,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7765,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -2718,7 +2788,7 @@ index 2b644cd..8eb255a 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7765,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7816,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -2768,7 +2838,7 @@ index 2b644cd..8eb255a 100644
      {0},
  };
  
-@@ -5579,6 +7822,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7873,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,

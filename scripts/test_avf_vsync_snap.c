@@ -225,7 +225,9 @@ static struct avf_step_cand content(int c, int n)
 }
 
 struct sim_out {
-    int steps, by_kind[6], two, none, relocks, forced;
+    // steps: every step taken; two, none: among the frames sent, neighbours
+    // one refresh apart by 0 or by 2 or more; unsent: frames a skip left out.
+    int steps, by_kind[6], two, none, relocks, forced, unsent;
     double av_min, av_max, av_sum, score_max, speed_min, speed_max;
     double typical;         // the content's typical score for that direction
 };
@@ -292,16 +294,18 @@ static void sim(double ppm, int c, bool pcm, double max_ppm, int frames,
             int bin = (int)floor(av / MS) + 120;
             av_hist[bin < 0 ? 0 : bin > 199 ? 199 : bin]++;
         }
-        if (n > 0) {
+        if (s.unsent) {
+            o->unsent++;
+            continue;       // not sent: the next frame follows the one before
+        }
+        if (prev_shown) {
             int64_t step = (shown - prev_shown + period_ns / 2) / period_ns;
-            if (step != 1) {
-                o->steps++;
-                o->two += step <= 0;
-                o->none += step >= 2;
-            }
+            o->two += step <= 0;
+            o->none += step >= 2 ? (int)(step - 1) : 0;
         }
         prev_shown = shown;
     }
+    o->steps = s.reslots;
     for (int k = 0; k < 6; k++)
         o->by_kind[k] = s.steps_by_kind[k];
     o->forced = s.steps_by_kind[AVF_STEP_FORCED];
@@ -340,7 +344,10 @@ static int sim_cases(void)
                o.av_min / MS, o.av_max / MS, o.av_sum / three_h / MS);
         printf("  picture offset percentiles: 5%% %+.1f, 50%% %+.1f, 95%% %+.1f ms\n",
                av_pct(0.05), av_pct(0.5), av_pct(0.95));
-        bool ok = o.steps >= 3 && o.steps <= 4 && o.steps == o.two && o.relocks == 1 &&
+        printf("  unsent %d, among the frames sent: two in a refresh %d, gaps %d\n",
+               o.unsent, o.two, o.none);
+        bool ok = o.steps >= 3 && o.steps <= 4 && o.unsent == o.steps && o.two == 0 &&
+                  o.none == 0 && o.relocks == 1 &&
                   o.av_min >= -60 * MS - 2 * MS && o.av_max <= 25 * MS + 2 * MS;
         if (c == C_CUTS || c == C_TALK)
             ok = ok && o.by_kind[1] == o.steps;
@@ -377,7 +384,8 @@ static int sim_cases(void)
                "%d steps at cuts; picture %+.1f..%+.1f ms, 5/50/95%%: %+.1f %+.1f %+.1f\n",
                ms, window_min, o.by_kind[1], o.av_min / MS, o.av_max / MS,
                av_pct(0.05), av_pct(0.5), av_pct(0.95));
-        if (!(o.by_kind[1] == o.steps && o.av_min >= -(ms + 2) * MS)) {
+        if (!(o.by_kind[1] == o.steps && o.unsent == o.steps && o.two == 0 &&
+              o.av_min >= -(ms + 2) * MS)) {
             fprintf(stderr, "FAIL: range %d ms\n", ms);
             bad++;
         }
@@ -391,7 +399,8 @@ static int sim_cases(void)
         printf("3 h, passthrough, refresh 14 ppm fast, a film: %d steps (repeats: "
                "none in a refresh %d), cut %d forced %d; picture %+.1f..%+.1f ms\n",
                o.steps, o.none, o.by_kind[1], o.forced, o.av_min / MS, o.av_max / MS);
-        if (!(o.steps >= 3 && o.steps <= 4 && o.none == o.steps && o.by_kind[1] == o.steps &&
+        if (!(o.steps >= 3 && o.steps <= 4 && o.none == o.steps && o.unsent == 0 &&
+              o.two == 0 && o.by_kind[1] == o.steps &&
               o.av_min >= -62 * MS && o.av_max <= 27 * MS)) {
             fprintf(stderr, "FAIL: 3 h passthrough, fast refresh\n");
             bad++;
@@ -432,6 +441,7 @@ static int sim_cases(void)
             // Past the cap: after a minute at it the resampling stops and
             // the steps take it all (one every 42 s), at cuts.
             ok = o.steps >= 250 && o.steps <= 270 && o.forced == 0 &&
+                 o.unsent == o.steps && o.two == 0 && o.none == 0 &&
                  o.speed_min == 1 && o.speed_max == 1 &&
                  o.av_min >= -62 * MS && o.av_max <= 27 * MS;
         snprintf(what, sizeof(what), "3 h decoded %+.1f ppm", d[i].ppm);
@@ -836,6 +846,11 @@ struct slot_case {
     int early_every;
     int step_at, step_dir;
     bool no_rule;           // without avf_vsync_pace_slot_ns() (the fault)
+    // The skip's frame (step_at, step_dir -1) is not sent, and mpv hands
+    // each frame over lag_ms before the VO is free (waiting: due 2 ms after
+    // the frame before's point, less the lag).
+    bool unsent;
+    double lag_ms;
 };
 
 struct slot_res {
@@ -844,6 +859,8 @@ struct slot_res {
     int doubles_apart;      // ... of frames stamped for different refreshes
     int empties;            // slots with no enqueue
     double lead_min_ms;
+    double after_lead_ms;   // the lead of the frame after an unsent one
+    bool after_on_point;    // ... and whether it went in at its point
 };
 
 static struct slot_res slot_run(const struct slot_case *c, int frames)
@@ -864,7 +881,18 @@ static struct slot_res slot_run(const struct slot_case *c, int frames)
             r.irregular += start > point;
         } else {
             start = n ? enq_prev + gap : point - 2000000;
+            if (c->unsent) {
+                int64_t due = point - p + 2000000 - (int64_t)llround(c->lag_ms * MS);
+                start = n ? (start > due ? start : due) : start;
+            }
         }
+        if (c->unsent && n == c->step_at && c->step_dir < 0) {
+            // Left out: the VO is free again at once.
+            enq_prev = start;
+            gap = 0;
+            continue;
+        }
+        bool after_unsent = c->unsent && n == c->step_at + 1;
         r.irregular += early_frame;
         int64_t early = early_frame ? (int64_t)llround((3.5 + 2.5 * rnd()) * MS)
                                     : 500000;
@@ -877,6 +905,10 @@ static struct slot_res slot_run(const struct slot_case *c, int frames)
         int64_t enq = at > start ? (early_frame ? at : at + early) : start;
         gap = early_frame ? 500000 : 2000000;
         r.lead_min_ms = fmin(r.lead_min_ms, (stamp - enq) / MS);
+        if (after_unsent) {
+            r.after_lead_ms = (stamp - enq) / MS;
+            r.after_on_point = llabs(enq - (point - p)) <= 600000;
+        }
         int64_t k = (enq - ph + p / 2) / p, ref = stamp / p;
         if (n) {
             if (k <= k_prev) {
@@ -967,6 +999,24 @@ static int slot_cases(void)
                  "never two refreshes' frames in one slot", steps[i].name);
         check(r.doubles_apart == 0 && r.empties <= 1 + allowed &&
               r.doubles + r.empties <= 1 + allowed && r.lead_min_ms >= 20, what);
+    }
+    // The skip's own frame left out (avf_vsync_snap_refresh() unsent): in the
+    // waiting regime on the 2nd generation, the frame after goes into the
+    // slot the skipped one would have used, at its point and with the normal
+    // lead, when mpv hands it over 3 ms or more before the VO is free; with
+    // less lag it goes in at once, never under 13 ms of lead; no slot has two.
+    for (double lag = 0; lag <= 6; lag += 1) {
+        struct slot_case c = {.phase = 0.42, .lead_ms = 55.5, .step_at = 5000,
+                              .step_dir = -1, .unsent = true, .lag_ms = lag};
+        struct slot_res r = slot_run(&c, 10000);
+        printf("slot skip unsent, VO lag %.0f ms: %d two in a slot, %d empty, frame after: "
+               "lead %.1f ms%s\n", lag, r.doubles, r.empties, r.after_lead_ms,
+               r.after_on_point ? " at its point" : " at once");
+        snprintf(what, sizeof(what), "slot skip unsent, lag %.0f ms: no slot with two, "
+                 "the next frame on its point with its lead (lag 3+), lead >= 13 ms", lag);
+        check(r.doubles == 0 && r.lead_min_ms >= 13 &&
+              (lag < 3 || (r.after_on_point && fabs(r.after_lead_ms - 55.5) < 0.6 &&
+                           r.empties == 0)), what);
     }
     return failures - before;
 }
