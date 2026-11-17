@@ -364,7 +364,7 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..486fd1c 100644
+index 2b644cd..9ccadf1 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,9 @@
@@ -1574,7 +1574,7 @@ index 2b644cd..486fd1c 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2454,971 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2454,978 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -1928,12 +1928,19 @@ index 2b644cd..486fd1c 100644
 +        // picture late, the sound early), the drift, the resampling asked
 +        // and applied, and every step by where it was hidden.
 +        const struct avf_vsync_snap *sn = &p->vsync_snap;
++        // The resampling the picture gets: the speed asked while the core
++        // applies it, else 0. The speed is still asked for while it is not
++        // applied (passthrough), so the core can take it up when it can, but
++        // that figure (the proportional part at its cap, +500 ppm with the
++        // picture 30 ms early) says nothing about what plays.
++        double resample_ppm = vo_get_audio_speed_applied(vo) && p->vsync_speed_sent
++                            ? (p->vsync_speed_sent - 1) * 1e6 : 0;
 +        static const char *const kinds[] = {"-", "cut", "black", "still", "low", "forced"};
 +        MP_VERBOSE(vo, "vsync-snap sync: av %+.1f..%+.1f ms, drift %+.1f ppm, resample "
 +                   "%+.1f ppm%s; steps cut %d black %d still %d low %d forced %d unsent "
 +                   "%d, last %s %.2f at %+.1f ms; sampled %d cuts %d flat %d unread %d\n",
 +                   st->av_n ? st->av_min / 1e6 : 0, st->av_n ? st->av_max / 1e6 : 0,
-+                   sn->drift * 1000, (p->vsync_speed_sent ? p->vsync_speed_sent - 1 : 0) * 1e6,
++                   sn->drift * 1000, resample_ppm,
 +                   vo_get_audio_speed_applied(vo) ? " on" : " off",
 +                   sn->steps_by_kind[AVF_STEP_CUT], sn->steps_by_kind[AVF_STEP_BLACK],
 +                   sn->steps_by_kind[AVF_STEP_STILL], sn->steps_by_kind[AVF_STEP_LOW],
@@ -2546,7 +2553,7 @@ index 2b644cd..486fd1c 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -1467,6 +3598,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
+@@ -1467,6 +3605,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
  
      sample_buffer_renderer_flush(displayLayer);
      sample_buffer_renderer_flush(osdLayer);
@@ -2554,7 +2561,7 @@ index 2b644cd..486fd1c 100644
  
      MP_WARN(vo, "Recovered AVFoundation display layer after %s "
                  "(status=%ld, requiresFlush=%s, ready=%s, "
-@@ -5092,6 +7224,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+@@ -5092,6 +7231,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
      }
  }
  
@@ -2583,7 +2590,7 @@ index 2b644cd..486fd1c 100644
  static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
  {
      struct priv *p = vo->priv;
-@@ -5099,6 +7253,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+@@ -5099,6 +7260,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
      if (!buf)
          return false;
  
@@ -2592,7 +2599,7 @@ index 2b644cd..486fd1c 100644
      sample_buffer_renderer_enqueue(p->displayLayer, buf);
      p->last_video_enqueue_ns = mp_time_ns();
      return true;
-@@ -5151,14 +7307,42 @@ static void flip_page(struct vo *vo)
+@@ -5151,14 +7314,42 @@ static void flip_page(struct vo *vo)
  
      report_presentation_diagnostics(vo);
  
@@ -2640,7 +2647,7 @@ index 2b644cd..486fd1c 100644
          if (p->ahead.started) {
              ahead_present(vo);
          } else {
-@@ -5175,14 +7359,37 @@ static void flip_page(struct vo *vo)
+@@ -5175,14 +7366,37 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
@@ -2679,7 +2686,7 @@ index 2b644cd..486fd1c 100644
                  if (osd_enqueued) {
                      p->osd_needs_enqueue = false;
                      if (osd_buf_has_subtitle)
-@@ -5199,8 +7406,13 @@ static void flip_page(struct vo *vo)
+@@ -5199,8 +7413,13 @@ static void flip_page(struct vo *vo)
                  }
              }
  
@@ -2694,7 +2701,7 @@ index 2b644cd..486fd1c 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,13 +7477,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,13 +7484,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
@@ -2735,7 +2742,7 @@ index 2b644cd..486fd1c 100644
      }
      p->next_media_pts_valid = media_pts_is_valid(pts);
      p->next_media_pts_ns = p->next_media_pts_valid
-@@ -5288,6 +7521,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +7528,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -2746,7 +2753,7 @@ index 2b644cd..486fd1c 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +7606,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7613,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -2755,7 +2762,7 @@ index 2b644cd..486fd1c 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,8 +7744,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,8 +7751,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -2771,7 +2778,7 @@ index 2b644cd..486fd1c 100644
          if (p->presentation_host && p->timebase) {
              // Fresh host-time samples arrive with future timestamps; the
              // free-running timebase needs no correction.
-@@ -5519,11 +7765,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7772,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -2788,7 +2795,7 @@ index 2b644cd..486fd1c 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7816,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7823,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -2838,7 +2845,7 @@ index 2b644cd..486fd1c 100644
      {0},
  };
  
-@@ -5579,6 +7873,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7880,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,
