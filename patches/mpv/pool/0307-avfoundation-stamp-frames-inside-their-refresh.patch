@@ -239,6 +239,10 @@ the refresh the frame before already has. That frame is not sent (no
 sample, no pacing wait, no enqueue), so no refresh gets two frames, the
 layer has nothing to drop at a step, and the next frame keeps its slot and
 lead; the "sync" line counts them ("unsent N").
+--avfoundation-osd-slots-ahead (default no) sends a frame's subtitle
+sample when the VO starts on the frame, a slot ahead of its video, when
+that is over half a refresh before the frame's point; its stamp is the
+frame's. The "sync" line's resample figure is the one applied (0 off).
 
 
 scripts/test_avf_vsync_snap.sh compiles the snap and the pacing from the
@@ -364,7 +368,7 @@ index 18a3b0c..8d6b293 100644
  double vo_get_vsync_interval(struct vo *vo);
  double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..9ccadf1 100644
+index 2b644cd..00835c2 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,9 @@
@@ -377,7 +381,7 @@ index 2b644cd..9ccadf1 100644
  
  #if TARGET_OS_IPHONE
  #import <UIKit/UIKit.h>
-@@ -269,6 +272,34 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
+@@ -269,6 +272,35 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
      int presentation;
      int osd_max_height;
      bool osd_video_res;
@@ -391,6 +395,7 @@ index 2b644cd..9ccadf1 100644
 +    int vsync_snap_ask_ms;
 +    char *vsync_snap_pace_file;
 +    bool osd_after_video;
++    bool osd_slots_ahead;
 +    bool expect_monotonic;
 +};
 +
@@ -412,7 +417,7 @@ index 2b644cd..9ccadf1 100644
  };
  
  // --- avf sync servo core (host-testable; keep freestanding) ---
-@@ -476,6 +507,1083 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -476,6 +508,1099 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
  }
  // --- end avf sync servo core ---
  
@@ -853,6 +858,21 @@ index 2b644cd..9ccadf1 100644
 +        at_ns += (next - at_ns + period_ns / 2) / period_ns * period_ns;
 +    }
 +    return at_ns;
++}
++
++// --avfoundation-osd-slots-ahead=1: a subtitle change and its frame's video
++// can still cost the video layer a refresh when both go in at one point
++// (build 50: one drop in 31 subtitle samples on the 2nd generation Apple TV
++// 4K, with order, slots and lead all right). The subtitle sample (rendered
++// ahead, stamped as its frame) then goes to its layer when the VO starts on
++// the frame, which in the regime where it waits almost a refresh for its
++// point is just after the frame before went in: a slot ahead of its own
++// frame. Only when that is so: more than half a refresh before the point
++// its frame is held for (point_ns), so its nearest slot is not the frame's;
++// otherwise it goes after the video as with 0.
++static bool avf_osd_slot_ahead(int64_t now_ns, int64_t point_ns, int64_t period_ns)
++{
++    return period_ns > 0 && point_ns > 0 && point_ns - now_ns > period_ns / 2;
 +}
 +
 +// --avfoundation-vsync-snap-pace=auto: finding and keeping the enqueue point.
@@ -1491,12 +1511,13 @@ index 2b644cd..9ccadf1 100644
 +    // At one frame per refresh, enqueue-to-enqueue gaps that round to no
 +    // refresh (two frames in one slot) and to two or more (a slot left empty).
 +    int slot_two, slot_empty;
++    int osd_ahead;          // OSD samples sent a slot ahead (osd-slots-ahead)
 +};
 +
  struct priv {
      struct mp_hwdec_ctx hwctx;
      struct m_config_cache *opts_cache;
-@@ -491,6 +1599,61 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+@@ -491,6 +1616,64 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      int64_t next_present_host_ns;
      // Latest host stamp given to a video frame; see avf_host_present_ns().
      int64_t last_host_present_ns;
@@ -1549,6 +1570,9 @@ index 2b644cd..9ccadf1 100644
 +    // The earliest the paced frame's video sample may go to the layer (0:
 +    // the frame was not held).
 +    int64_t vsync_pace_video_at_ns;
++    // The planned wait (vsync_pace_plan()): until when (0: none), planned
++    // when, on which refresh period.
++    int64_t vsync_pace_until_ns, vsync_pace_planned_at_ns, vsync_pace_period_ns;
 +    int64_t vsync_last_enqueue_ns;  // the last snapped video enqueue (0: none since a flush)
 +    // Media mode: the snapped stamp for the next frame, in media time.
 +    int64_t next_media_stamp_ns;
@@ -1558,7 +1582,7 @@ index 2b644cd..9ccadf1 100644
      int64_t next_media_pts_ns;
      bool next_media_pts_valid;
      double next_timebase_rate;
-@@ -1200,12 +2363,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
+@@ -1200,12 +2383,15 @@ static int64_t sample_presentation_pts_ns(struct priv *p)
      if (p->presentation_host)
          return p->next_present_host_ns > 0 ? p->next_present_host_ns
                                             : mp_time_ns();
@@ -1574,7 +1598,7 @@ index 2b644cd..9ccadf1 100644
      p->next_media_pts_ns = 0;
      p->next_media_pts_valid = false;
      p->next_timebase_rate = 0.0;
-@@ -1288,6 +2454,978 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1288,6 +2474,1000 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  // of a new frame's target an already queued frame can be stamped.
  #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
  
@@ -1967,18 +1991,18 @@ index 2b644cd..9ccadf1 100644
 +                   p->vsync_pace_origin ? p->vsync_pace_origin : "-");
 +        // Subtitle (OSD) samples handed to their layer in the window: how
 +        // many, what the enqueues took, and when, to set beside the drops.
-+        char osd_marks[64] = "-";
++        char osd_marks[36] = "-";
 +        for (int i = 0, at = 0; i < st->osd_marks && at < (int)sizeof(osd_marks) - 8; i++)
 +            at += snprintf(osd_marks + at, sizeof(osd_marks) - at, "%s%.1f", i ? "," : "",
 +                           st->osd_at_s[i]);
 +        // And the slots: two frames in one, slots left empty, and the drops
 +        // auto pacing set aside (or the window it did not judge).
-+        MP_VERBOSE(vo, "vsync-snap osd: %d enqueued %s the video, enqueue avg %.1f "
-+                   "max %.1f ms, at s: %s; slots two %d empty %d, set aside %d%s\n",
-+                   st->osd_enq, p->opts->osd_after_video ? "after" : "before",
++        MP_VERBOSE(vo, "vsync-snap osd: %d enqueued %s the video (%d ahead), enqueue "
++                   "avg %.1f max %.1f ms, at s: %s; slots two %d empty %d, set aside %d%s\n",
++                   st->osd_enq, p->opts->osd_after_video ? "after" : "before", st->osd_ahead,
 +                   st->osd_enq_ns / (double)MPMAX(st->osd_enq, 1) / 1e6,
 +                   st->osd_enq_max_ns / 1e6, osd_marks, st->slot_two, st->slot_empty,
-+                   st->pace_excused, st->pace_irregular ? " (irregular: not judged)" : "");
++                   st->pace_excused, st->pace_irregular ? " (irregular)" : "");
 +    }
 +    struct avf_vsync_stats next = {
 +        .window_start_ns = now,
@@ -2427,12 +2451,15 @@ index 2b644cd..9ccadf1 100644
 +               p->vsync_pace.phase, p->vsync_pace_origin, period / 1e6);
 +}
 +
-+static void vsync_pace_wait(struct vo *vo, bool with_osd)
++// Work out the instant the snapped frame is held for (vsync_pace_sleep()
++// waits for it): p->vsync_pace_until_ns, 0 when it goes in at once.
++static void vsync_pace_plan(struct vo *vo, bool with_osd)
 +{
 +    struct priv *p = vo->priv;
 +    p->vsync_pace_wait_ns = 0;
 +    p->vsync_pace_at_ns = 0;
 +    p->vsync_pace_video_at_ns = 0;
++    p->vsync_pace_until_ns = 0;
 +    p->vsync_pace_with_osd = with_osd;
 +    if (!p->vsync_frame_snapped || p->opts->vsync_snap != AVF_VSYNC_SNAP_YES ||
 +        p->opts->vsync_snap_pace == AVF_VSYNC_PACE_NO)
@@ -2465,10 +2492,29 @@ index 2b644cd..9ccadf1 100644
 +    p->vsync_pace_video_at_ns = at > now ? at + early - late : 0;
 +    // Lateness is learned from frames without an OSD sample only.
 +    p->vsync_pace_at_ns = at > now && !with_osd ? at + late : 0;
-+    if (at > now) {
-+        vsync_wait_until(at);
-+        p->vsync_pace_wait_ns = at - now;
-+    }
++    p->vsync_pace_planned_at_ns = now;
++    p->vsync_pace_period_ns = period;
++    if (at > now)
++        p->vsync_pace_until_ns = at;
++}
++
++static void vsync_pace_sleep(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->vsync_pace_until_ns)
++        return;
++    vsync_wait_until(p->vsync_pace_until_ns);
++    p->vsync_pace_wait_ns = p->vsync_pace_until_ns - p->vsync_pace_planned_at_ns;
++}
++
++// --avfoundation-osd-slots-ahead=1: whether the frame's subtitle sample goes
++// to its layer now, before the pacing wait, so that it falls in the slot
++// before its frame's video (avf_osd_slot_ahead()).
++static bool vsync_osd_slot_ahead(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    return p->opts->osd_slots_ahead && p->vsync_frame_snapped && p->vsync_pace_until_ns &&
++           avf_osd_slot_ahead(mp_time_ns(), p->vsync_pace_slot_ns, p->vsync_pace_period_ns);
 +}
 +
 +// With the OSD sample enqueued ahead of the video's, the wait was aimed
@@ -2553,7 +2599,7 @@ index 2b644cd..9ccadf1 100644
  static void update_media_timebase_for_frame(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -1467,6 +3605,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
+@@ -1467,6 +3647,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
  
      sample_buffer_renderer_flush(displayLayer);
      sample_buffer_renderer_flush(osdLayer);
@@ -2561,7 +2607,7 @@ index 2b644cd..9ccadf1 100644
  
      MP_WARN(vo, "Recovered AVFoundation display layer after %s "
                  "(status=%ld, requiresFlush=%s, ready=%s, "
-@@ -5092,6 +7231,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+@@ -5092,6 +7273,28 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
      }
  }
  
@@ -2590,7 +2636,7 @@ index 2b644cd..9ccadf1 100644
  static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
  {
      struct priv *p = vo->priv;
-@@ -5099,6 +7260,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+@@ -5099,6 +7302,8 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
      if (!buf)
          return false;
  
@@ -2599,7 +2645,49 @@ index 2b644cd..9ccadf1 100644
      sample_buffer_renderer_enqueue(p->displayLayer, buf);
      p->last_video_enqueue_ns = mp_time_ns();
      return true;
-@@ -5151,14 +7314,42 @@ static void flip_page(struct vo *vo)
+@@ -5142,6 +7347,41 @@ static void report_osd_perf(struct vo *vo)
+     memset(&p->perf, 0, sizeof(p->perf));
+ }
+ 
++// Hand the frame's OSD sample to its layer, with the window's counts.
++static bool flip_enqueue_osd(struct vo *vo, CMSampleBufferRef osd_buf,
++                             bool osd_buf_has_subtitle)
++{
++    struct priv *p = vo->priv;
++    int64_t t = mp_time_ns();
++    bool osd_enqueued = enqueue_osd_sample(vo, osd_buf);
++    int64_t osd_ns = mp_time_ns() - t;
++    p->perf.enqueue_ns += osd_ns;
++    struct avf_vsync_stats *vst = &p->vsync_stats;
++    vst->osd_enq++;
++    vst->osd_enq_ns += osd_ns;
++    vst->osd_enq_max_ns = MPMAX(vst->osd_enq_max_ns, osd_ns);
++    if (vst->window_start_ns && vst->osd_marks < (int)MP_ARRAY_SIZE(vst->osd_at_s))
++        vst->osd_at_s[vst->osd_marks++] = (t - vst->window_start_ns) / 1e9;
++    p->vsync_osd_enqueue_ns = p->vsync_osd_enqueue_ns > 0
++        ? p->vsync_osd_enqueue_ns + (MPMIN(osd_ns, 12e6) - p->vsync_osd_enqueue_ns) / 4
++        : MPMIN(osd_ns, 12e6);
++    if (osd_enqueued) {
++        p->osd_needs_enqueue = false;
++        if (osd_buf_has_subtitle)
++            p->osd_layer_dirty = true;
++        // Margin between the OSD enqueue and the frame's intended
++        // presentation time (same clock).
++        int64_t lead = p->next_present_host_ns - mp_time_ns();
++        if (!p->perf.enq_count || lead < p->perf.lead_min_ns)
++            p->perf.lead_min_ns = lead;
++        p->perf.lead_sum_ns += lead;
++        p->perf.enq_count++;
++    } else {
++        p->perf.enq_drops++;
++    }
++    return osd_enqueued;
++}
++
+ static void flip_page(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -5151,14 +7391,42 @@ static void flip_page(struct vo *vo)
  
      report_presentation_diagnostics(vo);
  
@@ -2647,50 +2735,60 @@ index 2b644cd..9ccadf1 100644
          if (p->ahead.started) {
              ahead_present(vo);
          } else {
-@@ -5175,14 +7366,37 @@ static void flip_page(struct vo *vo)
+@@ -5175,32 +7443,44 @@ static void flip_page(struct vo *vo)
  
          bool osd_enqueued = !osd_needed;
  
 +        // A snapped frame waits for its point of the refresh, with its OSD
 +        // and video samples made, so that what goes to the layer goes there
 +        // ("avf vsync snap").
-+        bool osd_first = osd_buf && !p->opts->osd_after_video;
++        bool osd_first = osd_buf && !p->opts->osd_after_video && !p->opts->osd_slots_ahead;
 +        if (video_buf)
-+            vsync_pace_wait(vo, osd_first);
++            vsync_pace_plan(vo, osd_first);
++        // --avfoundation-osd-slots-ahead: the OSD sample now, a slot ahead
++        // of its frame's video (vsync_osd_slot_ahead()); its stamp is the
++        // frame's, as always.
++        bool osd_sent_ahead = false;
++        if (osd_buf && video_buf && vsync_osd_slot_ahead(vo)) {
++            osd_sent_ahead = true;
++            osd_enqueued = flip_enqueue_osd(vo, osd_buf, osd_buf_has_subtitle);
++            p->vsync_stats.osd_ahead++;
++        }
++        if (video_buf)
++            vsync_pace_sleep(vo);
 +        int64_t ready_start = mp_time_ns();
          if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
 +            int64_t ready_wait = mp_time_ns() - ready_start;
              if (!p->presentation_host)
                  update_media_timebase_for_frame(vo);
  
+-            if (osd_buf) {
+-                t = mp_time_ns();
+-                osd_enqueued = enqueue_osd_sample(vo, osd_buf);
+-                p->perf.enqueue_ns += mp_time_ns() - t;
+-                if (osd_enqueued) {
+-                    p->osd_needs_enqueue = false;
+-                    if (osd_buf_has_subtitle)
+-                        p->osd_layer_dirty = true;
+-                    // Margin between the OSD/video enqueue pair and the
+-                    // frame's intended presentation time (same clock).
+-                    int64_t lead = p->next_present_host_ns - mp_time_ns();
+-                    if (!p->perf.enq_count || lead < p->perf.lead_min_ns)
+-                        p->perf.lead_min_ns = lead;
+-                    p->perf.lead_sum_ns += lead;
+-                    p->perf.enq_count++;
+-                } else {
+-                    p->perf.enq_drops++;
+-                }
 +            if (!osd_first) {
 +                vsync_note_enqueue(vo, ready_wait);
 +                enqueue_video_sample(vo, video_buf);
-+            }
-+
-             if (osd_buf) {
-                 t = mp_time_ns();
-                 osd_enqueued = enqueue_osd_sample(vo, osd_buf);
--                p->perf.enqueue_ns += mp_time_ns() - t;
-+                int64_t osd_ns = mp_time_ns() - t;
-+                p->perf.enqueue_ns += osd_ns;
-+                struct avf_vsync_stats *vst = &p->vsync_stats;
-+                vst->osd_enq++;
-+                vst->osd_enq_ns += osd_ns;
-+                vst->osd_enq_max_ns = MPMAX(vst->osd_enq_max_ns, osd_ns);
-+                if (vst->window_start_ns && vst->osd_marks < (int)MP_ARRAY_SIZE(vst->osd_at_s))
-+                    vst->osd_at_s[vst->osd_marks++] = (t - vst->window_start_ns) / 1e9;
-+                p->vsync_osd_enqueue_ns = p->vsync_osd_enqueue_ns > 0
-+                    ? p->vsync_osd_enqueue_ns + (MPMIN(osd_ns, 12e6) - p->vsync_osd_enqueue_ns) / 4
-+                    : MPMIN(osd_ns, 12e6);
-                 if (osd_enqueued) {
-                     p->osd_needs_enqueue = false;
-                     if (osd_buf_has_subtitle)
-@@ -5199,8 +7413,13 @@ static void flip_page(struct vo *vo)
-                 }
              }
  
 -            enqueue_video_sample(vo, video_buf);
++            if (osd_buf && !osd_sent_ahead)
++                osd_enqueued = flip_enqueue_osd(vo, osd_buf, osd_buf_has_subtitle);
++
 +            if (osd_first) {
 +                vsync_pace_hold_video(vo);
 +                vsync_note_enqueue(vo, ready_wait);
@@ -2701,7 +2799,7 @@ index 2b644cd..9ccadf1 100644
  
          if (osd_needed && !osd_enqueued)
              p->osd_change_id = 0;
-@@ -5265,13 +7484,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5265,13 +7545,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
@@ -2742,7 +2840,7 @@ index 2b644cd..9ccadf1 100644
      }
      p->next_media_pts_valid = media_pts_is_valid(pts);
      p->next_media_pts_ns = p->next_media_pts_valid
-@@ -5288,6 +7528,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5288,6 +7589,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
              &p->next_timebase_rate);
      }
@@ -2753,7 +2851,7 @@ index 2b644cd..9ccadf1 100644
      ahead_file_frame(vo, frame);
      return true;
  }
-@@ -5369,6 +7613,8 @@ static void uninit(struct vo *vo)
+@@ -5369,6 +7674,8 @@ static void uninit(struct vo *vo)
      sample_buffer_renderer_flush(p->displayLayer);
      sample_buffer_renderer_flush(p->osdLayer);
  
@@ -2762,7 +2860,7 @@ index 2b644cd..9ccadf1 100644
      // No wait for the main thread: the host may be destroying this player
      // from it (mpv_terminate_destroy() joins this thread). The observers,
      // the layers' timebase and the link's own references go to a main-queue
-@@ -5505,8 +7751,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5505,8 +7812,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
          p->geometry_render_failure_logged = false;
          bool was_paused = p->playback_paused;
          reset_media_timing(p);
@@ -2778,7 +2876,7 @@ index 2b644cd..9ccadf1 100644
          if (p->presentation_host && p->timebase) {
              // Fresh host-time samples arrive with future timestamps; the
              // free-running timebase needs no correction.
-@@ -5519,11 +7772,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5519,11 +7833,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
          clear_osd_layer(vo);
          return VO_TRUE;
      case VOCTRL_PAUSE:
@@ -2795,7 +2893,7 @@ index 2b644cd..9ccadf1 100644
          if (!p->presentation_host)
              set_media_timebase_paused(vo, false);
          ahead_set_paused(p, false);
-@@ -5565,6 +7823,49 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5565,6 +7884,50 @@ static int control(struct vo *vo, uint32_t request, void *data)
      // Rasterize the OSD at the video's pixel density instead of the
      // display's (1:1 over the on-screen video rect).
      {"osd-video-res", OPT_BOOL(osd_video_res)},
@@ -2824,6 +2922,7 @@ index 2b644cd..9ccadf1 100644
 +    {"vsync-snap-pace-file", OPT_STRING(vsync_snap_pace_file), .flags = M_OPT_FILE},
 +    // The OSD sample goes to its layer after the video sample (no: before).
 +    {"osd-after-video", OPT_BOOL(osd_after_video)},
++    {"osd-slots-ahead", OPT_BOOL(osd_slots_ahead)},
 +    // Promise the video renderer monotonically increasing stamps.
 +    {"expect-monotonic", OPT_BOOL(expect_monotonic)},
 +    // Decoded audio at one frame per refresh: resample the sound by up to
@@ -2845,7 +2944,7 @@ index 2b644cd..9ccadf1 100644
      {0},
  };
  
-@@ -5579,6 +7880,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -5579,6 +7942,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
          // against mpv's audio-slaved schedule (plezy#1776).
          .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
                                       : AVF_PRESENTATION_MEDIA,

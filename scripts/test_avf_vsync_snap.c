@@ -1000,6 +1000,43 @@ static int slot_cases(void)
         check(r.doubles_apart == 0 && r.empties <= 1 + allowed &&
               r.doubles + r.empties <= 1 + allowed && r.lead_min_ms >= 20, what);
     }
+    // --avfoundation-osd-slots-ahead=1 (avf_osd_slot_ahead()): the subtitle
+    // sample goes in when the VO starts on its frame only when that is more
+    // than half a refresh before the frame's point, so never in its own
+    // frame's slot. In the waiting regime (start 2 to 4 ms after the last
+    // enqueue) that is every frame; with starts around the point, none.
+    {
+        const int64_t p = 41709000;
+        check(!avf_osd_slot_ahead(10 * p, 10 * p + p / 2, p) &&
+              avf_osd_slot_ahead(10 * p, 10 * p + p / 2 + 1, p) &&
+              !avf_osd_slot_ahead(10 * p, 0, p) && !avf_osd_slot_ahead(10 * p, 11 * p, 0),
+              "osd slots ahead: over half a refresh before the point only");
+        for (int regime = 0; regime < 2; regime++) {
+            int ahead = 0, own = 0, frames = 20000;
+            int64_t ph = (int64_t)llround(p * 0.42), enq_prev = 0;
+            for (int n = 0; n < frames; n++) {
+                int64_t point = (1000 + (int64_t)n) * p + ph;
+                int64_t start = regime == 0
+                    ? (n ? enq_prev + (int64_t)llround((3 + rnd()) * MS) : point - 2000000)
+                    : point + (int64_t)llround(3 * MS * rnd());
+                int64_t at = avf_vsync_pace_ns(start, point + 55500000, 0, p, ph, 20000000);
+                int64_t slot_point = at > start ? at : 0;
+                if (avf_osd_slot_ahead(start, slot_point, p)) {
+                    ahead++;
+                    // The subtitle's slot: the point nearest its enqueue.
+                    own += (start - ph + p / 2) / p == (slot_point - ph + p / 2) / p;
+                }
+                enq_prev = at > start ? at : start;
+            }
+            printf("osd slots ahead, %s: %d of %d subtitle samples a slot ahead, %d in their "
+                   "own frame's slot\n", regime ? "starts around the point" : "waiting",
+                   ahead, frames, own);
+            check(own == 0 && (regime ? ahead == 0 : ahead >= frames - 1),   // the first frame starts at its point
+                  regime ? "osd slots ahead: starts at the point keep the subtitle after the video"
+                         : "osd slots ahead: waiting, every subtitle a slot ahead of its frame");
+        }
+    }
+
     // The skip's own frame left out (avf_vsync_snap_refresh() unsent): in the
     // waiting regime on the 2nd generation, the frame after goes into the
     // slot the skipped one would have used, at its point and with the normal
