@@ -66,3 +66,11 @@
 # that it changes, and copies from the previous canvas what that one already
 # holds (common 0234's pixel ids; test_avf_osd_damage.sh).
 0048-avfoundation-redraw-only-the-canvas-tiles-a-frame-changes.patch
+# Upstream 0050-0053 ported onto 0300 and 0307: media-time stamps never go
+# back across a reset (test_avf_media_stamp.sh), the OSD layer primed before
+# its first subtitle, subtitles in their video's colour (test_avf_osd_color.sh)
+# and untagged VideoToolbox frames decoded as mpv does.
+0308-avfoundation-port-0050-stamp-media-frames-after-every-frame-before.patch
+0309-avfoundation-port-0051-prime-the-osd-layer-before-its-first-subtitle.patch
+0310-avfoundation-port-0052-show-subtitles-in-the-colour-of-their-video.patch
+0311-avfoundation-port-0053-decode-untagged-videotoolbox-frames-as-mpv-does.patch
