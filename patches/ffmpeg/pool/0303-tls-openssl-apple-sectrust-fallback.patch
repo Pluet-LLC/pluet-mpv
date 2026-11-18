@@ -1,0 +1,167 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:00:00 +0000
+Subject: [PATCH] tls_openssl: on Apple, fall back to the system trust check
+
+Pluet's Apple apps turn TLS verification on and point tls-ca-file at a
+bundled copy of Mozilla's roots (FFmpeg's OpenSSL has no system store on
+iOS or tvOS). A server whose chain ends at a root the device trusts but
+the bundle does not (a home CA installed by the user, a profile or MDM; or
+a public root newer than the bundle) was then refused, although the app's
+own requests, checked by the system, reach it.
+
+With verification on, a client's chain is now checked by OpenSSL first
+(the CA file, the host name, the dates) and, only if that fails, handed to
+SecTrustEvaluateWithError with the SSL policy for the host name, the order
+curl uses with --with-apple-sectrust. The connection is accepted only if
+one of them accepts it; an expired certificate, a wrong host or an unknown
+root fails both. One line says when the system accepted a server (info),
+and why it refused (error). Runs on the thread opening the stream.
+Security.framework is already linked on Apple.
+
+Checked on macOS 27 (arm64) with local TLS servers and a public site, CA
+file / result, before -> after: own test root / plays -> plays; Mozilla
+bundle, unknown root / refused -> refused; wrong host / refused -> refused;
+expired / refused -> refused; public site with an unrelated CA file /
+refused -> plays ("verified by the system trust store").
+
+--- a/libavformat/tls_openssl.c
++++ b/libavformat/tls_openssl.c
+@@ -33,6 +33,12 @@
+ #include <openssl/err.h>
+ #include <openssl/x509v3.h>
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#include <Security/Security.h>
++#define TLS_APPLE_SECTRUST 1
++#endif
++
+ /**
+  * Returns a heap-allocated null-terminated string containing
+  * the PEM-encoded public key. Caller must free.
+@@ -911,6 +917,110 @@
+     return ret;
+ }
+ 
++#if TLS_APPLE_SECTRUST
++/*
++ * Apple: a peer chain OpenSSL does not verify against the CA file (Pluet
++ * ships Mozilla's roots) is handed to the system's trust evaluation for the
++ * host name, as curl's --with-apple-sectrust does: the device's own store,
++ * with roots the user installed and trusted and roots a profile or MDM put
++ * there. Accepted only if SecTrust accepts it for this host; an expired
++ * certificate, a wrong host or an unknown root still fails both checks.
++ * Runs on the thread opening the stream, never the main thread.
++ */
++static int sectrust_accepts(URLContext *h, X509_STORE_CTX *store_ctx, const char *host)
++{
++    X509 *leaf = X509_STORE_CTX_get0_cert(store_ctx);
++    STACK_OF(X509) *untrusted = X509_STORE_CTX_get0_untrusted(store_ctx);
++    CFMutableArrayRef certs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
++    CFStringRef name = NULL;
++    SecPolicyRef policy = NULL;
++    SecTrustRef trust = NULL;
++    CFErrorRef err = NULL;
++    int n, ok = 0;
++
++    if (!certs || !leaf)
++        goto done;
++    n = untrusted ? sk_X509_num(untrusted) : 0;
++    // The leaf first, then the chain the server sent.
++    for (int i = -1; i < n; i++) {
++        X509 *x = i < 0 ? leaf : sk_X509_value(untrusted, i);
++        unsigned char *der = NULL;
++        CFDataRef data;
++        SecCertificateRef cert;
++        int len;
++        if (i >= 0 && !X509_cmp(x, leaf))
++            continue;
++        len = i2d_X509(x, &der);
++        if (len <= 0)
++            continue;
++        data = CFDataCreate(NULL, der, len);
++        OPENSSL_free(der);
++        if (!data)
++            continue;
++        cert = SecCertificateCreateWithData(NULL, data);
++        CFRelease(data);
++        if (cert) {
++            CFArrayAppendValue(certs, cert);
++            CFRelease(cert);
++        }
++    }
++    if (!CFArrayGetCount(certs))
++        goto done;
++    if (host && host[0])
++        name = CFStringCreateWithCString(NULL, host, kCFStringEncodingUTF8);
++    policy = SecPolicyCreateSSL(true, name);
++    if (!policy || SecTrustCreateWithCertificates(certs, policy, &trust) != errSecSuccess)
++        goto done;
++    ok = SecTrustEvaluateWithError(trust, &err);
++    if (!ok && err) {
++        CFStringRef desc = CFErrorCopyDescription(err);
++        char buf[256] = "";
++        if (desc) {
++            CFStringGetCString(desc, buf, sizeof(buf), kCFStringEncodingUTF8);
++            CFRelease(desc);
++        }
++        av_log(h, AV_LOG_ERROR, "TLS: the system trust check refused %s too: %s\n",
++               host ? host : "the server", buf);
++    }
++done:
++    if (err)
++        CFRelease(err);
++    if (trust)
++        CFRelease(trust);
++    if (policy)
++        CFRelease(policy);
++    if (name)
++        CFRelease(name);
++    if (certs)
++        CFRelease(certs);
++    return ok;
++}
++
++// OpenSSL's own verification first (CA file, host name, dates); on failure,
++// the system trust check above. One line says which check accepted the server.
++static int verify_with_sectrust_fallback(X509_STORE_CTX *store_ctx, void *arg)
++{
++    URLContext *h = arg;
++    TLSContext *p = h->priv_data;
++    TLSShared *c = &p->tls_shared;
++    int err;
++    if (X509_verify_cert(store_ctx) == 1) {
++        av_log(h, AV_LOG_VERBOSE, "TLS: %s verified by the CA file\n", c->host);
++        return 1;
++    }
++    err = X509_STORE_CTX_get_error(store_ctx);
++    av_log(h, AV_LOG_VERBOSE, "TLS: %s not verified by the CA file (%s); asking the system\n",
++           c->host, X509_verify_cert_error_string(err));
++    if (sectrust_accepts(h, store_ctx, c->numerichost ? NULL : c->host)) {
++        X509_STORE_CTX_set_error(store_ctx, X509_V_OK);
++        av_log(h, AV_LOG_INFO, "TLS: %s verified by the system trust store\n", c->host);
++        return 1;
++    }
++    X509_STORE_CTX_set_error(store_ctx, err);
++    return 0;
++}
++#endif
++
+ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
+ {
+     TLSContext *p = h->priv_data;
+@@ -938,8 +1048,13 @@
+     ret = openssl_init_ca_key_cert(h);
+     if (ret < 0) goto fail;
+ 
+-    if (c->verify)
++    if (c->verify) {
+         SSL_CTX_set_verify(p->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
++#if TLS_APPLE_SECTRUST
++        if (!c->listen)
++            SSL_CTX_set_cert_verify_callback(p->ctx, verify_with_sectrust_fallback, h);
++#endif
++    }
+     p->ssl = SSL_new(p->ctx);
+     if (!p->ssl) {
+         av_log(h, AV_LOG_ERROR, "%s\n", openssl_get_error(p));

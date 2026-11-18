@@ -30,3 +30,7 @@
 # Only an RPU whose size, prefix, final byte and CRC32 libdovi would accept
 # reaches libdovi (test test_dovi_rpu_check.sh).
 0301-videotoolbox-hand-libdovi-only-intact-dolby-vision-rpus.patch
+# With TLS verification on, a chain OpenSSL does not verify against the CA
+# file is handed to Apple's SecTrust for the host name (as curl's
+# --with-apple-sectrust): roots the device trusts are honoured.
+0303-tls-openssl-apple-sectrust-fallback.patch
