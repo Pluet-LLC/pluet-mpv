@@ -91,8 +91,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libass",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libass-7c7c7b217282.xcframework.zip",
-            checksum: "71a03a142d2ce23409273fbd9f577e49bfb6b5706f6ad8fa5a27ce4531a3363c"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libass-4257f8256750.xcframework.zip",
+            checksum: "071028a36a7d83c98aede0101698cbecddf453ecc8e24599752289cc66c1a225"
         ),
 
         .binaryTarget(
@@ -144,8 +144,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libplacebo",
-            url: "https://github.com/mpvkit/libplacebo-build/releases/download/7.351.0-2512/Libplacebo.xcframework.zip",
-            checksum: "3b2bd57b82549566963effadf0891a141448d9f89c7d48fca0b8f823b854bac6"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libplacebo-7.387.0-50fcab9a44fe.xcframework.zip",
+            checksum: "50fcab9a44fed213379a06bc92fe647afd39a37f6924e140fc6764f8115f177b"
         ),
 
         .binaryTarget(
@@ -156,38 +156,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libavcodec-864477ccfe18.xcframework.zip",
-            checksum: "deda7aade329237aa77a126b09fe00425d89f447517e438fdd9a9721c55db07c"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libavcodec-e4950928970f.xcframework.zip",
+            checksum: "55135556e7074955e58f147687e25e4e585c934166eab98f437fbf74457a8b43"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libavdevice-864477ccfe18.xcframework.zip",
-            checksum: "ecb4600583970eac6c8c47cc5a3d510b5739317e47004a8c0fbffe6ed3239690"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libavdevice-e4950928970f.xcframework.zip",
+            checksum: "37e6987d77b8ebd64d32dbda83ebae9ccd2386c09b1410727427176def67647c"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libavformat-864477ccfe18.xcframework.zip",
-            checksum: "ad7508e66fda39f3c0424140353c2f77c19a52013271ffac8336296f02f3389d"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libavformat-e4950928970f.xcframework.zip",
+            checksum: "b7af14f9d1f680415669bdfae3f74be36fa9ecba414664dd2fffa8f44270058a"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libavfilter-864477ccfe18.xcframework.zip",
-            checksum: "6b16bb8a0495abd4144e4683316278e988f5e59c20f2368bb963ce382037450d"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libavfilter-e4950928970f.xcframework.zip",
+            checksum: "6c787a817e0530af5d1ae82253fe36bbfdf596808111f1cc57c8d3e98dd14399"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libavutil-864477ccfe18.xcframework.zip",
-            checksum: "f2ea2c8d6c4822966f359d3b2d5ef1b23b2c5d18f9ade9f6316d52a0727b6066"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libavutil-e4950928970f.xcframework.zip",
+            checksum: "a7e12a7ec596c2a3cd6534f017c9ed48b505c602bfb4abbd47af0f42e3e3426f"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libswresample-864477ccfe18.xcframework.zip",
-            checksum: "32f407fe4f300bf455d34fe9899a9e3106ad3e9bed9dd38acbd08a77c7cb6436"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libswresample-e4950928970f.xcframework.zip",
+            checksum: "cab2482b0982de45e6b4a06e198346fcb2b10390bd6852d99149a8e4a3a8d133"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libswscale-864477ccfe18.xcframework.zip",
-            checksum: "783cf35054de2c12c7404986799e93b7edd52a7b9d4bc9b44ccf959554a8750a"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libswscale-e4950928970f.xcframework.zip",
+            checksum: "d7ba3e7a4e427dfa97ffd2fb8e7ad56bab0cf7b8a8f85e3171eb6692af4706a7"
         ),
 
         .binaryTarget(
@@ -204,8 +204,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7/Libmpv-b9105d332ff0.xcframework.zip",
-            checksum: "00841697cffce3df6d3c569da9518c9171c1fae1a401c8b078caf93a35e70d05"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-bd4896eccce8/Libmpv-275f4806b3eb.xcframework.zip",
+            checksum: "a5562dc792f9c3b774c8ec8a3b1073ab61a156cedcff5ead8e9cb04042b368f3"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
