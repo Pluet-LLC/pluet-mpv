@@ -74,3 +74,6 @@
 0309-avfoundation-port-0051-prime-the-osd-layer-before-its-first-subtitle.patch
 0310-avfoundation-port-0052-show-subtitles-in-the-colour-of-their-video.patch
 0311-avfoundation-port-0053-decode-untagged-videotoolbox-frames-as-mpv-does.patch
+# Measurement only: whether subtitles and their frames share a refresh,
+# logged at the verbose level (test_avf_subref.sh).
+0312-avfoundation-log-whether-subtitles-and-frames-share-a-refresh.patch

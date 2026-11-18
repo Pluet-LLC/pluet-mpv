@@ -1,0 +1,929 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vo_avfoundation: log whether subtitles and their frames share
+ a refresh (measurement only)
+
+Plezy's engine found (edde746/mpv-build 1e16360, b626c6a; HDMI captures)
+that on tvOS the video and OSD layers can show the same stamp on different
+refreshes when stamps sit 75-90% into a refresh, and after some seeks the
+subtitles stay a refresh late for the whole stretch. 0307 stamps 75% into the
+refresh. This patch only measures; nothing handed to a layer, or when,
+changes.
+
+The signal: AVSampleBufferVideoRenderer's copyDisplayedPixelBuffer (tvOS,
+iOS 17.4, macOS 14.4), read for the video layer, the OSD layer and the video
+layer again (a refresh between the reads leaves the look torn and unjudged)
+just before each frame's hand-over (0307's pacing point) while a subtitle is
+up or for 3 s after one; the video alone every 4th frame otherwise. The
+buffers are found in rings of what each layer was handed (identity, stamp,
+hand-over time), and the OSD sample shown is judged against the one due: the
+newest stamped at or before the shown frame's stamp (both layers run on the
+one timebase, and a subtitle change is stamped as its frame). AVFoundation
+documents the call as returning NULL while the rate is non-zero; the counts
+say how often it did. tvOS 27's RenderingEvent (Swift only) reports
+failures, not presentation, and the timebase notifications report rate and
+jumps, so there is no more direct per-frame signal. Beside it, the model's
+inputs: where each change's stamp sits in the refresh (display link grid),
+each layer's lead in refreshes, an instant between the two hand-overs, and
+Plezy's 2.9-3.35 refresh band as a prediction; the OSD layer's readiness and
+flush state at each hand-over. In host mode the frame shown is also set
+against the newest frame stamped by then.
+
+Lines, verbose level only (a field build), none per frame: "subref" every 5 s
+while subtitles were up, "subref ... video" every 5 s, "subref after
+start|seek|unpause" for the 10 s of playing after each (with a verdict:
+in step, LATE, EARLY, STUCK LATE, STUCK EARLY), "subref session" at
+--avfoundation-subref-report changing (the app's close) and at uninit, and
+"switches" at the first frame and when a live switch (snap, snap-lead,
+queue-lead-ms, pace, pace-phase, osd order) changes; window, stretch and
+session lines carry a run tag [s<stamp%> q<lead ms> p<A|Y|N><point>[pin]
+o<a|b|s>]. --avfoundation-subref-look=no turns the looks off. The judging
+code is freestanding; scripts/test_avf_subref.sh checks it.
+
+LOCAL TEST ONLY: not pushed, not run on a device.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 4eab1f7..b1d3939 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -371,6 +371,8 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
+     bool osd_slots_ahead;
+     bool vsync_snap_record;
+     bool expect_monotonic;
++    bool subref_look;
++    int subref_report;
+ };
+ 
+ // --avfoundation-vsync-snap: stamps placed inside their refresh (yes), left
+@@ -1842,6 +1844,200 @@ static void avf_phase_get(const struct avf_phase_stat *s, double period,
+     int osd_ahead;          // OSD samples sent a slot ahead (osd-slots-ahead)
+ };
+ 
++// --- avf subtitle refresh match (host-testable; keep freestanding) ---
++// Measurement only: whether a subtitle (OSD layer) sample is on screen on
++// the same refresh as the video frame it belongs to. Both layers run on one
++// timebase and a subtitle change is stamped as its frame, so at any moment
++// the OSD layer should show the newest OSD sample stamped at or before the
++// stamp of the video sample the video layer shows. The VO keeps a ring of
++// what it handed each layer (the pixel buffer, by identity only, its stamp
++// and when it went), reads which buffer each layer shows
++// (copyDisplayedPixelBuffer), finds them in the rings, and judges. A sample
++// shown at once (a clear after a seek, a primer) replaces everything before
++// it on its layer, so it is due from then until the next timed one.
++#define AVF_SUBREF_RING 48
++#define AVF_SUBREF_AT_ONCE (INT64_MIN / 2)
++
++struct avf_subref_entry {
++    const void *buf;    // the pixel buffer handed over (identity only)
++    int64_t stamp_ns;   // its stamp on the layers' timebase, or AVF_SUBREF_AT_ONCE
++    int64_t enq_ns;     // when it went to its layer (mp_time_ns())
++    uint32_t id;        // hand-over order, never 0
++    bool empty;         // a transparent sample (no subtitle)
++    bool bad;           // a look caught it on the wrong refresh
++    bool gone;          // dropped by a flush or replaced before it could show
++    bool modeled;       // its hand-over was set beside its frame's (model)
++};
++
++struct avf_subref_ring {
++    struct avf_subref_entry e[AVF_SUBREF_RING];
++    int next, count;
++    uint32_t serial;
++};
++
++static struct avf_subref_entry *avf_subref_at(struct avf_subref_ring *r, int i)
++{
++    return &r->e[(r->next - 1 - i + 2 * AVF_SUBREF_RING) % AVF_SUBREF_RING];
++}
++
++static struct avf_subref_entry *avf_subref_push(struct avf_subref_ring *r,
++                                                const void *buf, int64_t stamp_ns,
++                                                int64_t enq_ns, bool empty)
++{
++    if (stamp_ns == AVF_SUBREF_AT_ONCE) {
++        for (int i = 0; i < r->count; i++)
++            avf_subref_at(r, i)->gone = true;
++    }
++    struct avf_subref_entry *e = &r->e[r->next];
++    if (!++r->serial)
++        r->serial = 1;
++    *e = (struct avf_subref_entry){
++        .buf = buf, .stamp_ns = stamp_ns, .enq_ns = enq_ns, .id = r->serial,
++        .empty = empty,
++    };
++    r->next = (r->next + 1) % AVF_SUBREF_RING;
++    if (r->count < AVF_SUBREF_RING)
++        r->count++;
++    return e;
++}
++
++// A flush at layer time t: what was stamped after it never shows.
++static void avf_subref_flush_after(struct avf_subref_ring *r, int64_t t)
++{
++    for (int i = 0; i < r->count; i++) {
++        struct avf_subref_entry *e = avf_subref_at(r, i);
++        if (e->stamp_ns > t)
++            e->gone = true;
++    }
++}
++
++// The hand-over buf came from: of several (one buffer handed over again),
++// the one stamped nearest to near_ns.
++static struct avf_subref_entry *avf_subref_find(struct avf_subref_ring *r,
++                                                const void *buf, int64_t near_ns)
++{
++    struct avf_subref_entry *best = NULL;
++    int64_t best_d = 0;
++    for (int i = 0; i < r->count; i++) {
++        struct avf_subref_entry *e = avf_subref_at(r, i);
++        if (e->gone || e->buf != buf)
++            continue;
++        int64_t d = e->stamp_ns == AVF_SUBREF_AT_ONCE ? INT64_MAX / 4
++                  : e->stamp_ns > near_ns ? e->stamp_ns - near_ns : near_ns - e->stamp_ns;
++        if (!best || d < best_d) {
++            best = e;
++            best_d = d;
++        }
++    }
++    return best;
++}
++
++// What should be up while a frame stamped t is: the newest sample stamped at
++// or before t (the latest handed over of equal stamps), or the newest shown
++// at once.
++static struct avf_subref_entry *avf_subref_due(struct avf_subref_ring *r, int64_t t)
++{
++    struct avf_subref_entry *best = NULL;
++    for (int i = 0; i < r->count; i++) {
++        struct avf_subref_entry *e = avf_subref_at(r, i);
++        if (e->gone || e->stamp_ns > t)
++            continue;
++        if (!best || e->stamp_ns > best->stamp_ns ||
++            (e->stamp_ns == best->stamp_ns && e->id > best->id))
++            best = e;
++    }
++    return best;
++}
++
++// A look's verdict: the OSD sample shown against the one due while the
++// video layer shows a frame stamped video_ns. 0: the right picture (the due
++// sample, or one with the same buffer, or both transparent). > 0: a later
++// frame's subtitle is up already (ahead, by that many refreshes). < 0: an
++// earlier one is still up (behind, by the refreshes since the due one's
++// stamp, counting the refresh it was due on).
++static int avf_subref_judge(int64_t video_ns, const struct avf_subref_entry *shown,
++                            const struct avf_subref_entry *due, int64_t period_ns)
++{
++    if (shown == due || shown->buf == due->buf || (shown->empty && due->empty))
++        return 0;
++    if (period_ns <= 0)
++        return shown->stamp_ns > video_ns ? 1 : -1;
++    if (shown->stamp_ns > video_ns) {
++        int64_t n = (shown->stamp_ns - video_ns + period_ns / 2) / period_ns;
++        return (int)(n < 1 ? 1 : n > 99 ? 99 : n);
++    }
++    int64_t since = due->stamp_ns == AVF_SUBREF_AT_ONCE ? 0 : video_ns - due->stamp_ns;
++    int64_t n = (since + period_ns / 2) / period_ns + 1;
++    return -(int)(n < 1 ? 1 : n > 99 ? 99 : n);
++}
++
++// The model, from Plezy's HDMI captures (edde746/mpv-build b626c6a): a tvOS
++// layer shows a sample on the refresh its stamp asks for only when it has the
++// sample about three refreshes ahead, and the video and OSD layers' limits
++// differ, between 2.9 and 3.35 refreshes. Leads are stamp minus hand-over,
++// in refreshes.
++enum { AVF_SUBREF_UNDER, AVF_SUBREF_BAND, AVF_SUBREF_OVER };
++
++static int avf_subref_zone(double lead)
++{
++    return lead < 2.9 ? AVF_SUBREF_UNDER : lead <= 3.35 ? AVF_SUBREF_BAND
++                                                        : AVF_SUBREF_OVER;
++}
++
++// Predicted on different refreshes: either lead in the band (either layer's
++// limit may sit either side of it), the two in different zones, or both
++// under it (each layer then shows its sample as soon as it can) with a
++// display link instant between the two hand-overs.
++static bool avf_subref_predict(double lead_v, double lead_o, bool crossed)
++{
++    int zv = avf_subref_zone(lead_v), zo = avf_subref_zone(lead_o);
++    if (zv == AVF_SUBREF_BAND || zo == AVF_SUBREF_BAND || zv != zo)
++        return true;
++    return zv == AVF_SUBREF_UNDER && crossed;
++}
++// --- end avf subtitle refresh match ---
++
++// The subtitle refresh match's counts (see "subtitle refresh match: the VO's
++// side"): a 5 s window, a stretch after a start, seek or unpause, a session.
++struct avf_subref_tally {
++    int frames;                 // video frames handed over while a subtitle was up
++    int looks, nulls, torn, unknown, match;
++    int ahead[3], behind[3];    // looks off by 1, 2, 3+ refreshes
++    int changes, changes_bad;   // timed OSD samples; those a look caught off
++    int model, zone[3], crossed, pred;
++    double lead_v_lo, lead_v_hi, lead_o_lo, lead_o_hi, gap_lo, gap_hi;
++    struct avf_phase_stat stamp;    // % of the refresh, past the link's instant
++    int not_ready, flush;
++    int64_t look_max_ns;
++    // Video alone (every frame while a subtitle is up, else every 4th; host
++    // mode): the frame shown against the newest one stamped by now, in
++    // refreshes (early, on time, 1 late, 2+ late), and how long ago, in
++    // refreshes, the shown frame's stamp was.
++    int vlooks, vunknown, vlate[4];
++    double vage_lo, vage_hi, vage_sum;
++};
++
++struct avf_subref {
++    struct avf_subref_ring vid, osd;
++    struct avf_subref_tally win, stretch, total;
++    struct avf_subref_tally *tallies[3];
++    int64_t win_start_ns;
++    bool stretch_on;
++    const char *stretch_kind;
++    int64_t stretch_first_ns;
++    double stretch_pos;
++    int stretches, stretches_bad;
++    int worst_bad, worst_changes, worst_behind, worst_ahead;
++    const char *worst_kind;
++    double worst_pos;
++    int64_t sub_seen_ns;
++    int64_t last_video_stamp_ns, frame_ns;
++    bool grid;
++    bool session_told;
++    int vlook_skip;
++    bool switches_told;
++};
++
+ struct priv {
+     struct mp_hwdec_ctx hwctx;
+     struct m_config_cache *opts_cache;
+@@ -1923,6 +2119,9 @@ static void avf_phase_get(const struct avf_phase_stat *s, double period,
+     // Media mode: the snapped stamp for the next frame, in media time.
+     int64_t next_media_stamp_ns;
+     bool next_media_stamp_valid;
++    // Measurement only: subtitle and video on the same refresh? (see
++    // "subtitle refresh match: the VO's side")
++    struct avf_subref subref;
+     int64_t vsync_tb_offset_ns;     // layer timebase minus mp_time_ns()
+     int64_t vsync_tb_checked_ns;
+     int64_t next_media_pts_ns;
+@@ -2162,6 +2361,8 @@ static CGFloat get_screen_scale(void)
+ 
+ static void clear_subtitle_cache(struct priv *p);
+ static void clear_osd_layer(struct vo *vo);
++static void subref_session(struct vo *vo, const char *when);
++static void subref_switches(struct vo *vo, const char *why);
+ static void ahead_invalidate(struct priv *p, double pts);
+ static void release_ci_compositor(struct priv *p);
+ static const struct m_sub_options avfoundation_conf;
+@@ -4431,10 +4632,22 @@ static void update_avfoundation_options(struct vo *vo)
+     int old_queue_slack_ms = p->opts->queue_slack_ms;
+     int old_osd_max_height = p->opts->osd_max_height;
+     bool old_osd_video_res = p->opts->osd_video_res;
++    int old_subref_report = p->opts->subref_report;
++    int old_snap = p->opts->vsync_snap, old_pace = p->opts->vsync_snap_pace;
++    double old_lead = p->opts->vsync_snap_lead, old_phase = p->opts->vsync_snap_pace_phase;
++    bool old_after = p->opts->osd_after_video, old_ahead = p->opts->osd_slots_ahead;
+ 
+     if (!m_config_cache_update(p->opts_cache))
+         return;
+ 
++    if (old_subref_report != p->opts->subref_report)
++        subref_session(vo, "close");
++    if (old_snap != p->opts->vsync_snap || old_pace != p->opts->vsync_snap_pace ||
++        old_lead != p->opts->vsync_snap_lead || old_phase != p->opts->vsync_snap_pace_phase ||
++        old_after != p->opts->osd_after_video || old_ahead != p->opts->osd_slots_ahead ||
++        old_queue_lead_ms != p->opts->queue_lead_ms)
++        subref_switches(vo, "changed");
++
+     if (old_queue_lead_ms != p->opts->queue_lead_ms)
+         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+     if (old_queue_slack_ms != p->opts->queue_slack_ms)
+@@ -6458,6 +6671,531 @@ static CMSampleBufferRef create_osd_sample_buffer(struct vo *vo,
+     return buf;
+ }
+ 
++// --- subtitle refresh match: the VO's side (measurement only)
++// See "avf subtitle refresh match". While a subtitle is up (and for 3 s
++// after the last one went), each frame's hand-over first reads which buffer
++// each layer shows: the video layer's, the OSD layer's, and the video's again
++// (a refresh between the reads is a torn look and is not judged). Counted per
++// 5 s window, per stretch after a start, seek or unpause (10 s of playing),
++// and per session; logged only at the verbose level (a field build), with no
++// line per frame. Nothing here changes what is handed to a layer, or when.
++#define AVF_SUBREF_WINDOW_NS MP_TIME_MS_TO_NS(5000)
++#define AVF_SUBREF_STRETCH_NS MP_TIME_MS_TO_NS(10000)
++#define AVF_SUBREF_LINGER_NS MP_TIME_MS_TO_NS(3000)
++
++static struct avf_subref_tally *const *subref_tallies(struct priv *p)
++{
++    struct avf_subref *sr = &p->subref;
++    sr->tallies[0] = &sr->win;
++    sr->tallies[1] = sr->stretch_on ? &sr->stretch : NULL;
++    sr->tallies[2] = &sr->total;
++    return sr->tallies;
++}
++
++#define SUBREF_ALL(p, t, stmt) do {                                   \
++    struct avf_subref_tally *const *ts_ = subref_tallies(p);          \
++    for (int k_ = 0; k_ < 3; k_++) {                                  \
++        struct avf_subref_tally *t = ts_[k_];                         \
++        if (t) { stmt; }                                              \
++    }                                                                 \
++} while (0)
++
++static bool subref_on(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    return p->opts->subref_look && mp_msg_test(vo->log, MSGL_V) &&
++           p->displayLayer && p->osdLayer;
++}
++
++// The refresh period to count in: the display link's, else (no link) the
++// spacing of the frames' stamps.
++static int64_t subref_period(struct priv *p, int64_t now, int64_t *vsync)
++{
++    int64_t v = 0, period = 0, nominal = 0;
++    if (vsync_snap_grid(p, now, &v, &period, &nominal)) {
++        p->subref.grid = true;
++        if (vsync)
++            *vsync = v;
++        return period;
++    }
++    p->subref.grid = false;
++    if (vsync)
++        *vsync = 0;
++    return p->subref.frame_ns;
++}
++
++static int64_t subref_stamp(CMSampleBufferRef buf)
++{
++    CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(buf, false);
++    if (att && CFArrayGetCount(att) > 0) {
++        CFDictionaryRef d = CFArrayGetValueAtIndex(att, 0);
++        if (d && CFDictionaryGetValue(d, kCMSampleAttachmentKey_DisplayImmediately) == kCFBooleanTrue)
++            return AVF_SUBREF_AT_ONCE;
++    }
++    return cm_time_to_ns(CMSampleBufferGetPresentationTimeStamp(buf));
++}
++
++// A frame's OSD and video hand-overs, set beside each other and the display
++// link's grid: where the stamp sits in the refresh, each lead in refreshes,
++// whether a link instant fell between them, and the model's prediction.
++static void subref_model(struct vo *vo, const struct avf_subref_entry *v,
++                         struct avf_subref_entry *o)
++{
++    struct priv *p = vo->priv;
++    o->modeled = true;
++    int64_t vsync = 0;
++    int64_t period = subref_period(p, mp_time_ns(), &vsync);
++    if (!p->subref.grid || period <= 0 || o->stamp_ns == AVF_SUBREF_AT_ONCE)
++        return;
++    double lead_v = (v->stamp_ns - v->enq_ns) / (double)period;
++    double lead_o = (o->stamp_ns - o->enq_ns) / (double)period;
++    bool crossed = avf_vsync_floor_div(v->enq_ns - vsync, period) !=
++                   avf_vsync_floor_div(o->enq_ns - vsync, period);
++    bool pred = avf_subref_predict(lead_v, lead_o, crossed);
++    double pct = vsync_mod(o->stamp_ns - vsync, period) * 100.0 / period;
++    double gap = (o->enq_ns - v->enq_ns) / 1e6;
++    int zv = avf_subref_zone(lead_v), zo = avf_subref_zone(lead_o);
++    SUBREF_ALL(p, t, {
++        if (!t->model) {
++            t->lead_v_lo = t->lead_v_hi = lead_v;
++            t->lead_o_lo = t->lead_o_hi = lead_o;
++            t->gap_lo = t->gap_hi = gap;
++        }
++        t->model++;
++        t->lead_v_lo = MPMIN(t->lead_v_lo, lead_v);
++        t->lead_v_hi = MPMAX(t->lead_v_hi, lead_v);
++        t->lead_o_lo = MPMIN(t->lead_o_lo, lead_o);
++        t->lead_o_hi = MPMAX(t->lead_o_hi, lead_o);
++        t->gap_lo = MPMIN(t->gap_lo, gap);
++        t->gap_hi = MPMAX(t->gap_hi, gap);
++        t->zone[MPMAX(zv, zo)]++;
++        t->crossed += crossed;
++        t->pred += pred;
++        avf_phase_add(&t->stamp, pct, 100.0);
++    });
++}
++
++// The video layer was handed buf.
++static void subref_note_video(struct vo *vo, CMSampleBufferRef buf)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!subref_on(vo))
++        return;
++    int64_t now = mp_time_ns();
++    int64_t stamp = subref_stamp(buf);
++    if (stamp != AVF_SUBREF_AT_ONCE && sr->last_video_stamp_ns &&
++        stamp > sr->last_video_stamp_ns &&
++        stamp - sr->last_video_stamp_ns < MP_TIME_MS_TO_NS(200))
++        sr->frame_ns = stamp - sr->last_video_stamp_ns;
++    if (stamp != AVF_SUBREF_AT_ONCE)
++        sr->last_video_stamp_ns = stamp;
++    struct avf_subref_entry *v = avf_subref_push(&sr->vid, CMSampleBufferGetImageBuffer(buf),
++                                                 stamp, now, false);
++    if (!sr->switches_told) {
++        sr->switches_told = true;
++        subref_switches(vo, "first frame");
++    }
++    bool up = p->has_subtitle ||
++              (sr->sub_seen_ns && now - sr->sub_seen_ns < AVF_SUBREF_LINGER_NS);
++    if (sr->stretch_on && !sr->stretch_first_ns) {
++        sr->stretch_first_ns = now;
++        sr->stretch_pos = p->next_pts;
++    }
++    if (up)
++        SUBREF_ALL(p, t, t->frames++);
++    // The frame's subtitle sample went first (osd-after-video=no, or a slot
++    // ahead): set the two beside each other now.
++    if (sr->osd.count) {
++        struct avf_subref_entry *o = avf_subref_at(&sr->osd, 0);
++        if (!o->modeled && !o->gone && o->stamp_ns == stamp)
++            subref_model(vo, v, o);
++    }
++}
++
++// The OSD layer was handed buf (enqueued is false: refused, not ready).
++static void subref_note_osd(struct vo *vo, CMSampleBufferRef buf, bool enqueued,
++                            bool wants_flush)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!subref_on(vo))
++        return;
++    int64_t now = mp_time_ns();
++    if (!enqueued) {
++        SUBREF_ALL(p, t, t->not_ready++);
++        return;
++    }
++    if (wants_flush)
++        SUBREF_ALL(p, t, t->flush++);
++    CVImageBufferRef img = CMSampleBufferGetImageBuffer(buf);
++    bool empty = !img || img != p->cachedSubtitleBuffer || !p->has_subtitle;
++    int64_t stamp = subref_stamp(buf);
++    struct avf_subref_entry *o = avf_subref_push(&sr->osd, img, stamp, now, empty);
++    if (!empty)
++        sr->sub_seen_ns = now;
++    if (stamp == AVF_SUBREF_AT_ONCE)
++        return;
++    SUBREF_ALL(p, t, t->changes++);
++    // The frame's video went first (the default order).
++    if (sr->vid.count) {
++        struct avf_subref_entry *v = avf_subref_at(&sr->vid, 0);
++        if (!v->gone && v->stamp_ns == stamp)
++            subref_model(vo, v, o);
++    }
++}
++
++// One look: which frame and which subtitle the layers show now.
++static void subref_look(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!subref_on(vo))
++        return;
++    int64_t now = mp_time_ns();
++    bool subs = p->has_subtitle ||
++                (sr->sub_seen_ns && now - sr->sub_seen_ns < AVF_SUBREF_LINGER_NS);
++    if (!subs && (++sr->vlook_skip % 4))
++        return;
++    if (@available(iOS 17.4, tvOS 17.4, macOS 14.4, *)) {
++        AVSampleBufferVideoRenderer *vr = p->displayLayer.sampleBufferRenderer;
++        CVPixelBufferRef v1 = [vr copyDisplayedPixelBuffer];
++        CVPixelBufferRef o = NULL, v2 = NULL;
++        if (subs) {
++            AVSampleBufferVideoRenderer *orr = p->osdLayer.sampleBufferRenderer;
++            o = [orr copyDisplayedPixelBuffer];
++            v2 = [vr copyDisplayedPixelBuffer];
++        }
++        int64_t cost = mp_time_ns() - now;
++        const void *vb = v1, *ob = o;
++        bool torn = subs && v1 != v2;
++        if (v1)
++            CVPixelBufferRelease(v1);
++        if (o)
++            CVPixelBufferRelease(o);
++        if (v2)
++            CVPixelBufferRelease(v2);
++        int64_t period = subref_period(p, now, NULL);
++
++        // The video frame shown against its stamp (host mode: stamps are
++        // mp_time_ns()).
++        struct avf_subref_entry *v = vb ? avf_subref_find(&sr->vid, vb, now) : NULL;
++        if (v && v->stamp_ns == AVF_SUBREF_AT_ONCE)
++            v = NULL;
++        if (p->presentation_host && vb && period > 0) {
++            struct avf_subref_entry *vdue = avf_subref_due(&sr->vid, now);
++            if (!v || !vdue) {
++                SUBREF_ALL(p, t, { t->vlooks++; t->vunknown++; });
++            } else {
++                int64_t d = vdue->stamp_ns - v->stamp_ns;
++                int k = v->stamp_ns > now ? 0
++                      : 1 + (int)MPMIN((d + period / 2) / period, 2);
++                double age = (now - v->stamp_ns) / (double)period;
++                SUBREF_ALL(p, t, {
++                    if (!(t->vlooks - t->vunknown))
++                        t->vage_lo = t->vage_hi = age;
++                    t->vlooks++;
++                    t->vlate[k]++;
++                    t->vage_lo = MPMIN(t->vage_lo, age);
++                    t->vage_hi = MPMAX(t->vage_hi, age);
++                    t->vage_sum += age;
++                });
++            }
++        }
++        if (!subs)
++            return;
++
++        SUBREF_ALL(p, t, {
++            t->looks++;
++            t->look_max_ns = MPMAX(t->look_max_ns, cost);
++        });
++        if (!vb || !ob) {
++            SUBREF_ALL(p, t, t->nulls++);
++            return;
++        }
++        if (torn) {
++            SUBREF_ALL(p, t, t->torn++);
++            return;
++        }
++        if (!v) {
++            SUBREF_ALL(p, t, t->unknown++);
++            return;
++        }
++        struct avf_subref_entry *due = avf_subref_due(&sr->osd, v->stamp_ns);
++        struct avf_subref_entry *shown = avf_subref_find(&sr->osd, ob, v->stamp_ns);
++        if (!due || !shown) {
++            SUBREF_ALL(p, t, t->unknown++);
++            return;
++        }
++        int j = avf_subref_judge(v->stamp_ns, shown, due, period);
++        if (!j) {
++            SUBREF_ALL(p, t, t->match++);
++            return;
++        }
++        int n = MPMIN(j < 0 ? -j : j, 3) - 1;
++        struct avf_subref_entry *blame = j < 0 ? due : shown;
++        bool first = !blame->bad;
++        blame->bad = true;
++        SUBREF_ALL(p, t, {
++            if (j > 0)
++                t->ahead[n]++;
++            else
++                t->behind[n]++;
++            if (first)
++                t->changes_bad++;
++        });
++    } else {
++        SUBREF_ALL(p, t, t->nulls++);
++    }
++}
++
++// The live switches a run is told apart by: stamp place (s, % into the
++// refresh), queue lead (q, ms), pacing (p: A auto, Y yes, N no; then the
++// point in use, or the pinned option), subtitle order (o: a after, b before,
++// s a slot ahead).
++static void subref_tag(struct priv *p, char *buf, size_t size)
++{
++    const struct avfoundation_opts *o = p->opts;
++    char pace = o->vsync_snap_pace == AVF_VSYNC_PACE_AUTO ? 'A'
++              : o->vsync_snap_pace == AVF_VSYNC_PACE_YES ? 'Y' : 'N';
++    double point = o->vsync_snap_pace_phase >= 0 ? o->vsync_snap_pace_phase
++                 : p->vsync_pace_period ? p->vsync_pace.phase : -1;
++    snprintf(buf, size, "[%ss%.0f q%d p%c%.2f%s o%c]",
++             o->vsync_snap == AVF_VSYNC_SNAP_YES ? "" :
++             o->vsync_snap == AVF_VSYNC_SNAP_NO ? "snap-off " : "snap-measure ",
++             (1.0 - o->vsync_snap_lead) * 100, o->queue_lead_ms, pace, point,
++             o->vsync_snap_pace_phase >= 0 ? "pin" : "",
++             o->osd_slots_ahead ? 's' : o->osd_after_video ? 'a' : 'b');
++}
++
++// The switches, in words: at a VO's first frame and whenever one changes.
++static void subref_switches(struct vo *vo, const char *why)
++{
++    struct priv *p = vo->priv;
++    if (!mp_msg_test(vo->log, MSGL_V))
++        return;
++    const struct avfoundation_opts *o = p->opts;
++    static const char *const snaps[] = {"no", "yes", "measure"};
++    static const char *const paces[] = {"no", "yes", "auto"};
++    char tag[64];
++    subref_tag(p, tag, sizeof(tag));
++    MP_VERBOSE(vo, "switches (%s): vsync-snap %s, snap-lead %.2f (stamp %.0f%% into the "
++               "refresh), queue-lead-ms %d, pace %s, pace-phase %.2f, osd %s%s %s\n",
++               why, snaps[o->vsync_snap % 3], o->vsync_snap_lead,
++               (1.0 - o->vsync_snap_lead) * 100, o->queue_lead_ms,
++               paces[o->vsync_snap_pace % 3], o->vsync_snap_pace_phase,
++               o->osd_after_video ? "after" : "before",
++               o->osd_slots_ahead ? " (slot ahead)" : "", tag);
++}
++
++static void subref_fmt_counts(const struct avf_subref_tally *t, char *buf, size_t size)
++{
++    snprintf(buf, size, "looks %d (null %d torn %d ?%d) ok %d, ahead %d/%d/%d behind %d/%d/%d",
++             t->looks, t->nulls, t->torn, t->unknown, t->match,
++             t->ahead[0], t->ahead[1], t->ahead[2],
++             t->behind[0], t->behind[1], t->behind[2]);
++}
++
++static void subref_fmt_model(const struct avf_subref_tally *t, char *buf, size_t size)
++{
++    if (!t->model) {
++        snprintf(buf, size, "no grid or no change");
++        return;
++    }
++    double avg, lo, hi;
++    avf_phase_get(&t->stamp, 100.0, &avg, &lo, &hi);
++    snprintf(buf, size, "stamp %.0f%% [%+.0f %+.0f], lead v %.2f-%.2f o %.2f-%.2f, "
++             "gap %.1f-%.1f ms, zones %d/%d/%d x%d pred %d",
++             avg, lo, hi, t->lead_v_lo, t->lead_v_hi, t->lead_o_lo, t->lead_o_hi,
++             t->gap_lo, t->gap_hi, t->zone[AVF_SUBREF_UNDER], t->zone[AVF_SUBREF_BAND],
++             t->zone[AVF_SUBREF_OVER], t->crossed, t->pred);
++}
++
++static void subref_fmt_video(const struct avf_subref_tally *t, char *buf, size_t size)
++{
++    int n = t->vlooks - t->vunknown;
++    if (n <= 0) {
++        snprintf(buf, size, "video looks %d (?%d)", t->vlooks, t->vunknown);
++        return;
++    }
++    snprintf(buf, size, "video looks %d (?%d) vs stamp early %d ok %d +1 %d +2 %d, "
++             "age %.2f [%.2f %.2f] refreshes", t->vlooks, t->vunknown, t->vlate[0],
++             t->vlate[1], t->vlate[2], t->vlate[3], t->vage_sum / n, t->vage_lo, t->vage_hi);
++}
++
++static const char *subref_verdict(const struct avf_subref_tally *t)
++{
++    int ahead = t->ahead[0] + t->ahead[1] + t->ahead[2];
++    int behind = t->behind[0] + t->behind[1] + t->behind[2];
++    if (!t->changes_bad)
++        return t->match ? "in step" : "unjudged";
++    if (t->changes >= 2 && t->changes_bad >= t->changes && behind && !ahead)
++        return "STUCK LATE";
++    if (t->changes >= 2 && t->changes_bad >= t->changes && ahead && !behind)
++        return "STUCK EARLY";
++    return behind >= ahead ? "LATE" : "EARLY";
++}
++
++// A post-seek (or start, or unpause) stretch is over: its line, and the
++// session's worst.
++static void subref_end_stretch(struct vo *vo, int64_t now, const char *why)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!sr->stretch_on)
++        return;
++    sr->stretch_on = false;
++    const struct avf_subref_tally *t = &sr->stretch;
++    // Nothing played since it began (a stop, or a seek straight after one).
++    if (!sr->stretch_first_ns) {
++        sr->stretch_kind = NULL;
++        return;
++    }
++    double s = (now - sr->stretch_first_ns) / 1e9;
++    char pos[24] = "-";
++    if (sr->stretch_pos != MP_NOPTS_VALUE && isfinite(sr->stretch_pos))
++        snprintf(pos, sizeof(pos), "%.1f", sr->stretch_pos);
++    if (!t->frames && !t->changes) {
++        char v[160], tag[64];
++        subref_fmt_video(t, v, sizeof(v));
++        subref_tag(p, tag, sizeof(tag));
++        MP_VERBOSE(vo, "subref after %s @%s: no subtitles up in %.1fs%s %s\n",
++                   sr->stretch_kind, pos, s, why ? why : "", tag);
++        MP_VERBOSE(vo, "subref after %s @%s %s\n", sr->stretch_kind, pos, v);
++        sr->stretch_kind = NULL;
++        return;
++    }
++    char c[160], m[200], v[160], tag[64];
++    subref_fmt_counts(t, c, sizeof(c));
++    subref_fmt_model(t, m, sizeof(m));
++    subref_fmt_video(t, v, sizeof(v));
++    subref_tag(p, tag, sizeof(tag));
++    MP_VERBOSE(vo, "subref after %s @%s: %.1fs%s, %s %d/%d changes; frames %d, %s\n",
++               sr->stretch_kind, pos, s, why ? why : "", subref_verdict(t),
++               t->changes_bad, t->changes, t->frames, c);
++    MP_VERBOSE(vo, "subref after %s @%s model: %s %s\n", sr->stretch_kind, pos, m, tag);
++    MP_VERBOSE(vo, "subref after %s @%s %s\n", sr->stretch_kind, pos, v);
++    sr->stretches++;
++    if (t->changes_bad) {
++        sr->stretches_bad++;
++        if (t->changes_bad > sr->worst_bad) {
++            sr->worst_bad = t->changes_bad;
++            sr->worst_changes = t->changes;
++            sr->worst_kind = sr->stretch_kind;
++            sr->worst_pos = sr->stretch_pos;
++            sr->worst_behind = t->behind[0] + t->behind[1] + t->behind[2];
++            sr->worst_ahead = t->ahead[0] + t->ahead[1] + t->ahead[2];
++        }
++    }
++    sr->stretch_kind = NULL;
++}
++
++// A start, a seek or an unpause: a stretch begins (and the one before ends).
++static void subref_start_stretch(struct vo *vo, const char *kind)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!subref_on(vo))
++        return;
++    int64_t now = mp_time_ns();
++    subref_end_stretch(vo, now, " (cut short)");
++    sr->stretch = (struct avf_subref_tally){0};
++    sr->stretch_on = true;
++    sr->stretch_kind = kind;
++    sr->stretch_first_ns = 0;
++    sr->stretch_pos = MP_NOPTS_VALUE;
++}
++
++// A flush (seek, stop): what was queued and not yet shown never shows.
++static void subref_flushed(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!p->timebase)
++        return;
++    int64_t t = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++    avf_subref_flush_after(&sr->vid, t);
++    avf_subref_flush_after(&sr->osd, t);
++    sr->last_video_stamp_ns = 0;
++}
++
++// After each hand-over: the window's lines, and a stretch's end.
++static void subref_tick(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!subref_on(vo))
++        return;
++    int64_t now = mp_time_ns();
++    if (sr->stretch_on && sr->stretch_first_ns &&
++        now - sr->stretch_first_ns >= AVF_SUBREF_STRETCH_NS)
++        subref_end_stretch(vo, now, NULL);
++    if (!sr->win_start_ns) {
++        sr->win_start_ns = now;
++        return;
++    }
++    if (now - sr->win_start_ns < AVF_SUBREF_WINDOW_NS)
++        return;
++    const struct avf_subref_tally *t = &sr->win;
++    double s = (now - sr->win_start_ns) / 1e9;
++    if (t->frames || t->changes || t->looks) {
++        char c[160], m[200];
++        subref_fmt_counts(t, c, sizeof(c));
++        subref_fmt_model(t, m, sizeof(m));
++        MP_VERBOSE(vo, "subref %.1fs: frames %d, changes %d bad %d, %s, cost max %.0f us%s\n",
++                   s, t->frames, t->changes, t->changes_bad, c, t->look_max_ns / 1e3,
++                   sr->grid ? "" : " (no link: frames)");
++        MP_VERBOSE(vo, "subref model: %s; osd not-ready %d flush %d\n", m,
++                   t->not_ready, t->flush);
++    }
++    if (t->vlooks || t->frames || t->changes)
++        sr->session_told = false;
++    if (t->vlooks) {
++        char v[160], tag[64];
++        subref_fmt_video(t, v, sizeof(v));
++        subref_tag(p, tag, sizeof(tag));
++        MP_VERBOSE(vo, "subref %.1fs %s %s\n", s, v, tag);
++    }
++    sr->win = (struct avf_subref_tally){0};
++    sr->win_start_ns = now;
++}
++
++// The session's line: at a close (--avfoundation-subref-report changed,
++// which the app does before it closes the player) and at uninit, once for
++// the same counts.
++static void subref_session(struct vo *vo, const char *when)
++{
++    struct priv *p = vo->priv;
++    struct avf_subref *sr = &p->subref;
++    if (!mp_msg_test(vo->log, MSGL_V))
++        return;
++    subref_end_stretch(vo, mp_time_ns(), " (cut short)");
++    const struct avf_subref_tally *t = &sr->total;
++    if (sr->session_told || (!t->frames && !t->changes && !t->vlooks))
++        return;
++    sr->session_told = true;
++    int ahead = t->ahead[0] + t->ahead[1] + t->ahead[2];
++    int behind = t->behind[0] + t->behind[1] + t->behind[2];
++    char worst[80] = "none";
++    if (sr->worst_bad) {
++        char pos[24] = "-";
++        if (sr->worst_pos != MP_NOPTS_VALUE && isfinite(sr->worst_pos))
++            snprintf(pos, sizeof(pos), "%.1f", sr->worst_pos);
++        snprintf(worst, sizeof(worst), "%s @%s %d/%d %s", sr->worst_kind, pos,
++                 sr->worst_bad, sr->worst_changes,
++                 sr->worst_behind >= sr->worst_ahead ? "late" : "early");
++    }
++    MP_VERBOSE(vo, "subref session (%s): sub frames %d, changes %d bad %d (ahead %d "
++               "behind %d of %d looks, null %d); stretches %d bad %d; worst %s; pred %d/%d\n",
++               when, t->frames, t->changes, t->changes_bad, ahead, behind, t->looks,
++               t->nulls, sr->stretches, sr->stretches_bad, worst, t->pred, t->model);
++    char v[160], tag[64];
++    subref_fmt_video(t, v, sizeof(v));
++    subref_tag(p, tag, sizeof(tag));
++    MP_VERBOSE(vo, "subref session (%s) %s %s\n", when, v, tag);
++}
++// --- end subtitle refresh match: the VO's side
++
+ static bool enqueue_osd_sample(struct vo *vo, CMSampleBufferRef buf)
+ {
+     struct priv *p = vo->priv;
+@@ -6472,11 +7210,14 @@ static bool enqueue_osd_sample(struct vo *vo, CMSampleBufferRef buf)
+     if (!sample_buffer_renderer_is_ready(osdLayer)) {
+         MP_VERBOSE(vo, "OSD layer not ready; dropping subtitle sample for this frame\n");
+         [osdLayer release];
++        subref_note_osd(vo, buf, false, false);
+         return false;
+     }
+ 
++    bool wants_flush = subref_on(vo) && sample_buffer_renderer_requires_flush(osdLayer);
+     sample_buffer_renderer_enqueue(osdLayer, buf);
+     [osdLayer release];
++    subref_note_osd(vo, buf, true, wants_flush);
+ 
+     return true;
+ }
+@@ -7945,6 +8686,7 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+ 
+     sample_buffer_renderer_enqueue(p->displayLayer, buf);
+     p->last_video_enqueue_ns = mp_time_ns();
++    subref_note_video(vo, buf);
+     return true;
+ }
+ 
+@@ -8123,6 +8865,7 @@ static void flip_page(struct vo *vo)
+         int64_t ready_start = mp_time_ns();
+         if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
+             int64_t ready_wait = mp_time_ns() - ready_start;
++            subref_look(vo);
+             if (!p->presentation_host)
+                 update_media_timebase_for_frame(vo);
+ 
+@@ -8151,6 +8894,7 @@ static void flip_page(struct vo *vo)
+             CFRelease(video_buf);
+ 
+         p->perf.frames++;
++        subref_tick(vo);
+     }
+ 
+     // Flush excess buffers every ~60 frames to prevent memory growth
+@@ -8347,6 +9091,7 @@ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
++    subref_session(vo, "uninit");
+     report_osd_perf(vo);
+     report_ahead_perf(vo);
+     if (p->ahead.started)
+@@ -8487,6 +9232,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         sync_osd_layer_frame(vo);
+         return VO_TRUE;
+     case VOCTRL_RESET:
++        subref_flushed(vo);
+         // Fired by vo_seek_reset() on every seek (and on stop/track change).
+         // Flush queued-but-undisplayed samples without removing the on-screen
+         // frame: removing it blanks the layer to black until the first
+@@ -8526,8 +9272,11 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         }
+         // After the re-seed, so the clear is stamped on the new timeline.
+         clear_osd_layer(vo);
++        subref_start_stretch(vo, p->subref.total.frames || p->subref.stretches
++                                 ? "seek" : "start");
+         return VO_TRUE;
+     case VOCTRL_PAUSE:
++        subref_end_stretch(vo, mp_time_ns(), " (paused)");
+         p->vsync_paused = true;
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, true);
+@@ -8535,6 +9284,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         return VO_TRUE;
+     case VOCTRL_RESUME:
+         // Playback resumes on a new schedule: learn its phase again.
++        subref_start_stretch(vo, "unpause");
+         p->vsync_paused = false;
+         avf_vsync_snap_unlock(&p->vsync_snap);
+         p->vsync_stats.have_prev = false;
+@@ -8606,6 +9356,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     {"osd-after-video", OPT_BOOL(osd_after_video)},
+     {"osd-slots-ahead", OPT_BOOL(osd_slots_ahead)},
+     {"vsync-snap-record", OPT_BOOL(vsync_snap_record)},
++    // Measurement only, at the verbose log level: read which buffer the video
++    // and subtitle layers show before each frame's hand-over while a
++    // subtitle is up, and log how often they were on different refreshes
++    // (subref lines). -report: any change logs the session's line now (the
++    // app sets it before closing the player).
++    {"subref-look", OPT_BOOL(subref_look)},
++    {"subref-report", OPT_INT(subref_report)},
+     // Promise the video renderer monotonically increasing stamps.
+     {"expect-monotonic", OPT_BOOL(expect_monotonic)},
+     // Decoded audio at one frame per refresh: resample the sound by up to
+@@ -8659,6 +9416,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         .vsync_snap_sound_early_ms = 25,
+         .vsync_snap_sample = true,
+         .vsync_snap_record = true,
++        .subref_look = true,
+         .vsync_snap_ask_ms = 1000,
+         .osd_after_video = true,
+     },
