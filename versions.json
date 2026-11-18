@@ -549,6 +549,20 @@
           "url": "https://github.com/haasn/libplacebo",
           "ref": "v7.387.0",
           "commit": "275f7dea27924cdd34ab2e6c20e448b6bc4fab65",
+          "vendored": {
+            "3rdparty/Vulkan-Headers": {
+              "url": "https://github.com/KhronosGroup/Vulkan-Headers",
+              "commit": "74d8a6cb930c68ef617b202c3ff3c59d919e086b"
+            },
+            "3rdparty/fast_float": {
+              "url": "https://github.com/fastfloat/fast_float.git",
+              "commit": "97b54ca9e75f5303507699d27c6b4f4efe4641a1"
+            },
+            "3rdparty/glad": {
+              "url": "https://github.com/Dav1dde/glad",
+              "commit": "73db193f853e2ee079bf3ca8a64aa2eaf6459043"
+            }
+          },
           "provenance": "mpv 0.42 needs libplacebo 7.387.0 or newer and no Apple prebuilt exists, so the apple driver builds it from source. Resolved 2026-11-18: haasn/libplacebo (upstream author's repository) and code.videolan.org/videolan/libplacebo both report annotated tag object 451d8ea5661c868562725e6500deda7fdd4e9a1e for v7.387.0, peeling to this commit. Its vendored 3rdparty submodules are cloned recursively at the commits that commit records."
         }
       }
