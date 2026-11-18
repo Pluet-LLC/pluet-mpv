@@ -17,10 +17,10 @@ scripts/test_mediacodec_osd.sh compiles the scheduler core and the request
 dispatcher from this file.
 
 diff --git a/meson.build b/meson.build
-index a77c20d..b5929ab 100644
+index b15f310..0cb60de 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -238,6 +238,7 @@ sources = files(
+@@ -252,6 +252,7 @@ sources = files(
      'video/out/gpu/video.c',
      'video/out/gpu/video_shaders.c',
      'video/out/libmpv_sw.c',

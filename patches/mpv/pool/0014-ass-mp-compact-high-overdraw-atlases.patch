@@ -11,10 +11,52 @@ Transparent pixels are skipped and opaque ones copied directly during the
 composition. Tracks that need per-mask VSFilter color correction keep their
 masks.
 
-diff --git a/sub/ass_mp.c b/sub/ass_mp.c
---- a/sub/ass_mp.c
-+++ b/sub/ass_mp.c
-@@ -167,6 +167,8 @@
+diff --git a/sub/dec_sub.h b/sub/dec_sub.h
+index 3c49c82..7511d12 100644
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -62,6 +62,7 @@ void sub_preload(struct dec_sub *sub);
+ void sub_redecode_cached_packets(struct dec_sub *sub);
+ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+                       bool *packets_read, bool *sub_updated);
++// format is a bitmask of supported (1 << SUBBITMAP_*) formats.
+ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+                                     int format, double pts, bool prefetch);
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
+diff --git a/sub/osd.c b/sub/osd.c
+index 0919759..802ba50 100644
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -416,7 +416,10 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+             osd->sub_render_busy = true;
+             mp_mutex_unlock(&osd->lock);
+ 
+-            res = sub_get_bitmaps(sub, vo_res, format, video_pts, prefetch);
++            int formats = 1 << format;
++            if (format == SUBBITMAP_LIBASS && sub_formats[SUBBITMAP_BGRA])
++                formats |= 1 << SUBBITMAP_BGRA;
++            res = sub_get_bitmaps(sub, vo_res, formats, video_pts, prefetch);
+ 
+             mp_mutex_lock(&osd->lock);
+             osd->sub_render_busy = false;
+diff --git a/sub/osd_libass.c b/sub/osd_libass.c
+index 7b08509..6c47264 100644
+--- a/sub/osd_libass.c
++++ b/sub/osd_libass.c
+@@ -715,7 +715,7 @@ struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
+ done:;
+     struct sub_bitmaps out_imgs = {0};
+     mp_sub_packer_pack_ass(obj->sub_packer, obj->ass_imgs, obj->num_externals + 1,
+-                       obj->changed, false, format, &out_imgs);
++                           obj->changed, false, 1 << format, &out_imgs);
+ 
+     obj->changed = false;
+ 
+diff --git a/sub/packer.c b/sub/packer.c
+index 1d4af4c..9e925d3 100644
+--- a/sub/packer.c
++++ b/sub/packer.c
+@@ -159,6 +159,8 @@ static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
      const unsigned int g = (color >> 16) & 0xff;
      const unsigned int b = (color >>  8) & 0xff;
      const unsigned int a = 0xff - (color & 0xff);
@@ -23,7 +65,7 @@ diff --git a/sub/ass_mp.c b/sub/ass_mp.c
  
      dst += dst_y * dst_stride + dst_x * 4;
  
-@@ -174,6 +176,12 @@
+@@ -166,6 +168,12 @@ static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
          uint32_t *dstrow = (uint32_t *) dst;
          for (int x = 0; x < src_w; x++) {
              const unsigned int v = src[x];
@@ -36,15 +78,7 @@ diff --git a/sub/ass_mp.c b/sub/ass_mp.c
              int rr = (r * a * v);
              int gg = (g * a * v);
              int bb = (b * a * v);
-@@ -337,6 +345,7 @@
-         .format = SUBBITMAP_BGRA,
-         .parts = p->rgba_imgs,
-         .num_parts = num_bb,
-+        .video_color_space = res->video_color_space,
-     };
- 
-     for (int n = 0; n < imgs.num_parts; n++) {
-@@ -387,17 +396,15 @@
+@@ -267,17 +275,15 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
  // Pack the contents of image_lists[0] to image_lists[num_image_lists-1] into
  // a single image, and make *out point to it. *out is completely overwritten.
  // If libass reported any change, image_lists_changed must be set (it then
@@ -53,7 +87,7 @@ diff --git a/sub/ass_mp.c b/sub/ass_mp.c
 +// repacks all images). preferred_osd_format is a bitmask of supported
 +// (1 << SUBBITMAP_*) formats. Prefer masks unless heavy overlap makes their
 +// upload substantially larger than a composited image.
- void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
                          int num_image_lists, bool image_lists_changed, bool video_color_space,
                          int preferred_osd_format, struct sub_bitmaps *out)
  {
@@ -66,7 +100,7 @@ diff --git a/sub/ass_mp.c b/sub/ass_mp.c
      {
          *out = p->cached_subs;
          return;
-@@ -407,7 +414,7 @@
+@@ -287,7 +293,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
      p->cached_subs_valid = false;
  
      struct sub_bitmaps res = {
@@ -75,7 +109,7 @@ diff --git a/sub/ass_mp.c b/sub/ass_mp.c
          .format = SUBBITMAP_LIBASS,
          .parts = p->cached_parts,
          .video_color_space = video_color_space,
-@@ -431,6 +438,24 @@
+@@ -311,6 +317,24 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
          }
      }
  
@@ -100,48 +134,23 @@ diff --git a/sub/ass_mp.c b/sub/ass_mp.c
      bool r = false;
      if (format == SUBBITMAP_BGRA) {
          r = pack_rgba(p, &res);
-diff --git a/sub/ass_mp.h b/sub/ass_mp.h
---- a/sub/ass_mp.h
-+++ b/sub/ass_mp.h
-@@ -56,6 +56,7 @@
- struct sub_bitmaps;
- struct mp_ass_packer;
- struct mp_ass_packer *mp_ass_packer_alloc(void *ta_parent);
-+// preferred_osd_format is a bitmask of supported (1 << SUBBITMAP_*) formats.
- void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
-                         int num_image_lists, bool changed, bool video_color_space,
-                         int preferred_osd_format, struct sub_bitmaps *out);
-diff --git a/sub/osd.c b/sub/osd.c
---- a/sub/osd.c
-+++ b/sub/osd.c
-@@ -413,7 +413,10 @@
-             osd->sub_render_busy = true;
-             mp_mutex_unlock(&osd->lock);
+diff --git a/sub/sd.h b/sub/sd.h
+index 990e801..a813520 100644
+--- a/sub/sd.h
++++ b/sub/sd.h
+@@ -48,6 +48,7 @@ struct sd_functions {
+     bool (*accepts_packet)(struct sd *sd, double pts); // implicit default if NULL: true
+     int (*control)(struct sd *sd, enum sd_ctrl cmd, void *arg);
  
--            res = sub_get_bitmaps(sub, vo_res, format, video_pts, prefetch);
-+            int formats = 1 << format;
-+            if (format == SUBBITMAP_LIBASS && sub_formats[SUBBITMAP_BGRA])
-+                formats |= 1 << SUBBITMAP_BGRA;
-+            res = sub_get_bitmaps(sub, vo_res, formats, video_pts, prefetch);
- 
-             mp_mutex_lock(&osd->lock);
-             osd->sub_render_busy = false;
-diff --git a/sub/osd_libass.c b/sub/osd_libass.c
---- a/sub/osd_libass.c
-+++ b/sub/osd_libass.c
-@@ -714,7 +714,7 @@
- done:;
-     struct sub_bitmaps out_imgs = {0};
-     mp_ass_packer_pack(obj->ass_packer, obj->ass_imgs, obj->num_externals + 1,
--                       obj->changed, false, format, &out_imgs);
-+                       obj->changed, false, 1 << format, &out_imgs);
- 
-     obj->changed = false;
- 
++    // format is a bitmask of supported (1 << SUBBITMAP_*) formats.
+     struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
+                                        int format, double pts, bool prefetch);
+     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index 5fa51bd..cdedd0f 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
-@@ -108,7 +108,7 @@
+@@ -115,7 +115,7 @@ const struct m_sub_options mp_sub_filter_opts = {
      .change_flags = UPDATE_SUB_FILT,
  };
  
@@ -150,7 +159,7 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
  static void fill_plaintext(struct sd *sd, double pts);
  
  static const struct sd_filter_functions *const filters[] = {
-@@ -848,6 +848,10 @@
+@@ -895,6 +895,10 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
  
      int changed;
      ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
@@ -158,10 +167,10 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
 +    // Keep those masks rather than flattening colors before that adjustment.
 +    if (!converted && (format & (1 << SUBBITMAP_LIBASS)) && mangle_colors(sd, NULL))
 +        format &= ~(1 << SUBBITMAP_BGRA);
-     mp_ass_packer_pack(r->packer, &imgs, 1, changed, !converted, format, res);
+     mp_sub_packer_pack_ass(r->packer, &imgs, 1, changed, !converted, format, res);
  
  done:
-@@ -1182,14 +1186,14 @@
+@@ -1272,14 +1276,14 @@ const struct sd_functions sd_ass = {
  };
  
  // Disgusting hack for (xy-)vsfilter color compatibility.
@@ -178,7 +187,7 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
      bool force_601 = opts->ass_vsfilter_color_compat == 3;
      ASS_Track *track = ctx->ass_track;
      static const int ass_csp[] = {
-@@ -1213,7 +1217,7 @@
+@@ -1303,7 +1307,7 @@ static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
          trackcsp = YCBCR_BT601_TV;
      // NONE is a bit random, but the intention is: don't modify colors.
      if (trackcsp == YCBCR_NONE)
@@ -187,7 +196,7 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
      if (trackcsp < MP_ARRAY_SIZE(ass_csp))
          csp = ass_csp[trackcsp];
      if (trackcsp <  MP_ARRAY_SIZE(ass_levels))
-@@ -1224,7 +1228,7 @@
+@@ -1314,7 +1318,7 @@ static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
      }
      // Unknown colorspace (either YCBCR_UNKNOWN, or a valid value unknown to us)
      if (!csp || !levels)
@@ -196,7 +205,7 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
  
      struct mp_image_params params = ctx->video_params;
  
-@@ -1237,7 +1241,7 @@
+@@ -1327,7 +1331,7 @@ static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
  
      if ((csp == params.repr.sys && levels == params.repr.levels) ||
              params.repr.sys == PL_COLOR_SYSTEM_RGB) // Even VSFilter doesn't mangle on RGB video
@@ -205,7 +214,7 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
  
      bool basic_conv = params.repr.sys == PL_COLOR_SYSTEM_BT_709 &&
                        params.repr.levels == PL_COLOR_LEVELS_LIMITED &&
-@@ -1246,7 +1250,10 @@
+@@ -1336,7 +1340,10 @@ static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
  
      // With "basic", only do as much as needed for basic compatibility.
      if (opts->ass_vsfilter_color_compat == 1 && !basic_conv)
@@ -217,7 +226,7 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
  
      if (params.repr.sys != ctx->last_params.repr.sys ||
          params.repr.levels != ctx->last_params.repr.levels)
-@@ -1288,6 +1295,7 @@
+@@ -1378,6 +1385,7 @@ static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
          mp_map_fixp_color(&vs2rgb, 8, yuv, 8, rgb);
          sb->libass.color = MP_ASS_RGBA(rgb[0], rgb[1], rgb[2], a);
      }
@@ -225,25 +234,16 @@ diff --git a/sub/sd_ass.c b/sub/sd_ass.c
  }
  
  int sd_ass_fmt_offset(const char *evt_fmt)
-diff --git a/sub/dec_sub.h b/sub/dec_sub.h
---- a/sub/dec_sub.h
-+++ b/sub/dec_sub.h
-@@ -48,6 +48,7 @@
- void sub_redecode_cached_packets(struct dec_sub *sub);
- void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
-                       bool *packets_read, bool *sub_updated);
-+// format is a bitmask of supported (1 << SUBBITMAP_*) formats.
- struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
-                                     int format, double pts, bool prefetch);
- char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
-diff --git a/sub/sd.h b/sub/sd.h
---- a/sub/sd.h
-+++ b/sub/sd.h
-@@ -47,6 +47,7 @@
-     bool (*accepts_packet)(struct sd *sd, double pts); // implicit default if NULL: true
-     int (*control)(struct sd *sd, enum sd_ctrl cmd, void *arg);
+diff --git a/sub/sd_sbr.c b/sub/sd_sbr.c
+index ba6a904..eda7977 100644
+--- a/sub/sd_sbr.c
++++ b/sub/sd_sbr.c
+@@ -170,7 +170,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+ }
  
-+    // format is a bitmask of supported (1 << SUBBITMAP_*) formats.
-     struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
-                                        int format, double pts, bool prefetch);
-     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
+ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+-                                       int format, double pts)
++                                       int format, double pts, bool prefetch)
+ {
+     struct sd_sbr_priv *ctx = sd->priv;
+     struct mp_subtitle_opts *opts = sd->opts;

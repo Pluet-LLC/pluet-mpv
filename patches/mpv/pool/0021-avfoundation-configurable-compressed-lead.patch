@@ -2,7 +2,7 @@ diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
 index 497e99d..7de0b3e 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
-@@ -115,10 +115,23 @@ - (void)invalidate;
+@@ -104,10 +104,23 @@ - (void)invalidate;
      int avp_last_item_status;    // last logged AVPlayerItemStatus
      int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
      int avp_heartbeat;           // verbose position log divider
@@ -26,7 +26,7 @@ index 497e99d..7de0b3e 100644
  #if TARGET_OS_OSX
      // The bounded PCM lookahead is macOS-only. That is where --volume is
      // driven from a slider or the keyboard and the lag is felt; on tvOS and
-@@ -153,12 +166,9 @@ - (void)invalidate;
+@@ -142,22 +155,19 @@ - (void)invalidate;
  #define SPDIF_FRAMES_PER_BURST 1536
  
  #define AVP_TICK_NS         MP_TIME_MS_TO_NS(50)
@@ -40,7 +40,7 @@ index 497e99d..7de0b3e 100644
 +#define AVP_START_LEAD_NS(p) (2 * (p)->avp_lead_ns)
  // Minimum priming before the transport is started.
  #define AVP_START_MIN_NS    MP_TIME_S_TO_NS(1)
-@@ -168,9 +178,9 @@ - (void)invalidate;
+ // Deadline for the playhead to move once the rate is applied.
  #define AVP_START_GRACE_NS  MP_TIME_S_TO_NS(2)
  // History kept behind the loader's read position for offset-0 restarts.
  #define AVP_ES_HISTORY_BYTES (2 * 1024 * 1024)
@@ -53,7 +53,7 @@ index 497e99d..7de0b3e 100644
  
  // A failed compressed AO must reject its immediate reload so mpv can decode
  // to PCM. A later successful PCM initialization clears this process-local
-@@ -532,11 +542,21 @@ static void feed_avp(struct ao *ao)
+@@ -498,11 +508,21 @@ static void feed_avp(struct ao *ao)
      }
      if (++p->avp_heartbeat % 100 == 0) {
          CMTime t = [p->item currentTime];
@@ -77,7 +77,7 @@ index 497e99d..7de0b3e 100644
      }
      if ([p->item status] == AVPlayerItemStatusFailed || [p->player error]) {
          NSError *error = [p->item error] ? [p->item error] : [p->player error];
-@@ -551,7 +571,7 @@ static void feed_avp(struct ao *ao)
+@@ -517,7 +537,7 @@ static void feed_avp(struct ao *ao)
  
      for (int guard = 0; guard < 64 && !p->avp_eof; guard++) {
          int64_t cur = avp_feed_position_ns(ao);
@@ -86,7 +86,7 @@ index 497e99d..7de0b3e 100644
              break;
          // One pull can extract every burst buffered in the stash, so demand
          // room for a full stash's worth of payload before pulling.
-@@ -1131,10 +1151,15 @@ static int init(struct ao *ao)
+@@ -1092,11 +1112,16 @@ static int init(struct ao *ao)
          // traps, and an idle timer costs nothing.
          dispatch_resume(p->avp_timer);
  
@@ -103,7 +103,8 @@ index 497e99d..7de0b3e 100644
 +                     (int)(2 * p->opt_compressed_lead * AVP_ES_LEAD_BYTES_PER_S);
          p->es_buf = talloc_size(ao, p->es_size);
          // the lead bound is what actually paces the stream
-@@ -1340,6 +1365,7 @@ static void uninit(struct ao *ao)
+         ao->device_buffer = ao->samplerate * 2;
+@@ -1299,6 +1324,7 @@ static void uninit(struct ao *ao)
      .priv_size      = sizeof(struct priv),
      .priv_defaults  = &(const struct priv){
          .opt_accept_compressed = true,
@@ -111,7 +112,7 @@ index 497e99d..7de0b3e 100644
          // Well inside the renderer's own depth, so the queue still absorbs
          // scheduling jitter, while cutting the delay before a volume change
          // is audible to a fraction of what it was.
-@@ -1352,6 +1378,7 @@ static void uninit(struct ao *ao)
+@@ -1311,6 +1337,7 @@ static void uninit(struct ao *ao)
          {"max-lookahead", OPT_DOUBLE(opt_max_lookahead), M_RANGE(0, 10)},
  #endif
          {"accept-compressed", OPT_BOOL(opt_accept_compressed)},

@@ -229,7 +229,7 @@ index 7b64ea3..cc51549 100644
  
      // Float gain multiplicator
 diff --git a/common/global.h b/common/global.h
-index 7a029b0..c05b70e 100644
+index 14d78c8..6cdbea5 100644
 --- a/common/global.h
 +++ b/common/global.h
 @@ -1,8 +1,6 @@
@@ -241,10 +241,11 @@ index 7a029b0..c05b70e 100644
  // This should be accessed by glue code only, never normal code.
  // The only purpose of this is to make mpv library-safe.
  // Think hard before adding new members.
-@@ -13,9 +11,6 @@ struct mpv_global {
-     char *configdir;
+@@ -14,10 +12,6 @@ struct mpv_global {
      struct stats_base *stats;
      struct demux_packet_pool *packet_pool;
+     struct curl_ctx *curl;
+-
 -    // Per-player failure state must survive destruction/recreation of its AO.
 -    // Only ao_spatial reads/writes it (on the AO and player threads).
 -    atomic_bool spatial_format_latch[2];
@@ -252,10 +253,10 @@ index 7a029b0..c05b70e 100644
  
  #endif
 diff --git a/player/audio.c b/player/audio.c
-index c7e5650..e581066 100644
+index efd143f..4ff815a 100644
 --- a/player/audio.c
 +++ b/player/audio.c
-@@ -355,6 +355,17 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
+@@ -357,6 +357,17 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
      mp_filter_wakeup(ao_c->ao_filter);
  }
  
@@ -273,7 +274,7 @@ index c7e5650..e581066 100644
  static int reinit_audio_filters_and_output(struct MPContext *mpctx)
  {
      struct MPOpts *opts = mpctx->opts;
-@@ -467,11 +478,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+@@ -469,11 +480,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
      if (!mpctx->ao) {
          // If spdif was used, try to fallback to PCM.
          if (spdif_fallback && ao_c->track && ao_c->track->dec) {
@@ -286,7 +287,7 @@ index c7e5650..e581066 100644
                  goto init_error;
              reset_audio_state(mpctx);
              mp_output_chain_reset_harder(ao_c->filter);
-@@ -871,12 +878,45 @@ void audio_start_ao(struct MPContext *mpctx)
+@@ -893,12 +900,45 @@ void audio_start_ao(struct MPContext *mpctx)
      mp_wakeup_core(mpctx);
  }
  
@@ -335,10 +336,10 @@ index c7e5650..e581066 100644
      update_throttle(mpctx);
  
 diff --git a/player/main.c b/player/main.c
-index 51acf4d..37eb6b1 100644
+index 3e40979..2fbb19d 100644
 --- a/player/main.c
 +++ b/player/main.c
-@@ -285,8 +285,6 @@ struct MPContext *mp_create(void)
+@@ -289,8 +289,6 @@ struct MPContext *mp_create(void)
      mp_mutex_init(&mpctx->abort_lock);
  
      mpctx->global = talloc_zero(mpctx, struct mpv_global);

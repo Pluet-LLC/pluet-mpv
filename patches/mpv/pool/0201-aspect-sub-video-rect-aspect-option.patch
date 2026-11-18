@@ -1,8 +1,8 @@
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index fa71dc0..545b46e 100644
+index dddff27..4305bb2 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -1751,6 +1751,21 @@ Video
+@@ -1814,6 +1814,21 @@ Video
      more generally useful. The behavior of these options may change to fit
      OSC requirements better, too.
  
@@ -25,10 +25,10 @@ index fa71dc0..545b46e 100644
      ``--correct-pts=no`` switches mpv to a mode where video timing is
      determined using a fixed framerate value (either using the
 diff --git a/options/options.c b/options/options.c
-index 716c3e6..91c223a 100644
+index a432414..79d087d 100644
 --- a/options/options.c
 +++ b/options/options.c
-@@ -166,6 +166,7 @@ static const m_option_t mp_vo_opt_list[] = {
+@@ -171,6 +171,7 @@ static const m_option_t mp_vo_opt_list[] = {
      {"video-margin-ratio-right", OPT_FLOAT(margin_x[1]), M_RANGE(0.0, 1.0)},
      {"video-margin-ratio-top", OPT_FLOAT(margin_y[0]), M_RANGE(0.0, 1.0)},
      {"video-margin-ratio-bottom", OPT_FLOAT(margin_y[1]), M_RANGE(0.0, 1.0)},
@@ -37,10 +37,10 @@ index 716c3e6..91c223a 100644
      {"video-unscaled", OPT_CHOICE(unscaled,
          {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
 diff --git a/options/options.h b/options/options.h
-index 12dafea..278c347 100644
+index 1f8e7cb..ca90343 100644
 --- a/options/options.h
 +++ b/options/options.h
-@@ -51,6 +51,7 @@ typedef struct mp_vo_opts {
+@@ -52,6 +52,7 @@ typedef struct mp_vo_opts {
      float scale_x, scale_y;
      float margin_x[2];
      float margin_y[2];

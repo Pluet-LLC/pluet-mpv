@@ -14,10 +14,10 @@ taken below it wakes the thread, which then reads up to the readahead
 in one go. Nothing changes at the default hysteresis of 0.
 
 diff --git a/demux/demux.c b/demux/demux.c
-index 1320040..86a233d 100644
+index 5f1a059..7672f4b 100644
 --- a/demux/demux.c
 +++ b/demux/demux.c
-@@ -2662,7 +2662,14 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
+@@ -2853,7 +2853,14 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
          return 1;
      }
  

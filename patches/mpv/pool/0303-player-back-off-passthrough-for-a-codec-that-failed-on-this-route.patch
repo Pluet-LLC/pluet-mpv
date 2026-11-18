@@ -48,10 +48,10 @@ defaults.
 
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 666f01e..2d00dc6 100644
+index 6919c80..fdf0d23 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -2140,6 +2140,22 @@ Audio
+@@ -2201,6 +2201,22 @@ Audio
          multichannel PCM, and mpv supports lossless DTS-HD decoding via
          FFmpeg's new DCA decoder (based on libdcadec).
  
@@ -268,10 +268,10 @@ index 1219de3..cd6769b 100644
  
  const struct ao_driver audio_out_avfoundation = {
 diff --git a/options/options.c b/options/options.c
-index 26b4723..1790c82 100644
+index d733e1d..c38db28 100644
 --- a/options/options.c
 +++ b/options/options.c
-@@ -756,6 +756,9 @@ static const m_option_t mp_opts[] = {
+@@ -779,6 +779,9 @@ static const m_option_t mp_opts[] = {
      {"", OPT_SUBSTRUCT(ao_opts, ao_conf)},
      {"audio-exclusive", OPT_BOOL(audio_exclusive), .flags = UPDATE_AUDIO},
      {"audio-fallback-to-null", OPT_BOOL(ao_null_fallback)},
@@ -281,7 +281,7 @@ index 26b4723..1790c82 100644
      {"audio-stream-silence", OPT_BOOL(audio_stream_silence)},
      {"audio-wait-open", OPT_FLOAT(audio_wait_open), M_RANGE(0, 60)},
      {"force-window", OPT_CHOICE(force_vo,
-@@ -1000,6 +1003,7 @@ static const struct MPOpts mp_default_opts = {
+@@ -1030,6 +1033,7 @@ static const struct MPOpts mp_default_opts = {
      .softvol_gain_min = -96,
      .softvol_gain = 0,
      .gapless_audio = -1,
@@ -290,10 +290,10 @@ index 26b4723..1790c82 100644
      .stop_screensaver = 1,
      .cursor_autohide_delay = 1000,
 diff --git a/options/options.h b/options/options.h
-index 53bc367..62ddc3d 100644
+index f0342ec..0efe4d9 100644
 --- a/options/options.h
 +++ b/options/options.h
-@@ -200,6 +200,8 @@ typedef struct MPOpts {
+@@ -211,6 +211,8 @@ typedef struct MPOpts {
  
      bool audio_exclusive;
      bool ao_null_fallback;
@@ -303,10 +303,10 @@ index 53bc367..62ddc3d 100644
      float audio_wait_open;
      int force_vo;
 diff --git a/player/audio.c b/player/audio.c
-index e581066..d42ab2c 100644
+index 4ff815a..c4745c3 100644
 --- a/player/audio.c
 +++ b/player/audio.c
-@@ -355,6 +355,136 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
+@@ -357,6 +357,136 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
      mp_filter_wakeup(ao_c->ao_filter);
  }
  
@@ -443,7 +443,7 @@ index e581066..d42ab2c 100644
  // Switch the chain's track from passthrough to decoding. The caller resets
  // the output chain. Returns false if the decoder could not be reinitialized.
  static bool fall_back_to_pcm(struct MPContext *mpctx, struct ao_chain *ao_c)
-@@ -534,8 +664,15 @@ int init_audio_decoder(struct MPContext *mpctx, struct track *track)
+@@ -536,8 +666,15 @@ int init_audio_decoder(struct MPContext *mpctx, struct track *track)
      if (!track->dec)
          goto init_error;
  
@@ -461,7 +461,7 @@ index e581066..d42ab2c 100644
  
      if (!mp_decoder_wrapper_reinit(track->dec))
          goto init_error;
-@@ -795,7 +932,7 @@ void reload_audio_output(struct MPContext *mpctx)
+@@ -817,7 +954,7 @@ void reload_audio_output(struct MPContext *mpctx)
      // to PCM again if necessary).
      if (ao_c && ao_c->track) {
          struct mp_decoder_wrapper *dec = ao_c->track->dec;
@@ -470,7 +470,7 @@ index e581066..d42ab2c 100644
              ao_c->spdif_passthrough = true;
              ao_c->spdif_failed = false;
              mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, true);
-@@ -880,6 +1017,7 @@ void audio_start_ao(struct MPContext *mpctx)
+@@ -902,6 +1039,7 @@ void audio_start_ao(struct MPContext *mpctx)
  
  static void handle_ao_events(struct MPContext *mpctx)
  {
@@ -478,7 +478,7 @@ index e581066..d42ab2c 100644
      if (!mpctx->ao)
          return;
      int events = ao_query_and_reset_events(mpctx->ao,
-@@ -902,6 +1040,7 @@ static void handle_ao_events(struct MPContext *mpctx)
+@@ -924,6 +1062,7 @@ static void handle_ao_events(struct MPContext *mpctx)
      if (!fall_back)
          return;
  
@@ -487,10 +487,10 @@ index e581066..d42ab2c 100644
          MP_ERR(mpctx, "Error reinitializing audio.\n");
          error_on_track(mpctx, ao_c->track);
 diff --git a/player/core.h b/player/core.h
-index c3e0816..f56583b 100644
+index 38fe822..49ed793 100644
 --- a/player/core.h
 +++ b/player/core.h
-@@ -176,6 +176,17 @@ struct vo_chain {
+@@ -185,6 +185,17 @@ struct vo_chain {
      bool underrun_signaled;
  };
  
@@ -508,7 +508,7 @@ index c3e0816..f56583b 100644
  // Like vo_chain, for audio.
  struct ao_chain {
      struct mp_log *log;
-@@ -324,6 +335,14 @@ typedef struct MPContext {
+@@ -334,6 +345,14 @@ typedef struct MPContext {
      struct ao *ao;
      struct mp_aframe *ao_filter_fmt; // for weak gapless audio check
      struct ao_chain *ao_chain;
@@ -524,10 +524,10 @@ index c3e0816..f56583b 100644
      struct vo_chain *vo_chain;
  
 diff --git a/player/main.c b/player/main.c
-index 37eb6b1..d4906fb 100644
+index 2fbb19d..1eca7de 100644
 --- a/player/main.c
 +++ b/player/main.c
-@@ -180,6 +180,8 @@ void mp_destroy(struct MPContext *mpctx)
+@@ -183,6 +183,8 @@ void mp_destroy(struct MPContext *mpctx)
      mpctx->ipc_ctx = NULL;
  
      uninit_audio_out(mpctx);

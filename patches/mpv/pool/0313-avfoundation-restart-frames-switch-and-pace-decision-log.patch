@@ -44,7 +44,7 @@ Host tests: test_avf_osd_ahead.sh (restart waits), test_avf_subref.sh
 LOCAL TEST ONLY: not pushed, not run on a device.
 
 diff --git a/video/out/vo.c b/video/out/vo.c
-index 664fd26..7214bb2 100644
+index 77cb28c..71e9506 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -142,6 +142,7 @@ struct vo_internal {
@@ -55,7 +55,7 @@ index 664fd26..7214bb2 100644
      bool visible;
      bool wakeup_on_done;
      int queued_events;              // event mask for the user
-@@ -937,6 +938,18 @@ static bool render_frame(struct vo *vo)
+@@ -942,6 +943,18 @@ static bool render_frame(struct vo *vo)
  
      mp_mutex_lock(&in->lock);
  
@@ -95,7 +95,7 @@ index 664fd26..7214bb2 100644
  
          if (send_reset)
 diff --git a/video/out/vo.h b/video/out/vo.h
-index 8d6b293..2c90b22 100644
+index fe4904c..7a99c11 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -483,6 +483,11 @@ struct vo {
@@ -111,7 +111,7 @@ index 8d6b293..2c90b22 100644
      //     be accessed unsynchronized (read-only).
  
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index b1d3939..64752ef 100644
+index cff145f..4cc6709 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -264,6 +264,22 @@ static int64_t avf_osd_wait_until(int64_t now, int64_t present_ns,
@@ -241,7 +241,7 @@ index b1d3939..64752ef 100644
 +    vo->pause_with_frame = p->opts->restart_frames;
  
      if (old_queue_lead_ms != p->opts->queue_lead_ms)
-         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1, 2);
 @@ -6960,12 +7034,13 @@ static void subref_tag(struct priv *p, char *buf, size_t size)
                : o->vsync_snap_pace == AVF_VSYNC_PACE_YES ? 'Y' : 'N';
      double point = o->vsync_snap_pace_phase >= 0 ? o->vsync_snap_pace_phase
@@ -362,7 +362,7 @@ index b1d3939..64752ef 100644
      int dropped;
 @@ -8282,6 +8415,8 @@ static int preinit(struct vo *vo)
      });
-     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1, 2);
      vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
 +    vo->pause_with_frame = p->opts->restart_frames;
 +    restart_window(vo, "start");

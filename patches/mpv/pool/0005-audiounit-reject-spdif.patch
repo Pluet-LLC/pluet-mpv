@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_audiounit.m b/audio/out/ao_audiounit.m
-index 8d4eb4d..fbbfd6b 100644
+index afb82d2..33292b3 100644
 --- a/audio/out/ao_audiounit.m
 +++ b/audio/out/ao_audiounit.m
 @@ -113,6 +113,11 @@ static bool init_audiounit(struct ao *ao)
@@ -18,8 +18,8 @@ index 8d4eb4d..fbbfd6b 100644
          MP_VERBOSE(ao, "channel map: %i: %u\n", i, layout->mChannelDescriptions[i].mChannelLabel);
      }
  
--    if (af_fmt_is_spdif(ao->format) || instance.outputNumberOfChannels <= 2) {
-+    if (instance.outputNumberOfChannels <= 2) {
+-    if (af_fmt_is_spdif(ao->format) || instance.outputNumberOfChannels <= 2 ||
++    if (instance.outputNumberOfChannels <= 2 ||
+         layout->mNumberChannelDescriptions > MP_NUM_CHANNELS)
+     {
          ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
-         MP_VERBOSE(ao, "using stereo output\n");
-     } else {

@@ -2,16 +2,10 @@ diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
 index 4384a70..797bef7 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
-@@ -402,12 +402,30 @@ static void avp_serve_requests(struct ao *ao)
-         if (off < write_head) {
-             // real stream data
-             int64_t n = MPMIN(write_head - off, req_end - off);
-             NSData *chunk = [NSData dataWithBytes:p->es_buf + (off - p->es_head)
-                                            length:n];
+@@ -418,6 +418,24 @@ static void avp_serve_requests(struct ao *ao)
              [dr respondWithData:chunk];
              MP_TRACE(ao, "served %lld bytes at offset %lld\n",
                       (long long)n, (long long)off);
--        }
 +        } else if (off > write_head) {
 +            // Read past the write head: the duration/bitrate probe the
 +            // system issues against the fake endless resource during
@@ -30,11 +24,12 @@ index 4384a70..797bef7 100644
 +                [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOTSUP userInfo:nil]];
 +            [reqs removeObjectAtIndex:i];
 +            continue;
-+        }
+         }
          if (!dr.requestsAllDataToEndOfResource &&
              dr.currentOffset >= dr.requestedOffset + (int64_t)dr.requestedLength) {
-             [req finishLoading];
-@@ -449,7 +467,7 @@ static void avp_update_transport(struct ao *ao)
+@@ -458,9 +476,9 @@ static void avp_update_transport(struct ao *ao)
+             return;
+         }
          // Not gated on the item becoming ready: while prerolling, the
 -        // system may park on a far-offset probe of the fake endless
 -        // resource that can never be served, and only the seek-to-start

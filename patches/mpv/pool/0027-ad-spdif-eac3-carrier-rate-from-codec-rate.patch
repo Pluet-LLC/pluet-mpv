@@ -1,8 +1,8 @@
 diff --git a/audio/decode/ad_spdif.c b/audio/decode/ad_spdif.c
-index a42bab0..e5a429a 100644
+index 0bce4c6..a237047 100644
 --- a/audio/decode/ad_spdif.c
 +++ b/audio/decode/ad_spdif.c
-@@ -286,7 +286,11 @@ static int init_filter(struct mp_filter *da)
+@@ -306,7 +306,11 @@ static int init_filter(struct mp_filter *da)
      }
      case AV_CODEC_ID_EAC3:
          sample_format                   = AF_FORMAT_S_EAC3;

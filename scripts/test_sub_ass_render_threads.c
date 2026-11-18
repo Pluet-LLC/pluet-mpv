@@ -10,7 +10,7 @@
 
 typedef struct ASS_Renderer { int dummy; } ASS_Renderer;
 typedef struct ASS_Library ASS_Library;
-struct mp_ass_packer;
+struct mp_sub_packer;
 struct mpv_global;
 struct mp_log;
 struct osd_style_opts;
@@ -27,7 +27,7 @@ struct sd {
 };
 struct ass_render_state {
     ASS_Renderer *renderer;
-    struct mp_ass_packer *packer;
+    struct mp_sub_packer *packer;
 };
 struct sd_ass_priv {
     ASS_Library *ass_library;
@@ -45,7 +45,7 @@ static unsigned ass_set_threads(ASS_Renderer *r, unsigned threads)
 static void mp_ass_configure_fonts(ASS_Renderer *r, struct osd_style_opts *o,
                                    struct mpv_global *g, struct mp_log *l) {}
 static void set_renderer_cache_limits(struct sd *sd, ASS_Renderer *r) {}
-static struct mp_ass_packer *mp_ass_packer_alloc(void *ta) { return NULL; }
+static struct mp_sub_packer *mp_sub_packer_alloc(void *ta) { return NULL; }
 static int destroy_renderer(void *p) { return 0; }
 #define talloc_zero(ctx, type) ((type *)calloc(1, sizeof(type)))
 #define talloc_set_destructor(p, d) ((void)(d))

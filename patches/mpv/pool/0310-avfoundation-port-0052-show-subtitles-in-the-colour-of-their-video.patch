@@ -46,7 +46,7 @@ Ported by Pluet, LLC onto Pluet's 0300 and 0307 (vo_avfoundation as
 they leave it); upstream: edde746/mpv-build f2a89ab. flip_page makes the video sample before the OSD's (0307 had the OSD's first); the order of the enqueues, and 0307's pacing around them, are unchanged.
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 19f2301..ce78119 100644
+index 19384e9..92c3371 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -2029,6 +2029,11 @@ static void avf_phase_get(const struct avf_phase_stat *s, double period,

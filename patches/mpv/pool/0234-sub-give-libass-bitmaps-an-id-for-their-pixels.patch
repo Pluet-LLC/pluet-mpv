@@ -26,11 +26,27 @@ for 2000 bitmaps that are all new (Apple M5 host, the region compiled by
 scripts/test_ass_pixel_ids.sh, which checks the id rules against a model
 over random lists).
 
-diff --git a/sub/ass_mp.c b/sub/ass_mp.c
-index aa2ff71..eaeab81 100644
---- a/sub/ass_mp.c
-+++ b/sub/ass_mp.c
-@@ -206,6 +206,97 @@ struct packed_src {
+diff --git a/sub/osd.h b/sub/osd.h
+index 17a3a8e..452e11a 100644
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -54,6 +54,11 @@ struct sub_bitmap {
+     union {
+         struct {
+             uint32_t color;
++            // Nonzero: identifies this part's pixels (not where or in which
++            // color they are drawn). Parts with the same id, in this or an
++            // earlier sub_bitmaps, have identical bitmaps, so a consumer that
++            // kept what it made of them need not make it again. 0: unknown.
++            uint64_t pixels_id;
+         } libass;
+         struct {
+             const struct sbr_output_image *image;
+diff --git a/sub/packer.c b/sub/packer.c
+index f3d1514..dfecc84 100644
+--- a/sub/packer.c
++++ b/sub/packer.c
+@@ -43,6 +43,97 @@ struct packed_src {
      int w, h, stride;
  };
  
@@ -125,10 +141,10 @@ index aa2ff71..eaeab81 100644
 +
 +// --- end ass pixel ids
 +
- struct mp_ass_packer {
+ struct mp_sub_packer {
      struct sub_bitmap *cached_parts; // only for the array memory
-     struct mp_image *cached_img;
-@@ -227,6 +318,8 @@ struct mp_ass_packer {
+     struct sub_bitmap *cached_subrandr_images;
+@@ -65,6 +156,8 @@ struct mp_sub_packer {
      ASS_Image *held;
      struct packed_src *src;
      int num_src;            // -1: cached_subs isn't a mask atlas of src
@@ -137,7 +153,7 @@ index aa2ff71..eaeab81 100644
  };
  
  // Identifies an atlas' pixels across sub_bitmaps copies; 0 is never used.
-@@ -257,6 +350,7 @@ void mp_ass_packer_release(struct mp_ass_packer *p)
+@@ -95,6 +188,7 @@ void mp_sub_packer_release(struct mp_sub_packer *p)
      ass_frame_unref(p->held);
      p->held = NULL;
      p->num_src = -1;
@@ -145,7 +161,7 @@ index aa2ff71..eaeab81 100644
  }
  
  static bool atlas_fits(struct mp_image *img, int imgfmt, int w, int h)
-@@ -547,6 +641,7 @@ static void pack_lists(struct mp_ass_packer *p, ASS_Image **image_lists,
+@@ -426,6 +520,7 @@ static void pack_lists(struct mp_sub_packer *p, ASS_Image **image_lists,
              res.num_parts++;
          }
      }
@@ -153,19 +169,3 @@ index aa2ff71..eaeab81 100644
  
      int format = SUBBITMAP_LIBASS;
      if (!(preferred_osd_format & (1 << SUBBITMAP_LIBASS))) {
-diff --git a/sub/osd.h b/sub/osd.h
-index 0fcded7..df69c10 100644
---- a/sub/osd.h
-+++ b/sub/osd.h
-@@ -49,6 +49,11 @@ struct sub_bitmap {
- 
-     struct {
-         uint32_t color;
-+        // Nonzero: identifies this part's pixels (not where or in which
-+        // color they are drawn). Parts with the same id, in this or an
-+        // earlier sub_bitmaps, have identical bitmaps, so a consumer that
-+        // kept what it made of them need not make it again. 0: unknown.
-+        uint64_t pixels_id;
-     } libass;
- };
- 

@@ -2,7 +2,7 @@
 # v0.41.0 pin all four groups build. Keep cross-platform fixes here instead of
 # repeating their pool entries in each platform series.
 0201-aspect-sub-video-rect-aspect-option.patch
-0026-ad-spdif-recreate-muxer-on-reset.patch
+# Dropped on mpv 0.42: 0026-ad-spdif-recreate-muxer-on-reset.patch, upstream in mpv 0.42 (ad_spdif: recreate spdif muxer on reset)
 0027-ad-spdif-eac3-carrier-rate-from-codec-rate.patch
 0102-f-output-chain-wake-after-reset-harder.patch
 0034-player-drop-the-frame-held-for-the-old-ao-on-reload.patch
@@ -32,12 +32,12 @@
 0214-osd-ahead-repeat-an-unchanged-frame-on-request.patch
 # deinterlace=ivtc and the ivtc-active property (needs the fieldmatch and
 # decimate filters every group's FFmpeg enables).
-0207-f-auto-filters-inverse-telecine-deinterlace-mode.patch
+# Dropped on mpv 0.42: 0207-f-auto-filters-inverse-telecine-deinterlace-mode.patch, not carried on mpv 0.42: 0.42 rewrote f_auto_filters (deinterlace=auto); Pluet never selects deinterlace=ivtc
 # FFmpeg's log lines reach the instance whose thread logged them, with
 # several instances alive at once.
 0209-av-log-route-ffmpeg-lines-to-their-own-instance.patch
 # hwdec=auto no longer picks Vulkan decoding (mpv master d20d108d94).
-0211-vd-lavc-remove-vulkan-hwdec-from-auto-safe-selection.patch
+# Dropped on mpv 0.42: 0211-vd-lavc-remove-vulkan-hwdec-from-auto-safe-selection.patch, upstream in mpv 0.42 (vd_lavc: remove Vulkan hwdec from auto-safe selection)
 # Fewer player wakeups during playback: the cache and OSD refreshes done on
 # playback's own wakeups instead of timers of their own (--coalesce-updates,
 # off by default).
@@ -70,7 +70,7 @@
 # A text subtitle packet the demuxer delivers again after a seek is dropped by
 # its payload where it has no file position (HLS), so a line seen twice shows
 # once.
-0242-sd-ass-tell-a-packet-without-a-position-by-its-payload.patch
+# Dropped on mpv 0.42: 0242-sd-ass-tell-a-packet-without-a-position-by-its-payload.patch, upstream in mpv 0.42 (sd_ass hashes a position-less packet itself)
 # Pluet (corruptmods) patches, 03xx, on top of everything above.
 # osd_get_sub_schedule() no longer holds osd->lock while its dec_sub queries
 # wait for a render (test test_osd_sub_schedule_lock.sh).

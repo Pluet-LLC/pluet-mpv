@@ -230,7 +230,7 @@ index ae12838..95b1dfe 100644
  void check_library_versions(struct mp_log *log, int v);
  #endif
 diff --git a/demux/demux.c b/demux/demux.c
-index dc36193..0fc3898 100644
+index f9e8574..5f1a059 100644
 --- a/demux/demux.c
 +++ b/demux/demux.c
 @@ -33,6 +33,7 @@
@@ -241,7 +241,7 @@ index dc36193..0fc3898 100644
  #include "common/msg.h"
  #include "common/global.h"
  #include "common/recorder.h"
-@@ -2560,6 +2561,7 @@ static MP_THREAD_VOID demux_thread(void *pctx)
+@@ -2757,6 +2758,7 @@ static MP_THREAD_VOID demux_thread(void *pctx)
  {
      struct demux_internal *in = pctx;
      mp_thread_set_name("demux");
@@ -250,7 +250,7 @@ index dc36193..0fc3898 100644
  
      stats_register_thread_cputime(in->stats, "thread");
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index 5e2e8d7..1e0c90c 100644
+index 4a2a3e4..d2e76c9 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
 @@ -36,6 +36,7 @@
@@ -261,7 +261,7 @@ index 5e2e8d7..1e0c90c 100644
  #include "common/codecs.h"
  #include "common/global.h"
  #include "common/recorder.h"
-@@ -1127,6 +1128,7 @@ static MP_THREAD_VOID dec_thread(void *ptr)
+@@ -1214,6 +1215,7 @@ static MP_THREAD_VOID dec_thread(void *ptr)
      case STREAM_AUDIO: t_name = "dec/audio"; break;
      }
      mp_thread_set_name(t_name);
@@ -270,7 +270,7 @@ index 5e2e8d7..1e0c90c 100644
      while (!p->request_terminate_dec_thread) {
          mp_filter_graph_run(p->dec_root_filter);
 diff --git a/player/client.c b/player/client.c
-index e23b98b..667e28f 100644
+index de977a9..c642391 100644
 --- a/player/client.c
 +++ b/player/client.c
 @@ -24,6 +24,7 @@
@@ -281,7 +281,7 @@ index e23b98b..667e28f 100644
  #include "common/msg.h"
  #include "common/msg_control.h"
  #include "input/input.h"
-@@ -595,6 +596,7 @@ static MP_THREAD_VOID core_thread(void *p)
+@@ -600,6 +601,7 @@ static MP_THREAD_VOID core_thread(void *p)
      while (!mpctx->initialized && mpctx->stop_play != PT_QUIT)
          mp_idle(mpctx);
  
@@ -290,10 +290,10 @@ index e23b98b..667e28f 100644
          mp_play_files(mpctx);
  
 diff --git a/player/command.c b/player/command.c
-index 20e8829..be75261 100644
+index 12d3dae..a43a56d 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -35,6 +35,7 @@
+@@ -40,6 +40,7 @@
  #include "clipboard/clipboard.h"
  #include "external_files.h"
  #include "common/av_common.h"
@@ -301,7 +301,7 @@ index 20e8829..be75261 100644
  #include "common/codecs.h"
  #include "common/msg.h"
  #include "common/msg_control.h"
-@@ -5549,6 +5550,8 @@ static void run_command_on_worker_thread(void *p)
+@@ -5954,6 +5955,8 @@ static void run_command_on_worker_thread(void *p)
      struct mp_cmd_ctx *ctx = p;
      struct MPContext *mpctx = ctx->mpctx;
  
@@ -311,7 +311,7 @@ index 20e8829..be75261 100644
  
      bool exec_async = ctx->cmd->def->exec_async;
 diff --git a/player/loadfile.c b/player/loadfile.c
-index f9b6531..ec39a68 100644
+index d4427df..1381681 100644
 --- a/player/loadfile.c
 +++ b/player/loadfile.c
 @@ -33,6 +33,7 @@
@@ -322,7 +322,7 @@ index f9b6531..ec39a68 100644
  #include "common/msg.h"
  #include "common/msg_control.h"
  #include "options/path.h"
-@@ -1125,6 +1126,7 @@ static MP_THREAD_VOID open_demux_thread(void *ctx)
+@@ -1280,6 +1281,7 @@ static MP_THREAD_VOID open_demux_thread(void *ctx)
      struct MPContext *mpctx = ctx;
  
      mp_thread_set_name("opener");
@@ -330,7 +330,7 @@ index f9b6531..ec39a68 100644
  
      struct demuxer_params p = {
          .force_format = mpctx->open_format,
-@@ -1508,6 +1510,8 @@ static void load_external_opts_thread(void *p)
+@@ -1689,6 +1691,8 @@ static void load_external_opts_thread(void *p)
      struct MPContext *mpctx = a[0];
      struct mp_waiter *waiter = a[1];
  
@@ -340,7 +340,7 @@ index f9b6531..ec39a68 100644
  
      load_chapters(mpctx);
 diff --git a/video/out/vo.c b/video/out/vo.c
-index c9cde30..36db5a6 100644
+index c90a55c..6510d50 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -37,6 +37,7 @@

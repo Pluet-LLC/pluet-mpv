@@ -57,10 +57,10 @@ canvases; paused screenshots against the unpatched build are identical in
 12 of 12 pairs, plain, after a resize and after a rotation and back.
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index b541510..2226a2f 100644
+index c6fcfc8..75c69fc 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
-@@ -68,80 +68,166 @@ struct avf_osd_canvas {
+@@ -72,80 +72,166 @@
      struct mp_osd_res res;
  };
  
@@ -287,7 +287,7 @@ index b541510..2226a2f 100644
  
  // --- avf osd ahead policy
  
-@@ -536,32 +622,40 @@ struct priv {
+@@ -1885,32 +1971,40 @@ static void avf_phase_get(const struct avf_phase_stat *s, double period,
          int64_t wait_ns, wait_max_ns;
      } ahead_perf;
  
@@ -344,7 +344,7 @@ index b541510..2226a2f 100644
          int clear_full;
          int64_t enqueue_ns, video_sample_ns;
          // Scheduling margin of enqueued OSD samples: sample PTS minus the
-@@ -2380,8 +2474,7 @@ static int clip_u10(double value)
+@@ -5051,8 +5145,7 @@ static int clip_u10(double value)
  
  // Union of the part destination rects, clamped to the OSD buffer. Both draw
  // paths only write inside these rects, so this bounds everything non-blank
@@ -354,7 +354,7 @@ index b541510..2226a2f 100644
  static void reset_subtitle_bounds(struct priv *p)
  {
      p->subtitle_x0 = p->osd_w;
-@@ -2390,8 +2483,7 @@ static void reset_subtitle_bounds(struct priv *p)
+@@ -5061,8 +5154,7 @@ static void reset_subtitle_bounds(struct priv *p)
      p->subtitle_y1 = 0;
  }
  
@@ -364,7 +364,7 @@ index b541510..2226a2f 100644
  {
      if (!imgs || p->osd_w <= 0 || p->osd_h <= 0)
          return;
-@@ -2410,17 +2502,14 @@ static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs,
+@@ -5081,17 +5173,14 @@ static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs,
          p->subtitle_y0 = MPMIN(p->subtitle_y0, r.y0);
          p->subtitle_x1 = MPMAX(p->subtitle_x1, r.x1);
          p->subtitle_y1 = MPMAX(p->subtitle_y1, r.y1);
@@ -384,7 +384,7 @@ index b541510..2226a2f 100644
  }
  
  // Map mpv image format to the CVPixelBuffer format the frame is uploaded as.
-@@ -2450,8 +2539,8 @@ static bool create_sw_upload_pool(struct vo *vo, int w, int h, OSType format)
+@@ -5121,8 +5210,8 @@ static bool create_sw_upload_pool(struct vo *vo, int w, int h, OSType format)
  static void reset_osd_buf_states(struct priv *p)
  {
      for (int i = 0; i < p->osd_buf_state_count; i++) {
@@ -395,7 +395,7 @@ index b541510..2226a2f 100644
      }
      p->osd_buf_state_count = 0;
  }
-@@ -2471,6 +2560,7 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
+@@ -5142,6 +5231,7 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
      for (int i = 0; i < p->osd_buf_state_count;) {
          if (osd_buf_state_stale(&p->osd_buf_states[i], now)) {
              CFRelease(p->osd_buf_states[i].surf);
@@ -403,7 +403,7 @@ index b541510..2226a2f 100644
              p->osd_buf_states[i] = p->osd_buf_states[--p->osd_buf_state_count];
          } else {
              i++;
-@@ -2478,6 +2568,8 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
+@@ -5149,6 +5239,8 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
      }
  }
  
@@ -412,7 +412,7 @@ index b541510..2226a2f 100644
  static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
                                                     CVPixelBufferRef buf)
  {
-@@ -2497,6 +2589,7 @@ static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
+@@ -5168,6 +5260,7 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
      // A surface new to this code usually replaces one the pool freed.
      prune_osd_buf_states(p, now);
      struct osd_buf_state *st;
@@ -420,7 +420,7 @@ index b541510..2226a2f 100644
      if (p->osd_buf_state_count < (int)MP_ARRAY_SIZE(p->osd_buf_states)) {
          st = &p->osd_buf_states[p->osd_buf_state_count++];
      } else {
-@@ -2506,35 +2599,23 @@ static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
+@@ -5177,35 +5270,23 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
                  st = &p->osd_buf_states[i];
          }
          CFRelease(st->surf);
@@ -462,7 +462,7 @@ index b541510..2226a2f 100644
      if (p->osdPool && (p->osd_pool_w != w || p->osd_pool_h != h))
          reset_osd_buf_states(p);
      return create_pixel_buffer_pool(vo, &p->osdPool, &p->osd_pool_w,
-@@ -3195,146 +3276,141 @@ static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
+@@ -5866,146 +5947,141 @@ static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
      return result;
  }
  
@@ -728,7 +728,7 @@ index b541510..2226a2f 100644
          if (!imgs->num_parts)
              continue;
          int64_t t = mp_time_ns();
-@@ -3360,15 +3436,137 @@ static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
+@@ -6031,15 +6107,137 @@ static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
      }
      if (context)
          CGContextRelease(context);
@@ -866,7 +866,7 @@ index b541510..2226a2f 100644
  // Wrap pixbuf (not consumed) in a sample buffer. An immediate sample is shown
  // as soon as it arrives instead of at pts on the layer's timebase.
  static CMSampleBufferRef create_image_sample_buffer(struct vo *vo,
-@@ -3564,9 +3762,7 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+@@ -6235,9 +6433,7 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
                  CVPixelBufferRelease(p->cachedSubtitleBuffer);
              p->cachedSubtitleBuffer = subtitleBuffer;
              int64_t t_bounds = mp_time_ns();
@@ -877,7 +877,7 @@ index b541510..2226a2f 100644
              p->perf.bounds_ns += mp_time_ns() - t_bounds;
              rendered = true;
          }
-@@ -3712,10 +3908,8 @@ static void present_inline_osd_list(struct vo *vo, struct sub_bitmap_list *list)
+@@ -6383,10 +6579,8 @@ static void present_inline_osd_list(struct vo *vo, struct sub_bitmap_list *list)
  
      int64_t t_bounds = mp_time_ns();
      reset_subtitle_bounds(p);
@@ -889,7 +889,7 @@ index b541510..2226a2f 100644
      p->perf.bounds_ns += mp_time_ns() - t_bounds;
  
      int64_t render_ns = mp_time_ns() - t_render;
-@@ -4876,7 +5070,8 @@ static void report_osd_perf(struct vo *vo)
+@@ -7580,7 +7774,8 @@ static void report_osd_perf(struct vo *vo)
          double ne = MPMAX(p->perf.enq_count, 1);
          MP_VERBOSE(vo,
              "osd-perf: n=%d avg=%.2fms max=%.2fms "
@@ -899,7 +899,7 @@ index b541510..2226a2f 100644
              "vid %.3f (/frame) | "
              "margin avg=%.1f min=%.1fms drops=%d | "
              "skip=%d empty=%d osd=%dx%d bufs=%d\n",
-@@ -4886,7 +5081,10 @@ static void report_osd_perf(struct vo *vo)
+@@ -7590,7 +7785,10 @@ static void report_osd_perf(struct vo *vo)
              p->perf.clear_ns / n / 1e6,
              p->perf.clear_px / n / 1e3,
              p->perf.clear_full,

@@ -14,10 +14,10 @@ behave as before.
 
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 97ad814..666f01e 100644
+index 2fbdfcf..6919c80 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -1956,6 +1956,20 @@ Video
+@@ -2012,6 +2012,20 @@ Video
  
          ``--vd-lavc-o=debug=pict``
  
@@ -39,10 +39,10 @@ index 97ad814..666f01e 100644
      Show even broken/corrupt frames (default: no). If this option is set to
      no, libavcodec won't output frames that were either decoded before an
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 202f726..58b9bcd 100644
+index 9d8c329..807c557 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
-@@ -84,6 +84,7 @@ struct vd_lavc_params {
+@@ -92,6 +92,7 @@ struct vd_lavc_params {
      bool check_hw_profile;
      char **avopts;
      int dr;
@@ -50,7 +50,7 @@ index 202f726..58b9bcd 100644
  };
  
  static const struct m_opt_choice_alternatives discard_names[] = {
-@@ -115,6 +116,11 @@ const struct m_sub_options vd_lavc_conf = {
+@@ -123,6 +124,11 @@ const struct m_sub_options vd_lavc_conf = {
          {"vd-lavc-dr", OPT_CHOICE(dr,
              {"auto", -1}, {"no", 0}, {"yes", 1})},
          {"vd-apply-cropping", OPT_BOOL(apply_cropping)},
@@ -62,7 +62,7 @@ index 202f726..58b9bcd 100644
          {0}
      },
      .change_flags = UPDATE_VD,
-@@ -128,6 +134,7 @@ const struct m_sub_options vd_lavc_conf = {
+@@ -136,6 +142,7 @@ const struct m_sub_options vd_lavc_conf = {
          .framedrop = AVDISCARD_NONREF,
          .dr = -1,
          .apply_cropping = true,
@@ -70,7 +70,7 @@ index 202f726..58b9bcd 100644
      },
  };
  
-@@ -845,6 +852,14 @@ static void init_avctx(struct mp_filter *vd)
+@@ -868,6 +875,14 @@ static void init_avctx(struct mp_filter *vd)
          break;
      }
  

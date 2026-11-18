@@ -82,7 +82,10 @@ static void rejoin(double speed, double audio_delay, double first, double writte
     handle_new_frame(&c);
     close_to(c.delay, written + audio_delay - first, "first frame rejoins written audio");
     update_avsync_before_frame(&c);
-    close_to(c.time_frame, 0, "first syncing frame is still immediate");
+    // mpv 0.42 times a first frame against audio that is already playing
+    // (update_avsync_before_frame), from the same written-audio delay.
+    close_to(c.time_frame, buffered - c.delay / speed,
+             "first syncing frame is timed by the playing audio");
 
     c.video_pts = first;
     c.video_status = STATUS_PLAYING;

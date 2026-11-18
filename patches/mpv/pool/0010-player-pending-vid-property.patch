@@ -18,12 +18,12 @@ the selected track like vid. "no" when none will be selected, unavailable
 without a file.
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index 24f9d7a..25b42c1 100644
+index 70c3418..499fe3c 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
-@@ -3551,6 +3551,16 @@ Property list
-     If tracks of the requested type are selected via ``--lavfi-complex``, the
-     first one is returned.
+@@ -3794,6 +3794,16 @@ Property list
+ 
+     Note that this property cannot be used directly, a sub-property is required.
  
 +``pending-vid``
 +    The ID of the video track playback will select, or ``no``. Unlike ``vid``,
@@ -39,10 +39,10 @@ index 24f9d7a..25b42c1 100644
      List of chapters, current entry marked.
  
 diff --git a/player/command.c b/player/command.c
-index 96bc06a..e75d144 100644
+index 981fe47..12d3dae 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -2314,6 +2314,38 @@ static int mp_property_hwdec_current(void *ctx, struct m_property *prop,
+@@ -2451,6 +2451,38 @@ static int mp_property_hwdec_current(void *ctx, struct m_property *prop,
      return m_property_strdup_ro(action, arg, current);
  }
  
@@ -81,7 +81,7 @@ index 96bc06a..e75d144 100644
  static int mp_property_hwdec_interop(void *ctx, struct m_property *prop,
                                       int action, void *arg)
  {
-@@ -4463,6 +4495,7 @@ static const struct m_property mp_properties_base[] = {
+@@ -4807,6 +4839,7 @@ static const struct m_property mp_properties_base[] = {
      {"estimated-vf-fps", mp_property_vf_fps},
      {"video-aspect-override", mp_property_video_aspect_override},
      {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
@@ -89,7 +89,7 @@ index 96bc06a..e75d144 100644
      {"hwdec-current", mp_property_hwdec_current},
      {"hwdec-interop", mp_property_hwdec_interop},
  
-@@ -4578,8 +4611,8 @@ static const char *const *const mp_event_property_change[] = {
+@@ -4930,8 +4963,8 @@ static const char *const *const mp_event_property_change[] = {
      E(MPV_EVENT_END_FILE, "*"),
      E(MPV_EVENT_FILE_LOADED, "*"),
      E(MP_EVENT_CHANGE_ALL, "*"),

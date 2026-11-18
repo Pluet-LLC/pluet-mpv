@@ -15,10 +15,10 @@ accept the render hint without changing behavior. This path does not enable
 persistent libass layout caching.
 
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
-index 3b094a6..363cd00 100644
+index 9110089..b9f0eb2 100644
 --- a/sub/dec_sub.c
 +++ b/sub/dec_sub.c
-@@ -505,7 +505,7 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
+@@ -514,7 +514,7 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
  // render returns. sd is exclusively the renderer's meanwhile; see
  // wait_render_done / apply_pending for how everything else keeps out.
  struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
@@ -27,7 +27,7 @@ index 3b094a6..363cd00 100644
  {
      mp_mutex_lock(&sub->lock);
      wait_render_done(sub);
-@@ -524,7 +524,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+@@ -533,7 +533,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
          sub->rendering = true;
          mp_mutex_unlock(&sub->lock);
  
@@ -37,10 +37,10 @@ index 3b094a6..363cd00 100644
          mp_mutex_lock(&sub->lock);
          sub->rendering = false;
 diff --git a/sub/dec_sub.h b/sub/dec_sub.h
-index cb18ae2..0e43f20 100644
+index 632bf6f..3c49c82 100644
 --- a/sub/dec_sub.h
 +++ b/sub/dec_sub.h
-@@ -49,7 +49,7 @@ void sub_redecode_cached_packets(struct dec_sub *sub);
+@@ -63,7 +63,7 @@ void sub_redecode_cached_packets(struct dec_sub *sub);
  void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
                        bool *packets_read, bool *sub_updated);
  struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
@@ -50,10 +50,10 @@ index cb18ae2..0e43f20 100644
  char *sub_ass_get_extradata(struct dec_sub *sub);
  struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 diff --git a/sub/osd.c b/sub/osd.c
-index dec9b8b..6b1ae86 100644
+index b796e72..0919759 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
-@@ -386,7 +386,8 @@ void osd_resize(struct osd_state *osd, struct mp_osd_res res)
+@@ -389,7 +389,8 @@ void osd_resize(struct osd_state *osd, struct mp_osd_res res)
  static struct sub_bitmaps *render_object(struct osd_state *osd,
                                           struct osd_object *obj,
                                           struct mp_osd_res osdres, double video_pts,
@@ -63,7 +63,7 @@ index dec9b8b..6b1ae86 100644
  {
      int format = SUBBITMAP_LIBASS;
      if (!sub_formats[format] || osd->opts->force_rgba_osd)
-@@ -412,7 +413,7 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+@@ -415,7 +416,7 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
              osd->sub_render_busy = true;
              mp_mutex_unlock(&osd->lock);
  
@@ -72,7 +72,7 @@ index dec9b8b..6b1ae86 100644
  
              mp_mutex_lock(&osd->lock);
              osd->sub_render_busy = false;
-@@ -482,7 +483,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
+@@ -486,7 +487,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
          stats_time_start(osd->stats, stat_type_render);
  
          struct sub_bitmaps *imgs =
@@ -83,10 +83,10 @@ index dec9b8b..6b1ae86 100644
          stats_time_end(osd->stats, stat_type_render);
  
 diff --git a/sub/osd.h b/sub/osd.h
-index 327f6a3..30feacd 100644
+index 613799c..76cc8d5 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
-@@ -210,6 +210,7 @@ enum mp_osd_draw_flags {
+@@ -229,6 +229,7 @@ enum mp_osd_draw_flags {
      OSD_DRAW_SUB_FILTER = (1 << 0),
      OSD_DRAW_SUB_ONLY   = (1 << 1),
      OSD_DRAW_OSD_ONLY   = (1 << 2),
@@ -95,10 +95,10 @@ index 327f6a3..30feacd 100644
  
  void osd_draw(struct osd_state *osd, struct mp_osd_res res,
 diff --git a/sub/sd.h b/sub/sd.h
-index 8db7c41..5541b4f 100644
+index d7cea26..990e801 100644
 --- a/sub/sd.h
 +++ b/sub/sd.h
-@@ -48,7 +48,7 @@ struct sd_functions {
+@@ -49,7 +49,7 @@ struct sd_functions {
      int (*control)(struct sd *sd, enum sd_ctrl cmd, void *arg);
  
      struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
@@ -106,13 +106,13 @@ index 8db7c41..5541b4f 100644
 +                                       int format, double pts, bool prefetch);
      char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
      struct sd_times (*get_times)(struct sd *sd, double pts);
- };
+     struct sub_lines *(*get_lines)(struct sd *sd);
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index 555b5af..17f7d59 100644
+index 20f5179..5fa51bd 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
-@@ -40,23 +40,41 @@
- #include "ass_mp.h"
+@@ -41,23 +41,41 @@
+ #include "packer.h"
  #include "sd.h"
  
 +// The one future event render keeps its libass change-detection state and
@@ -128,7 +128,7 @@ index 555b5af..17f7d59 100644
 +
 +struct ass_render_state {
 +    ASS_Renderer *renderer;
-+    struct mp_ass_packer *packer;
++    struct mp_sub_packer *packer;
 +    struct mp_osd_res osd;
 +    bool configured;
 +};
@@ -149,7 +149,7 @@ index 555b5af..17f7d59 100644
      struct sd_filter **filters;
      int num_filters;
      bool clear_once;
--    struct mp_ass_packer *packer;
+-    struct mp_sub_packer *packer;
 -    struct sub_bitmap_copy_cache *copy_cache;
      bstr last_text;
      struct mp_image_params video_params;
@@ -157,7 +157,7 @@ index 555b5af..17f7d59 100644
 -    struct mp_osd_res osd;
      struct seen_packet *seen_packets;
      int num_seen_packets;
-     int *packets_animated;
+     bool check_animated;
 @@ -229,28 +247,88 @@ static void filters_init(struct sd *sd)
      }
  }
@@ -217,7 +217,7 @@ index 555b5af..17f7d59 100644
 +        MP_WARN(sd, "libass built without threading support\n");
 +    mp_ass_configure_fonts(r->renderer, sd->opts->sub_style, sd->global, sd->log);
 +    set_renderer_cache_limits(sd, r->renderer);
-+    r->packer = mp_ass_packer_alloc(r);
++    r->packer = mp_sub_packer_alloc(r);
 +    ctx->renderers[index] = r;
 +    return r;
 +}
@@ -285,11 +285,11 @@ index 555b5af..17f7d59 100644
      assobjects_init(sd);
      filters_init(sd);
  
--    ctx->packer = mp_ass_packer_alloc(ctx);
+-    ctx->packer = mp_sub_packer_alloc(ctx);
  
      // Subtitles does not have any profile value, so put the converted type as a profile.
      const char *_Atomic *desc = ctx->converter ? &sd->codec->codec_profile : &sd->codec->codec_desc;
-@@ -533,13 +610,11 @@ static float get_libass_scale_height(struct mp_osd_res *dim, bool use_margins)
+@@ -545,13 +622,11 @@ static float get_libass_scale_height(struct mp_osd_res *dim, bool use_margins)
          return MPMIN(dim->h, dim->w / vidw * vidh);
  }
  
@@ -305,7 +305,7 @@ index 555b5af..17f7d59 100644
  
      ass_set_frame_size(priv, dim->w, dim->h);
      ass_set_margins(priv, dim->mt, dim->mb, dim->ml, dim->mr);
-@@ -736,7 +811,7 @@ static long long find_timestamp(struct sd *sd, double pts)
+@@ -749,7 +824,7 @@ static long long find_timestamp(struct sd *sd, double pts)
  #undef END
  
  static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
@@ -314,7 +314,7 @@ index 555b5af..17f7d59 100644
  {
      struct sd_ass_priv *ctx = sd->priv;
      struct mp_subtitle_opts *opts = sd->opts;
-@@ -745,12 +820,28 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+@@ -758,12 +833,28 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
          shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_STRIP;
      bool converted = (ctx->is_converted && !lavc_conv_is_styled(ctx->converter)) || no_ass;
      ASS_Track *track = no_ass ? ctx->shadow_track : ctx->ass_track;
@@ -346,7 +346,7 @@ index 555b5af..17f7d59 100644
  
      if (pts == MP_NOPTS_VALUE || !renderer)
          goto done;
-@@ -772,9 +863,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+@@ -785,9 +876,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
          if (isnormal(par))
              scale *= par;
      }
@@ -359,12 +359,12 @@ index 555b5af..17f7d59 100644
      }
      ass_set_pixel_aspect(renderer, scale);
      if (!converted && (!shared_opts->ass_style_override[sd->order] ||
-@@ -791,14 +882,23 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+@@ -804,14 +895,23 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
  
      int changed;
      ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
--    mp_ass_packer_pack(ctx->packer, &imgs, 1, changed, !converted, format, res);
-+    mp_ass_packer_pack(r->packer, &imgs, 1, changed, !converted, format, res);
+-    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
++    mp_sub_packer_pack_ass(r->packer, &imgs, 1, changed, !converted, format, res);
  
  done:
      // mangle_colors() modifies the color field, so copy the thing _before_.
@@ -385,7 +385,7 @@ index 555b5af..17f7d59 100644
  
      return res;
  }
-@@ -1007,6 +1107,8 @@ static void fill_plaintext(struct sd *sd, double pts)
+@@ -1020,6 +1120,8 @@ static void fill_plaintext(struct sd *sd, double pts)
  static void reset(struct sd *sd)
  {
      struct sd_ass_priv *ctx = sd->priv;
@@ -394,15 +394,15 @@ index 555b5af..17f7d59 100644
      if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
          ass_flush_events(ctx->ass_track);
          ctx->num_seen_packets = 0;
-@@ -1025,7 +1127,6 @@ static void uninit(struct sd *sd)
+@@ -1038,7 +1140,6 @@ static void uninit(struct sd *sd)
      if (ctx->converter)
          lavc_conv_uninit(ctx->converter);
      assobjects_destroy(sd);
 -    talloc_free(ctx->copy_cache);
  }
  
- static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
-@@ -1088,7 +1189,11 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
+ static struct sub_lines *get_lines(struct sd *sd)
+@@ -1143,7 +1244,11 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
              assobjects_destroy(sd);
              assobjects_init(sd);
          }
@@ -416,10 +416,10 @@ index 555b5af..17f7d59 100644
      }
      default:
 diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
-index 5cbc6d0..fc2506b 100644
+index ce9416e..dde1dd7 100644
 --- a/sub/sd_lavc.c
 +++ b/sub/sd_lavc.c
-@@ -438,7 +438,7 @@ static struct sub *get_current(struct sd_lavc_priv *priv, double pts)
+@@ -481,7 +481,7 @@ static struct sub *get_current(struct sd_lavc_priv *priv, double pts)
  }
  
  static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,

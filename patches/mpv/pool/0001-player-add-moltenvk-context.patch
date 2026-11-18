@@ -11,14 +11,14 @@ Folded in, in series order:
 
 * 0029-moltenvk-report-display-colorspace
 
-diff --git forkSrcPrefix/meson.build forkDstPrefix/meson.build
-index fb10be5..42ece8e 100644
---- forkSrcPrefix/meson.build
-+++ forkDstPrefix/meson.build
-@@ -1315,6 +1315,17 @@ if features['vulkan'] and features['x11']
+diff --git a/meson.build b/meson.build
+index 0cb60de..26eb1ed 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1376,6 +1376,17 @@ if features['vulkan'] and features['x11']
       sources += files('video/out/vulkan/context_xlib.c')
  endif
-
+ 
 +if host_machine.system() == 'darwin'
 +    moltenvk = get_option('moltenvk').require(
 +        features['vulkan'],
@@ -33,31 +33,31 @@ index fb10be5..42ece8e 100644
  features += {'vk-khr-display': vulkan.type_name() == 'internal' or
                                 cc.has_function('vkCreateDisplayPlaneSurfaceKHR', prefix: '#include <vulkan/vulkan_core.h>',
                                                 dependencies: [vulkan])}
-diff --git forkSrcPrefix/meson.options forkDstPrefix/meson.options
-index 52782f7..81bc931 100644
---- forkSrcPrefix/meson.options
-+++ forkDstPrefix/meson.options
-@@ -101,6 +101,7 @@ option('gl-dxinterop-d3d9', type: 'feature', value: 'auto', description: 'OpenGL
+diff --git a/meson.options b/meson.options
+index 3211082..f08768a 100644
+--- a/meson.options
++++ b/meson.options
+@@ -107,6 +107,7 @@ option('gl-dxinterop-d3d9', type: 'feature', value: 'auto', description: 'OpenGL
  option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES interop support')
  option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoolbox with OpenGL')
  option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
 +option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
-
+ 
  # macOS features
  option('macos-10-15-4-features', type: 'feature', value: 'auto', description: 'macOS 10.15.4 SDK Features')
-diff --git forkSrcPrefix/video/out/gpu/context.c forkDstPrefix/video/out/gpu/context.c
+diff --git a/video/out/gpu/context.c b/video/out/gpu/context.c
 index 60c0641..a1e3952 100644
---- forkSrcPrefix/video/out/gpu/context.c
-+++ forkDstPrefix/video/out/gpu/context.c
+--- a/video/out/gpu/context.c
++++ b/video/out/gpu/context.c
 @@ -50,6 +50,7 @@ extern const struct ra_ctx_fns ra_ctx_vulkan_xlib;
  extern const struct ra_ctx_fns ra_ctx_vulkan_android;
  extern const struct ra_ctx_fns ra_ctx_vulkan_display;
  extern const struct ra_ctx_fns ra_ctx_vulkan_mac;
 +extern const struct ra_ctx_fns ra_ctx_vulkan_moltenvk;
-
+ 
  /* Direct3D 11 */
  extern const struct ra_ctx_fns ra_ctx_d3d11;
-@@ -93,6 +94,9 @@ static const struct ra_ctx_fns *contexts[] = {
+@@ -93,6 +94,9 @@ static const struct ra_ctx_fns *const contexts[] = {
  #if HAVE_X11
      &ra_ctx_vulkan_xlib,
  #endif
@@ -67,10 +67,10 @@ index 60c0641..a1e3952 100644
  #if HAVE_COCOA && HAVE_SWIFT
      &ra_ctx_vulkan_mac,
  #endif
-diff --git forkSrcPrefix/video/out/vulkan/common.h forkDstPrefix/video/out/vulkan/common.h
+diff --git a/video/out/vulkan/common.h b/video/out/vulkan/common.h
 index e75cb22..afc1728 100644
---- forkSrcPrefix/video/out/vulkan/common.h
-+++ forkDstPrefix/video/out/vulkan/common.h
+--- a/video/out/vulkan/common.h
++++ b/video/out/vulkan/common.h
 @@ -22,6 +22,9 @@
  #if HAVE_WIN32_DESKTOP
  #define VK_USE_PLATFORM_WIN32_KHR

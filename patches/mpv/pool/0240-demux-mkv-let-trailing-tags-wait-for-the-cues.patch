@@ -61,10 +61,10 @@ test_demux_mkv_defer_tags.sh replays what opening and the first seek
 read for each layout.
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 97ad814..817290d 100644
+index 4f2e8fc..c2bac78 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -4143,6 +4143,19 @@ Demuxer
+@@ -4293,6 +4293,19 @@ Demuxer
      also reads the first timestamp, which may increase latency by one frame
      (which may be relevant for live streams).
  
@@ -85,10 +85,10 @@ index 97ad814..817290d 100644
      When opening the file, seek to the end of it, and check what timestamp the
      last video packet has, and report that as file duration. This is strictly
 diff --git a/demux/demux.c b/demux/demux.c
-index 86a233d..7032b87 100644
+index 7672f4b..834c40c 100644
 --- a/demux/demux.c
 +++ b/demux/demux.c
-@@ -3090,6 +3090,11 @@ void demux_metadata_changed(demuxer_t *demuxer)
+@@ -3295,6 +3295,11 @@ void demux_metadata_changed(demuxer_t *demuxer)
  
      mp_mutex_lock(&in->lock);
      add_timed_metadata(in, demuxer->metadata, NULL, MP_NOPTS_VALUE);
@@ -101,10 +101,10 @@ index 86a233d..7032b87 100644
  }
  
 diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
-index 6c2e773..f9930d3 100644
+index 87bd0eb..e30b310 100644
 --- a/demux/demux_mkv.c
 +++ b/demux/demux_mkv.c
-@@ -192,6 +192,10 @@ typedef struct mkv_demuxer {
+@@ -201,6 +201,10 @@ typedef struct mkv_demuxer {
      int num_tracks;
  
      struct ebml_tags *tags;
@@ -115,7 +115,7 @@ index 6c2e773..f9930d3 100644
  
      int64_t tc_scale, cluster_tc;
  
-@@ -240,6 +244,7 @@ struct demux_mkv_opts {
+@@ -250,6 +254,7 @@ struct demux_mkv_opts {
      int probe_duration;
      bool probe_start_time;
      bool crop_compat;
@@ -123,7 +123,7 @@ index 6c2e773..f9930d3 100644
  };
  
  const struct m_sub_options demux_mkv_conf = {
-@@ -254,6 +259,7 @@ const struct m_sub_options demux_mkv_conf = {
+@@ -264,6 +269,7 @@ const struct m_sub_options demux_mkv_conf = {
              {"no", 0}, {"yes", 1}, {"full", 2})},
          {"probe-start-time", OPT_BOOL(probe_start_time)},
          {"crop-compat", OPT_BOOL(crop_compat)},
@@ -131,7 +131,7 @@ index 6c2e773..f9930d3 100644
          {0}
      },
      .size = sizeof(struct demux_mkv_opts),
-@@ -263,6 +269,7 @@ const struct m_sub_options demux_mkv_conf = {
+@@ -273,6 +279,7 @@ const struct m_sub_options demux_mkv_conf = {
          .subtitle_preroll_secs_index = 10.0,
          .probe_start_time = true,
          .crop_compat = true,
@@ -139,7 +139,7 @@ index 6c2e773..f9930d3 100644
      },
      .change_flags = UPDATE_DEMUXER,
  };
-@@ -1291,6 +1298,14 @@ static void process_tags(demuxer_t *demuxer)
+@@ -1318,6 +1325,14 @@ static void process_tags(demuxer_t *demuxer)
      if (!tags)
          return;
  
@@ -154,7 +154,7 @@ index 6c2e773..f9930d3 100644
      for (int i = 0; i < tags->n_tag; i++) {
          struct ebml_tag tag = tags->tag[i];
          struct mp_tags *dst = NULL;
-@@ -1330,7 +1345,13 @@ static void process_tags(demuxer_t *demuxer)
+@@ -1357,7 +1372,13 @@ static void process_tags(demuxer_t *demuxer)
              dst = demuxer->metadata;
          }
  
@@ -168,7 +168,7 @@ index 6c2e773..f9930d3 100644
              for (int j = 0; j < tag.n_simple_tag; j++) {
                  if (tag.simple_tag[j].tag_name && tag.simple_tag[j].tag_string) {
                      char *name = tag.simple_tag[j].tag_name;
-@@ -1345,6 +1366,13 @@ static void process_tags(demuxer_t *demuxer)
+@@ -1372,6 +1393,13 @@ static void process_tags(demuxer_t *demuxer)
              }
          }
      }
@@ -182,7 +182,7 @@ index 6c2e773..f9930d3 100644
  }
  
  static int demux_mkv_read_attachments(demuxer_t *demuxer)
-@@ -1488,7 +1516,12 @@ static int read_deferred_element(struct demuxer *demuxer,
+@@ -1515,7 +1543,12 @@ static int read_deferred_element(struct demuxer *demuxer,
      MP_VERBOSE(demuxer, "Seeking to %"PRIu64" to read header element "
                 "0x%"PRIx32".\n",
                 elem->pos, elem->id);
@@ -196,7 +196,7 @@ index 6c2e773..f9930d3 100644
          MP_WARN(demuxer, "Failed to seek when reading header element.\n");
          return 0;
      }
-@@ -1501,6 +1534,28 @@ static int read_deferred_element(struct demuxer *demuxer,
+@@ -1528,6 +1561,28 @@ static int read_deferred_element(struct demuxer *demuxer,
      return read_header_element(demuxer, elem->id, elem->pos);
  }
  
@@ -225,7 +225,7 @@ index 6c2e773..f9930d3 100644
  static void read_deferred_cues(demuxer_t *demuxer)
  {
      mkv_demuxer_t *mkv_d = demuxer->priv;
-@@ -1508,12 +1563,107 @@ static void read_deferred_cues(demuxer_t *demuxer)
+@@ -1535,12 +1590,107 @@ static void read_deferred_cues(demuxer_t *demuxer)
      if (mkv_d->index_complete || demuxer->opts->index_mode != 1)
          return;
  
@@ -335,7 +335,7 @@ index 6c2e773..f9930d3 100644
  }
  
  static void add_coverart(struct demuxer *demuxer)
-@@ -2506,6 +2656,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+@@ -2612,6 +2762,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
  
      struct MPOpts *mp_opts = mp_get_config_group(mkv_d, demuxer->global, &mp_opt_root);
      mkv_d->edition_id = mp_opts->edition_id;
@@ -343,7 +343,7 @@ index 6c2e773..f9930d3 100644
      talloc_free(mp_opts);
  
      mkv_d->opts = mp_get_config_group(mkv_d, demuxer->global, &demux_mkv_conf);
-@@ -2531,58 +2682,8 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+@@ -2638,58 +2789,8 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
              return -1;
      }
  
@@ -404,7 +404,7 @@ index 6c2e773..f9930d3 100644
  
      if (!stream_seek(s, start_pos)) {
          MP_ERR(demuxer, "Couldn't seek back after reading headers?\n");
-@@ -2602,6 +2703,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+@@ -2710,6 +2811,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
      probe_dts_profile(demuxer);
      probe_if_image(demuxer);
  

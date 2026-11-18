@@ -8,6 +8,7 @@ explicit; it is also the renderer setup patch 0013 splits into two
 renderers.
 
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index c329b61..252ab54 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
 @@ -240,6 +240,15 @@ static void enable_output(struct sd *sd, bool enable)

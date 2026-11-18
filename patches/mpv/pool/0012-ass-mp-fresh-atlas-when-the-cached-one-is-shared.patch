@@ -1,8 +1,8 @@
-diff --git a/sub/ass_mp.c b/sub/ass_mp.c
-index c8b1bd0..16516b6 100644
---- a/sub/ass_mp.c
-+++ b/sub/ass_mp.c
-@@ -226,9 +226,14 @@ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
+diff --git a/sub/packer.c b/sub/packer.c
+index bebb456..1d4af4c 100644
+--- a/sub/packer.c
++++ b/sub/packer.c
+@@ -72,9 +72,14 @@ static bool pack(struct mp_sub_packer *p, struct sub_bitmaps *res, int imgfmt)
      res->packed_w = bb[1].x;
      res->packed_h = bb[1].y;
  
@@ -18,7 +18,7 @@ index c8b1bd0..16516b6 100644
      {
          talloc_free(p->cached_img);
          p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
-@@ -239,11 +244,6 @@ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
+@@ -85,11 +90,6 @@ static bool pack(struct mp_sub_packer *p, struct sub_bitmaps *res, int imgfmt)
          talloc_steal(p, p->cached_img);
      }
  

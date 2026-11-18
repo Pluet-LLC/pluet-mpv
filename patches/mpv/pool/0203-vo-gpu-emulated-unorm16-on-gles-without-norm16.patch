@@ -83,10 +83,10 @@ index d87b566..168f36b 100644
      // If not 0, the format represents some sort of packed fringe format, whose
      // shader representation is given by the special_imgfmt_desc pointer.
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index c0a1be8..2782a7c 100644
+index 6122e51..d95d96e 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
-@@ -1408,6 +1408,21 @@ static const char *get_tex_swizzle(struct image *img)
+@@ -1417,6 +1417,21 @@ static const char *get_tex_swizzle(struct image *img)
      return img->tex->params.format->ordered ? "rgba" : "bgra";
  }
  
@@ -108,7 +108,7 @@ index c0a1be8..2782a7c 100644
  // Copy a texture to the vec4 color, while increasing offset. Also applies
  // the texture multiplier to the sampled color
  static void copy_image(struct gl_video *p, unsigned int *offset, struct image img)
-@@ -1433,8 +1448,14 @@ static void copy_image(struct gl_video *p, unsigned int *offset, struct image im
+@@ -1442,8 +1457,14 @@ static void copy_image(struct gl_video *p, unsigned int *offset, struct image im
          img.multiplier *= 1.0 / (tex_max - 1);
      }
  
@@ -125,7 +125,7 @@ index c0a1be8..2782a7c 100644
  
      *offset += count;
  }
-@@ -1890,6 +1911,8 @@ static void pass_sample_separated(struct gl_video *p, struct image src,
+@@ -1942,6 +1963,8 @@ static void pass_sample_separated(struct gl_video *p, struct image src,
      sampler_prelude(p->sc, pass_bind(p, src));
      GLSLF("// first pass\n");
      pass_sample_separated_gen(p->sc, scaler, 0, 1);
@@ -134,7 +134,7 @@ index c0a1be8..2782a7c 100644
      GLSLF("color *= %f;\n", src.multiplier);
      finish_pass_tex(p, &scaler->sep_fbo, src.w, h);
  
-@@ -1995,8 +2018,11 @@ static void pass_sample(struct gl_video *p, struct image img,
+@@ -2047,8 +2070,11 @@ static void pass_sample(struct gl_video *p, struct image img,
  
      // Apply any required multipliers. Separated scaling already does this in
      // its first stage
@@ -147,7 +147,7 @@ index c0a1be8..2782a7c 100644
  
      // Micro-optimization: Avoid scaling unneeded channels
      skip_unused(p, img.components);
-@@ -2225,9 +2251,17 @@ static void pass_read_video(struct gl_video *p)
+@@ -2366,9 +2392,17 @@ static void pass_read_video(struct gl_video *p)
      }
  
      // If any textures are still in integer format by this point, we need
@@ -168,7 +168,7 @@ index c0a1be8..2782a7c 100644
              copy_image(p, &(int){0}, img[n]);
              pass_describe(p, "use_integer fix");
 diff --git a/video/out/opengl/ra_gl.c b/video/out/opengl/ra_gl.c
-index 0d38f82..0773d25 100644
+index abeff23..1c1f968 100644
 --- a/video/out/opengl/ra_gl.c
 +++ b/video/out/opengl/ra_gl.c
 @@ -231,8 +231,43 @@ static int ra_init_gl(struct ra *ra, GL *gl)

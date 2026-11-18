@@ -1,8 +1,8 @@
 diff --git a/player/audio.c b/player/audio.c
-index b3e975d..c7e5650 100644
+index 553873b..efd143f 100644
 --- a/player/audio.c
 +++ b/player/audio.c
-@@ -776,6 +776,11 @@ void reload_audio_output(struct MPContext *mpctx)
+@@ -798,6 +798,11 @@ void reload_audio_output(struct MPContext *mpctx)
      if (ao_c) {
          reset_audio_state(mpctx);
          mp_output_chain_reset_harder(ao_c->filter);

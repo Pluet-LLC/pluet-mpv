@@ -34,6 +34,7 @@ struct track {
     struct sh_stream *stream;
     struct mp_pin *sink;
     struct ao_chain *ao_c;
+    bool dec_failed;
 };
 struct MPOpts { bool audio_spdif_backoff; double audio_spdif_backoff_expiry; };
 struct mp_filter { int resets, wakeups; };

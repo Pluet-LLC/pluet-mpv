@@ -1,8 +1,8 @@
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
-index d60da5c..3b094a6 100644
+index 5160296..9110089 100644
 --- a/sub/dec_sub.c
 +++ b/sub/dec_sub.c
-@@ -59,9 +59,14 @@ struct dec_sub {
+@@ -65,9 +65,14 @@ struct dec_sub {
      struct attachment_list *attachments;
  
      struct sh_stream *sh;
@@ -17,12 +17,13 @@ index d60da5c..3b094a6 100644
      bool preload_attempted;
      double video_fps;
      double sub_speed;
-@@ -247,11 +252,13 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+@@ -255,12 +260,14 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
          .opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_sub_opts),
          .shared_opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_shared_sub_opts),
          .sh = track->stream,
 +        .demuxer = track->demuxer,
          .codec = track->stream->codec,
+         .lang = track->lang,
          .attachments = talloc_steal(sub, attachments),
          .play_dir = 1,
          .order = order,
@@ -31,7 +32,7 @@ index d60da5c..3b094a6 100644
          .last_vo_pts = MP_NOPTS_VALUE,
          .start = MP_NOPTS_VALUE,
          .end = MP_NOPTS_VALUE,
-@@ -430,6 +437,16 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+@@ -439,6 +446,16 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
          if (st <= 0) {
              *packets_read = st < 0 || (sub->last_pkt_pts != MP_NOPTS_VALUE &&
                                         sub->last_pkt_pts > video_pts);
@@ -48,7 +49,7 @@ index d60da5c..3b094a6 100644
              break;
          }
  
-@@ -569,6 +586,70 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+@@ -578,6 +595,70 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
      return res;
  }
  
@@ -119,7 +120,7 @@ index d60da5c..3b094a6 100644
  void sub_reset(struct dec_sub *sub)
  {
      mp_mutex_lock(&sub->lock);
-@@ -576,6 +657,8 @@ void sub_reset(struct dec_sub *sub)
+@@ -585,6 +666,8 @@ void sub_reset(struct dec_sub *sub)
      if (sub->sd->driver->reset)
          sub->sd->driver->reset(sub->sd);
      sub->last_pkt_pts = MP_NOPTS_VALUE;
@@ -129,10 +130,10 @@ index d60da5c..3b094a6 100644
      destroy_cached_pkts(sub);
      demux_packet_pool_push(sub->packet_pool, sub->new_segment);
 diff --git a/sub/dec_sub.h b/sub/dec_sub.h
-index 476e83a..cb18ae2 100644
+index 63832cb..632bf6f 100644
 --- a/sub/dec_sub.h
 +++ b/sub/dec_sub.h
-@@ -16,6 +16,7 @@ struct sd;
+@@ -17,6 +17,7 @@ struct sd;
  
  enum sd_ctrl {
      SD_CTRL_SUB_STEP,
@@ -140,10 +141,10 @@ index 476e83a..cb18ae2 100644
      SD_CTRL_SET_ANIMATED_CHECK,
      SD_CTRL_SET_VIDEO_PARAMS,
      SD_CTRL_SET_VIDEO_DEF_FPS,
-@@ -52,6 +53,9 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
- char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
- char *sub_ass_get_extradata(struct dec_sub *sub);
- struct sd_times sub_get_times(struct dec_sub *sub, double pts);
+@@ -69,6 +70,9 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts);
+ // Return subtitle lines in memory. Call talloc_free() on the return value.
+ struct sub_lines *sub_get_lines(struct dec_sub *sub);
+ 
 +double sub_get_render_horizon(struct dec_sub *sub);
 +double sub_get_next_event_start(struct dec_sub *sub, double after, int *num_events);
 +double sub_get_visible_end(struct dec_sub *sub, double pts);
@@ -151,7 +152,7 @@ index 476e83a..cb18ae2 100644
  void sub_select(struct dec_sub *sub, bool selected);
  void sub_set_recorder_sink(struct dec_sub *sub, struct mp_recorder_sink *sink);
 diff --git a/sub/osd.c b/sub/osd.c
-index 8c1d392..dec9b8b 100644
+index 76a51d2..b796e72 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
 @@ -15,6 +15,7 @@
@@ -162,7 +163,7 @@ index 8c1d392..dec9b8b 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <assert.h>
-@@ -273,6 +274,60 @@ double osd_get_force_video_pts(struct osd_state *osd)
+@@ -275,6 +276,60 @@ double osd_get_force_video_pts(struct osd_state *osd)
      return atomic_load(&osd->force_video_pts);
  }
  
@@ -224,10 +225,10 @@ index 8c1d392..dec9b8b 100644
  {
      mp_mutex_lock(&osd->lock);
 diff --git a/sub/osd.h b/sub/osd.h
-index 8bb6b90..327f6a3 100644
+index b62836e..613799c 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
-@@ -191,6 +191,10 @@ bool osd_get_render_subs_in_filter(struct osd_state *osd);
+@@ -210,6 +210,10 @@ bool osd_get_render_subs_in_filter(struct osd_state *osd);
  void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
  void osd_set_force_video_pts(struct osd_state *osd, double video_pts);
  double osd_get_force_video_pts(struct osd_state *osd);
@@ -239,10 +240,10 @@ index 8bb6b90..327f6a3 100644
  struct osd_progbar_state {
      int type;           // <0: disabled, 1-255: symbol, else: no symbol
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index 81d9bef..555b5af 100644
+index 448a33d..20f5179 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
-@@ -1042,6 +1042,31 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
+@@ -1093,6 +1093,31 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
          a[0] += res / 1000.0 + SUB_SEEK_OFFSET;
          return true;
      }

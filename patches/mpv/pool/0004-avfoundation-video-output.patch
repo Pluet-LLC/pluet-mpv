@@ -399,10 +399,10 @@ Folded in, in series order:
     the 8K cap.
 
 diff --git a/meson.build b/meson.build
-index f6f8e7f..55612b4 100644
+index 1abe20d..dfccfd0 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -823,6 +823,22 @@ if features['avfoundation']
+@@ -868,6 +868,22 @@ if features['avfoundation']
      sources += files('audio/out/ao_avfoundation.m')
  endif
  
@@ -426,10 +426,10 @@ index f6f8e7f..55612b4 100644
                         'AudioUnit', 'AudioToolbox'], required: get_option('coreaudio'))
  features += {'coreaudio': coreaudio.found()}
 diff --git a/meson.options b/meson.options
-index 81bc931..1ac622a 100644
+index f08768a..2cbe3e0 100644
 --- a/meson.options
 +++ b/meson.options
-@@ -62,6 +62,7 @@ option('d3d11', type: 'feature', value: 'auto', description: 'Direct3D 11 video
+@@ -66,6 +66,7 @@ option('d3d11', type: 'feature', value: 'auto', description: 'Direct3D 11 video
  option('direct3d', type: 'feature', value: 'auto', description: 'Direct3D support')
  option('dmabuf-wayland', type: 'feature', value: 'auto', description: 'dmabuf-wayland video output')
  option('drm', type: 'feature', value: 'auto', description: 'Direct Rendering Manager (DRM)')
@@ -1427,10 +1427,10 @@ index 0000000..a738e00
 +
 +#endif // HAVE_VULKAN && HAVE_MOLTENVK
 diff --git a/video/out/vo.c b/video/out/vo.c
-index c9cde30..582acbe 100644
+index 6510d50..c0020dc 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
-@@ -46,6 +46,7 @@
+@@ -47,6 +47,7 @@
  #include "osdep/io.h"
  #include "osdep/threads.h"
  
@@ -1438,7 +1438,7 @@ index c9cde30..582acbe 100644
  extern const struct vo_driver video_out_mediacodec_embed;
  extern const struct vo_driver video_out_x11;
  extern const struct vo_driver video_out_vdpau;
-@@ -69,6 +70,9 @@ extern const struct vo_driver video_out_kitty;
+@@ -70,6 +71,9 @@ extern const struct vo_driver video_out_kitty;
  
  static const struct vo_driver *const video_out_drivers[] =
  {

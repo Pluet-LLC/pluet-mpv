@@ -34,10 +34,10 @@ comparison runs only against an old value that exists.
 mpv master has the same code.
 
 diff --git a/demux/demux.c b/demux/demux.c
-index d1accba..cf492a0 100644
+index 296993b..f9e8574 100644
 --- a/demux/demux.c
 +++ b/demux/demux.c
-@@ -2027,17 +2027,27 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
+@@ -2188,17 +2188,27 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
  
      if (!drop && ds->refreshing) {
          // Resume reading once the old position was reached (i.e. we start

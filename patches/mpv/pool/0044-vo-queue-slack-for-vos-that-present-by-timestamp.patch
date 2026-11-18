@@ -22,7 +22,7 @@ when nothing else woke the core first. --avfoundation-queue-slack-ms
 sets it; default 0 keeps the old timing.
 
 diff --git a/video/out/vo.c b/video/out/vo.c
-index e3635b2..b109ee1 100644
+index c0020dc..746162b 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -162,6 +162,7 @@ struct vo_internal {
@@ -33,7 +33,7 @@ index e3635b2..b109ee1 100644
      int64_t timing_offset;     // same (but from options; not VO configured)
  
      int64_t delayed_count;
-@@ -851,9 +852,15 @@ bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts)
+@@ -856,9 +857,15 @@ bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts)
          next_pts -= in->timing_offset;
          next_pts -= in->flip_queue_offset;
          int64_t now = mp_time_ns();
@@ -51,7 +51,7 @@ index e3635b2..b109ee1 100644
              in->wakeup_pts = next_pts;
              // If we have to wait, update the vo thread's timer.
              if (!r)
-@@ -954,6 +961,10 @@ static bool render_frame(struct vo *vo)
+@@ -959,6 +966,10 @@ static bool render_frame(struct vo *vo)
  
      // Time at which we should flip_page on the VO.
      int64_t target = frame->display_synced ? 0 : pts - in->flip_queue_offset;
@@ -62,7 +62,7 @@ index e3635b2..b109ee1 100644
  
      // "normal" strict drop threshold.
      in->dropped_frame = duration >= 0 && end_time < now;
-@@ -1348,6 +1359,14 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames)
+@@ -1352,6 +1363,14 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames,
      mp_mutex_unlock(&in->lock);
  }
  
@@ -78,13 +78,13 @@ index e3635b2..b109ee1 100644
  {
      struct vo_internal *in = vo->in;
 diff --git a/video/out/vo.h b/video/out/vo.h
-index 160d860..18a3b0c 100644
+index f24918d..0882bb1 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
-@@ -549,6 +549,13 @@ void vo_event(struct vo *vo, int event);
- int vo_query_and_reset_events(struct vo *vo, int events);
+@@ -551,6 +551,13 @@ int vo_query_and_reset_events(struct vo *vo, int events);
  struct mp_image *vo_get_current_frame(struct vo *vo);
- void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames);
+ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames,
+                          int num_frame_refs);
 +// For VOs that present frames by their timestamp: accept a frame up to
 +// slack_ns before it is due if the core is awake anyway, and flip it at once
 +// instead of waiting for the flip queue offset. Saves the VO thread's timer
@@ -93,13 +93,13 @@ index 160d860..18a3b0c 100644
 +// the audio clock makes on most core wakeups. 0 disables.
 +void vo_set_queue_slack(struct vo *vo, int64_t slack_ns);
  int vo_get_num_req_frames(struct vo *vo);
+ int vo_get_num_frame_refs(struct vo *vo);
  double vo_get_vsync_interval(struct vo *vo);
- double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 50bf220..80d6b71 100644
+index ed31b8d..dadb5b5 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
-@@ -189,6 +189,7 @@ struct avfoundation_opts {
+@@ -264,6 +264,7 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
      bool composite_osd;
      bool pip_composite_osd;
      int queue_lead_ms;
@@ -107,7 +107,7 @@ index 50bf220..80d6b71 100644
      int presentation;
      int osd_max_height;
      bool osd_video_res;
-@@ -1490,6 +1491,7 @@ static void update_avfoundation_options(struct vo *vo)
+@@ -1573,6 +1574,7 @@ static void update_avfoundation_options(struct vo *vo)
      bool old_composite_osd = p->opts->composite_osd;
      bool old_pip_composite_osd = p->opts->pip_composite_osd;
      int old_queue_lead_ms = p->opts->queue_lead_ms;
@@ -115,24 +115,28 @@ index 50bf220..80d6b71 100644
      int old_osd_max_height = p->opts->osd_max_height;
      bool old_osd_video_res = p->opts->osd_video_res;
  
-@@ -1498,6 +1500,8 @@ static void update_avfoundation_options(struct vo *vo)
+@@ -1580,7 +1582,9 @@ static void update_avfoundation_options(struct vo *vo)
+         return;
  
      if (old_queue_lead_ms != p->opts->queue_lead_ms)
-         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+-        vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++        vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1, 2);
 +    if (old_queue_slack_ms != p->opts->queue_slack_ms)
 +        vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
  
      bool composite_changed =
          old_composite_osd != p->opts->composite_osd ||
-@@ -4221,6 +4225,7 @@ static int preinit(struct vo *vo)
+@@ -4365,7 +4369,8 @@ static int preinit(struct vo *vo)
+         displayLayer.controlTimebase = timebase;
      });
      [displayLayer release];
-     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+-    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1, 2);
 +    vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
      p->ready_queue = dispatch_queue_create("avfoundation ready",
          dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
                                                  QOS_CLASS_USER_INTERACTIVE, 0));
-@@ -4817,9 +4822,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -4965,9 +4970,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
      if (p->presentation_host) {
@@ -145,7 +149,7 @@ index 50bf220..80d6b71 100644
          p->last_host_present_ns = p->next_present_host_ns;
      }
      p->next_media_pts_valid = media_pts_is_valid(pts);
-@@ -5119,6 +5126,10 @@ static const struct m_option avfoundation_options[] = {
+@@ -5267,6 +5274,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
      {"composite-osd", OPT_BOOL(composite_osd)},
      {"pip-composite-osd", OPT_BOOL(pip_composite_osd)},
      {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000)},

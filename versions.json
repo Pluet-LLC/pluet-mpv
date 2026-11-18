@@ -14,11 +14,11 @@
   "components": {
     "mpv": {
       "kind": "git",
-      "version": "v0.41.0",
+      "version": "v0.42.0",
       "url": "https://github.com/mpv-player/mpv",
-      "ref": "v0.41.0",
-      "commit": "41f6a645068483470267271e1d09966ca3b9f413",
-      "provenance": "Tag carried over from main.swift; commit is the annotated tag's dereferenced target, resolved 2026-09-01 with `git ls-remote https://github.com/mpv-player/mpv 'refs/tags/v0.41.0*'` (peeled ^{} line).",
+      "ref": "v0.42.0",
+      "commit": "b0841e8c4d156b8403dc1876c4cbd9011eb583f3",
+      "provenance": "Resolved 2026-11-18 with `git ls-remote https://github.com/mpv-player/mpv 'refs/tags/v0.42.0*'`: annotated tag object b985c3634ef056b185e3f13c7ac597b3611f5774, peeled ^{} line b0841e8c4d156b8403dc1876c4cbd9011eb583f3 (released 2026-11-03).",
       "platforms": [
         "apple",
         "android",
@@ -544,8 +544,12 @@
           "provenance": "Same pin as overrides.android: official VideoLAN GitLab annotated tag object 719cc95244a1f1d648dd72459822e026e6530f22 (v7.360.1, PGP-signed by llyyr) dereferences to this root commit, and haasn/libplacebo reports the same tag object and commit. Gitlinks are identical to v7.360.0's. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way. Brings the OpenGL sync-object leak fix (mpv#12708) to this GL-only build."
         },
         "apple": {
-          "sha256": "aa8574c1160deb17863a82258d9a4289e5a5413ca3a58f5e3b12bd25e5585919",
-          "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 8484225 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match."
+          "kind": "git",
+          "version": "v7.387.0",
+          "url": "https://github.com/haasn/libplacebo",
+          "ref": "v7.387.0",
+          "commit": "275f7dea27924cdd34ab2e6c20e448b6bc4fab65",
+          "provenance": "mpv 0.42 needs libplacebo 7.387.0 or newer and no Apple prebuilt exists, so the apple driver builds it from source. Resolved 2026-11-18: haasn/libplacebo (upstream author's repository) and code.videolan.org/videolan/libplacebo both report annotated tag object 451d8ea5661c868562725e6500deda7fdd4e9a1e for v7.387.0, peeling to this commit. Its vendored 3rdparty submodules are cloned recursively at the commits that commit records."
         }
       }
     },

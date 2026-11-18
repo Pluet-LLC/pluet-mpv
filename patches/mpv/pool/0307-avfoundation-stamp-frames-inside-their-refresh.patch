@@ -274,10 +274,10 @@ while paused in one run; pacing at a start; and the classifiers.
 
 
 diff --git a/player/video.c b/player/video.c
-index 4d365a3..4c33302 100644
+index 41d183d..f5e7c43 100644
 --- a/player/video.c
 +++ b/player/video.c
-@@ -974,6 +974,23 @@ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
+@@ -1009,6 +1009,23 @@ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
              mpctx->speed_factor_v = 1.0;
              update_playback_speed(mpctx);
          }
@@ -302,7 +302,7 @@ index 4d365a3..4c33302 100644
          update_av_diff(mpctx, mpctx->time_frame > 0 ?
              mpctx->time_frame * mpctx->video_speed : 0);
 diff --git a/video/out/vo.c b/video/out/vo.c
-index b109ee1..664fd26 100644
+index 746162b..77cb28c 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -163,6 +163,8 @@ struct vo_internal {
@@ -314,7 +314,7 @@ index b109ee1..664fd26 100644
      int64_t timing_offset;     // same (but from options; not VO configured)
  
      int64_t delayed_count;
-@@ -1359,6 +1361,44 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames)
+@@ -1363,6 +1365,44 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames,
      mp_mutex_unlock(&in->lock);
  }
  
@@ -360,10 +360,10 @@ index b109ee1..664fd26 100644
  {
      struct vo_internal *in = vo->in;
 diff --git a/video/out/vo.h b/video/out/vo.h
-index 18a3b0c..8d6b293 100644
+index 0882bb1..fe4904c 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
-@@ -556,6 +556,10 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames);
+@@ -558,6 +558,10 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames,
  // the timer alone for target moves under 1 ms (or the slack, if less), which
  // the audio clock makes on most core wakeups. 0 disables.
  void vo_set_queue_slack(struct vo *vo, int64_t slack_ns);
@@ -372,10 +372,10 @@ index 18a3b0c..8d6b293 100644
 +void vo_set_audio_speed_applied(struct vo *vo, bool applied);
 +bool vo_get_audio_speed_applied(struct vo *vo);
  int vo_get_num_req_frames(struct vo *vo);
+ int vo_get_num_frame_refs(struct vo *vo);
  double vo_get_vsync_interval(struct vo *vo);
- double vo_get_estimated_vsync_interval(struct vo *vo);
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 2b644cd..ea6dae0 100644
+index b185cf1..c6fcfc8 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -49,6 +49,9 @@

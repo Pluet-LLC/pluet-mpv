@@ -24,7 +24,7 @@ Ported by Pluet, LLC onto Pluet's 0300 and 0307 (vo_avfoundation as
 they leave it); upstream: edde746/mpv-build d06e0ed. Applied unchanged in substance; only its context differed.
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index ce78119..4eab1f7 100644
+index 92c3371..c1180d2 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -4827,6 +4827,38 @@ static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,

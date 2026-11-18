@@ -20,7 +20,7 @@ edde746/plezy#2242 sign's composite stage drops from ~1 s to ~0.3 s per
 frame.
 
 diff --git a/sub/draw_bmp.c b/sub/draw_bmp.c
-index fe72a74..1cc6f87 100644
+index 9c22fdf..989de6d 100644
 --- a/sub/draw_bmp.c
 +++ b/sub/draw_bmp.c
 @@ -21,6 +21,11 @@

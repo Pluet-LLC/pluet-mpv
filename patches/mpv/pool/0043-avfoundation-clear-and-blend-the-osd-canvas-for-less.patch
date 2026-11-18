@@ -34,7 +34,7 @@ diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 index 50bf220..ed31b8d 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
-@@ -68,6 +68,81 @@ struct avf_osd_canvas {
+@@ -68,6 +68,81 @@
      struct mp_osd_res res;
  };
  
@@ -116,7 +116,7 @@ index 50bf220..ed31b8d 100644
  // --- avf osd ahead policy
  
  // How long flip_page may wait for its frame's subtitles before it enqueues
-@@ -466,11 +541,15 @@ struct priv {
+@@ -466,11 +541,15 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
      // backing surface lets the clear touch just those rows instead of the
      // whole display-sized buffer. The CFRetain on the surface pins its
      // pointer so an entry can never alias a different (recycled) surface.
@@ -135,7 +135,7 @@ index 50bf220..ed31b8d 100644
      int osd_buf_state_count;
  
      // OSD performance counters; accumulation is unconditional (cheap),
-@@ -479,6 +558,10 @@ struct priv {
+@@ -479,6 +558,10 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
          int renders, skipped, empty, frames;
          int64_t total_ns, max_ns;
          int64_t clear_ns, blend_ns, cg_ns, bounds_ns;
@@ -222,7 +222,7 @@ index 50bf220..ed31b8d 100644
              CFRelease(p->osd_buf_states[i].surf);
              p->osd_buf_states[i] = p->osd_buf_states[--p->osd_buf_state_count];
          } else {
-@@ -2334,42 +2434,45 @@ static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
+@@ -2334,42 +2434,45 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
          return NULL;
  
      int64_t now = mp_time_ns();

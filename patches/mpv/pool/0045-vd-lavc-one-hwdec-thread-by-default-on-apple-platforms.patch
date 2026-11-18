@@ -20,10 +20,10 @@ and 101 fps with videotoolbox-copy. The footprint drops 34% at 1080p
 and 20% at 4K, startup and seeks get faster, and no run dropped frames.
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index a1a3c29..d94950d 100644
+index 7815cee..2fbdfcf 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -1877,10 +1877,13 @@ Video
+@@ -1933,10 +1933,13 @@ Video
              Enable vdpau decoding for h264 and mpeg2 only.
  
  ``--hwdec-threads=<N>``
@@ -42,13 +42,13 @@ index a1a3c29..d94950d 100644
      If this is set to 0, the number of threads will be automatically determined
      by the number of CPU cores available.
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 2c681e5..4b7b76e 100644
+index 7b859c4..9d8c329 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
-@@ -171,7 +171,15 @@ const struct m_sub_options hwdec_conf = {
-         // for example, if vo_gpu increases the number of reference surfaces for
-         // interpolation, this value has to be increased too.
-         .hwdec_extra_frames = 6,
+@@ -175,7 +175,15 @@ const struct m_sub_options hwdec_conf = {
+         .hwdec_api = (char *[]){"no", NULL,},
+         .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx,apv",
+         .hwdec_extra_frames = -1,
 +#ifdef __APPLE__
 +        // VideoToolbox, the only hardware decoder there, decodes one frame
 +        // at a time: its hwaccels are not thread-safe, so frame threads gain

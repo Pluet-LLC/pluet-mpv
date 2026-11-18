@@ -26,10 +26,10 @@ The old code fails its lock check.
 
 
 diff --git a/sub/osd.c b/sub/osd.c
-index c6b7ce3..c35f88a 100644
+index 802ba50..fdf0f6c 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
-@@ -308,9 +308,27 @@ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
+@@ -310,9 +310,27 @@ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
      *next_start = MP_NOPTS_VALUE;
      *next_events = 0;
      *visible_end = MP_NOPTS_VALUE;
@@ -59,7 +59,7 @@ index c6b7ce3..c35f88a 100644
          if (!sub)
              continue;
          int events = 0;
-@@ -325,7 +343,13 @@ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
+@@ -327,7 +345,13 @@ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
          }
          *visible_end = MP_PTS_MIN(*visible_end, sub_get_visible_end(sub, pts));
      }

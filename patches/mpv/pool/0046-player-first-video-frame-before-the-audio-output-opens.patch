@@ -43,10 +43,10 @@ PLAYBACK_RESTART for the same rows: 92.8 -> 92.9 / 90.2 -> 91.2,
 124.1 -> 127.0 / 124.1 -> 125.3, 93.6 -> 97.7 / 89.0 -> 90.7.
 
 diff --git a/player/audio.c b/player/audio.c
-index e581066..565ada4 100644
+index c4745c3..b56d42e 100644
 --- a/player/audio.c
 +++ b/player/audio.c
-@@ -912,6 +912,22 @@ static void handle_ao_events(struct MPContext *mpctx)
+@@ -1073,6 +1073,22 @@ static void handle_ao_events(struct MPContext *mpctx)
      issue_refresh_seek(mpctx, MPSEEK_EXACT);
  }
  
@@ -69,7 +69,7 @@ index e581066..565ada4 100644
  void fill_audio_out_buffers(struct MPContext *mpctx)
  {
      struct MPOpts *opts = mpctx->opts;
-@@ -930,6 +946,8 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+@@ -1091,6 +1107,8 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
      }
  
      if (ao_c->filter->ao_needs_update) {
@@ -79,10 +79,10 @@ index e581066..565ada4 100644
              return;
      }
 diff --git a/player/core.h b/player/core.h
-index c3e0816..ac01925 100644
+index 49ed793..3d22546 100644
 --- a/player/core.h
 +++ b/player/core.h
-@@ -511,6 +511,7 @@ float audio_get_gain(struct MPContext *mpctx);
+@@ -546,6 +546,7 @@ float audio_get_gain(struct MPContext *mpctx);
  void audio_update_volume(struct MPContext *mpctx);
  void reload_audio_output(struct MPContext *mpctx);
  void audio_start_ao(struct MPContext *mpctx);
@@ -91,10 +91,10 @@ index c3e0816..ac01925 100644
  // configfiles.c
  void mp_parse_cfgfiles(struct MPContext *mpctx);
 diff --git a/player/playloop.c b/player/playloop.c
-index fa4bf44..50baad5 100644
+index 45beece..346e251 100644
 --- a/player/playloop.c
 +++ b/player/playloop.c
-@@ -1279,8 +1279,12 @@ void run_playloop(struct MPContext *mpctx)
+@@ -1350,8 +1350,12 @@ void run_playloop(struct MPContext *mpctx)
      if (mpctx->lavfi && mp_filter_has_failed(mpctx->lavfi))
          mpctx->stop_play = AT_END_OF_FILE;
  
@@ -105,5 +105,5 @@ index fa4bf44..50baad5 100644
 +    if (ao_waited && !audio_output_waits_for_video(mpctx))
 +        mp_wakeup_core(mpctx);
  
-     handle_playback_restart(mpctx);
+     handle_lazy_streams(mpctx);
  

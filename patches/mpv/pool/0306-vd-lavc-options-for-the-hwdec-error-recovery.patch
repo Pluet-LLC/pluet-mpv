@@ -20,10 +20,10 @@ defaults and counts the errored frames to a fallback for each case.
 
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index c39ab4f..749420d 100644
+index fdf0d23..e9b2ece 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -1898,6 +1898,20 @@ Video
+@@ -1954,6 +1954,20 @@ Video
      the number of packets that could not be decoded. Values below an unspecified
      count will not have this problem, because mpv retains the packets.
  
@@ -45,10 +45,10 @@ index c39ab4f..749420d 100644
      Check hardware decoder profile (default: yes). If ``no`` is set, the
      highest profile of the hardware decoder is unconditionally selected, and
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 58b9bcd..455877e 100644
+index 807c557..a0ede2d 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
-@@ -143,6 +143,8 @@ const struct m_sub_options vd_lavc_conf = {
+@@ -151,6 +151,8 @@ const struct m_sub_options vd_lavc_conf = {
  
  struct hwdec_opts {
      int software_fallback;
@@ -57,7 +57,7 @@ index 58b9bcd..455877e 100644
      char **hwdec_api;
      char *hwdec_codecs;
      int hwdec_image_format;
-@@ -165,12 +167,17 @@ const struct m_sub_options hwdec_conf = {
+@@ -173,12 +175,17 @@ const struct m_sub_options hwdec_conf = {
              {"no", INT_MAX}, {"yes", 1}), M_RANGE(1, INT_MAX),
              .flags = UPDATE_HWDEC},
          {"hwdec-threads", OPT_INT(hwdec_threads), M_RANGE(0, DBL_MAX)},
@@ -73,9 +73,9 @@ index 58b9bcd..455877e 100644
 +        .recover_keyframes = 2,
 +        .recover_max_frames = 240,
          .hwdec_api = (char *[]){"no", NULL,},
-         .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx",
-         // Maximum number of surfaces the player wants to buffer. This number
-@@ -1176,15 +1183,16 @@ static void prepare_decoding(struct mp_filter *vd)
+         .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx,apv",
+         .hwdec_extra_frames = -1,
+@@ -1235,15 +1242,16 @@ static void prepare_decoding(struct mp_filter *vd)
          reset_avctx(vd);
  }
  
@@ -101,7 +101,7 @@ index 58b9bcd..455877e 100644
  
  static void handle_err(struct mp_filter *vd)
  {
-@@ -1206,8 +1214,8 @@ static void handle_err(struct mp_filter *vd)
+@@ -1265,8 +1273,8 @@ static void handle_err(struct mp_filter *vd)
      // are content-triggered rather than a broken decoder: hold the fallback
      // until the burst survives whole keyframe intervals.
      if (!ctx->hwdec_notified ||

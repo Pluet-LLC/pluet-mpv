@@ -15,13 +15,13 @@ streams (MPEG-TS and the other formats it probes). The decoder still
 replaces either with its own answer once it runs.
 
 diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
-index 7013dbd..af067bd 100644
+index 1b9b087..be8d551 100644
 --- a/demux/demux_lavf.c
 +++ b/demux/demux_lavf.c
-@@ -705,6 +705,11 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+@@ -762,6 +762,11 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
          sh->codec->samplerate = codec->sample_rate;
          sh->codec->bitrate = codec->bit_rate;
-         sh->codec->format_name = talloc_strdup(sh, av_get_sample_fmt_name(codec->format));
+         sh->codec->format_name = talloc_strdup(sh->codec, av_get_sample_fmt_name(codec->format));
 +        // Stream probing parsed a frame already (DTS-HD MA vs. its lossy
 +        // core): publish that for every track, not only once a decoder
 +        // opens the selected one. A decoder still replaces it.
@@ -31,10 +31,10 @@ index 7013dbd..af067bd 100644
          double delay = 0;
          if (codec->sample_rate > 0)
 diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
-index 501d20e..97508a4 100644
+index d3e565e..262f64f 100644
 --- a/demux/demux_mkv.c
 +++ b/demux/demux_mkv.c
-@@ -2313,6 +2313,79 @@ static void probe_x264_garbage(demuxer_t *demuxer)
+@@ -2419,6 +2419,79 @@ static void probe_x264_garbage(demuxer_t *demuxer)
      }
  }
  
@@ -114,7 +114,7 @@ index 501d20e..97508a4 100644
  static int read_ebml_header(demuxer_t *demuxer)
  {
      mkv_demuxer_t *mkv_d = demuxer->priv;
-@@ -2524,6 +2597,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+@@ -2632,6 +2705,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
      if (mkv_d->opts->probe_duration)
          probe_last_timestamp(demuxer, start_pos);
      probe_x264_garbage(demuxer);

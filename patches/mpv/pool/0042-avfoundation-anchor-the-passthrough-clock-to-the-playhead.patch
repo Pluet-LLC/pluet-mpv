@@ -92,7 +92,7 @@ index f95525d..f583a8b 100644
      avp_update_transport(ao);
  }
 diff --git a/audio/out/buffer.c b/audio/out/buffer.c
-index a7e38f9..7c6f7d8 100644
+index 58e286e..f276740 100644
 --- a/audio/out/buffer.c
 +++ b/audio/out/buffer.c
 @@ -227,6 +227,21 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, b

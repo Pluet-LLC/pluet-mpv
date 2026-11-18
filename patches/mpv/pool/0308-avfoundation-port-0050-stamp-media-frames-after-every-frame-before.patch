@@ -32,7 +32,7 @@ Ported by Pluet, LLC onto Pluet's 0300 and 0307 (vo_avfoundation as
 they leave it); upstream: edde746/mpv-build 48129ba. The last stamp given is the one 0307's media snap leaves, when it moves one.
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index bb37950..cab8335 100644
+index 75c69fc..524f1e7 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -1926,6 +1926,10 @@ static void avf_phase_get(const struct avf_phase_stat *s, double period,

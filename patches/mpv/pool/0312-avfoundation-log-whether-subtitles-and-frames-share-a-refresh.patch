@@ -43,7 +43,7 @@ code is freestanding; scripts/test_avf_subref.sh checks it.
 LOCAL TEST ONLY: not pushed, not run on a device.
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 4eab1f7..b1d3939 100644
+index c1180d2..cff145f 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -371,6 +371,8 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
@@ -296,7 +296,7 @@ index 4eab1f7..b1d3939 100644
 +        subref_switches(vo, "changed");
 +
      if (old_queue_lead_ms != p->opts->queue_lead_ms)
-         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1, 2);
      if (old_queue_slack_ms != p->opts->queue_slack_ms)
 @@ -6458,6 +6671,531 @@ static CMSampleBufferRef create_osd_sample_buffer(struct vo *vo,
      return buf;

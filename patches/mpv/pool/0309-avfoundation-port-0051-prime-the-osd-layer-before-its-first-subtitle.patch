@@ -31,7 +31,7 @@ Ported by Pluet, LLC onto Pluet's 0300 and 0307 (vo_avfoundation as
 they leave it); upstream: edde746/mpv-build d7ac79e. Every frame's OSD hand-over goes through flip_enqueue_osd() (0307: after the video, or a slot ahead), so the primer goes there; 0049's present_pending_osd() is not in this series.
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index cab8335..19f2301 100644
+index 524f1e7..19384e9 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -6363,6 +6363,33 @@ static int64_t layer_time_ns(struct priv *p)

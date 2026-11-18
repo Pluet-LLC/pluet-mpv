@@ -10,7 +10,7 @@ index fd174fd..d5b25c8 100644
  #include "osdep/timer.h"
  #include "ta/ta_talloc.h"
  
-@@ -108,6 +109,30 @@ - (void)invalidate;
+@@ -101,6 +102,30 @@ - (void)invalidate;
      int avp_last_item_status;    // last logged AVPlayerItemStatus
      int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
      int avp_heartbeat;           // verbose position log divider
@@ -41,7 +41,7 @@ index fd174fd..d5b25c8 100644
  };
  
  #define IEC61937_HEADER_SIZE 8
-@@ -572,12 +598,92 @@ static void avp_teardown_item(struct ao *ao)
+@@ -544,12 +569,92 @@ static void avp_teardown_item(struct ao *ao)
      p->avp_start_seeked = false;
  }
  
@@ -134,7 +134,7 @@ index fd174fd..d5b25c8 100644
      CMBlockBufferRef block_buffer = NULL;
      CMSampleBufferRef sample_buffer = NULL;
      OSStatus err;
-@@ -678,6 +783,14 @@ static void start(struct ao *ao)
+@@ -649,6 +754,14 @@ static void start(struct ao *ao)
  
      p->end_time_av = -1;
      [p->synchronizer setRate:1];
@@ -149,7 +149,7 @@ index fd174fd..d5b25c8 100644
      [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
          feed(ao);
      }];
-@@ -697,6 +810,12 @@ static void stop(struct ao *ao)
+@@ -668,6 +781,12 @@ static void stop(struct ao *ao)
          [p->renderer stopRequestingMediaData];
          [p->renderer flush];
          [p->synchronizer setRate:0];
@@ -162,7 +162,7 @@ index fd174fd..d5b25c8 100644
      };
      if (dispatch_get_specific(&avfoundation_queue_key) == p)
          stop_block();
-@@ -736,7 +855,18 @@ static bool set_pause(struct ao *ao, bool paused)
+@@ -704,7 +823,18 @@ static bool set_pause(struct ao *ao, bool paused)
  
      if (paused) {
          [p->synchronizer setRate:0];
@@ -181,7 +181,7 @@ index fd174fd..d5b25c8 100644
          [p->synchronizer setRate:1];
      }
  
-@@ -990,6 +1120,35 @@ static int init(struct ao *ao)
+@@ -956,6 +1086,35 @@ static int init(struct ao *ao)
          goto error;
      }
  
@@ -217,7 +217,7 @@ index fd174fd..d5b25c8 100644
      if (ao->device && ao->device[0]) {
  #if TARGET_OS_OSX
          [p->renderer setAudioOutputDeviceUniqueID:(NSString*)cfstr_from_cstr(ao->device)];
-@@ -1054,6 +1213,13 @@ static int init(struct ao *ao)
+@@ -1020,6 +1179,13 @@ static int init(struct ao *ao)
          dispatch_release(p->avp_timer);
          p->avp_timer = NULL;
      }
@@ -231,7 +231,7 @@ index fd174fd..d5b25c8 100644
      if (p->loader) {
          [p->loader invalidate];
          [p->loader release];
-@@ -1093,6 +1259,19 @@ static void uninit(struct ao *ao)
+@@ -1059,6 +1225,19 @@ static void uninit(struct ao *ao)
          [p->player release];
          dispatch_release(p->queue);
      } else {
@@ -251,7 +251,7 @@ index fd174fd..d5b25c8 100644
          [p->renderer release];
          [p->synchronizer release];
          dispatch_release(p->queue);
-@@ -1123,4 +1302,19 @@ static void uninit(struct ao *ao)
+@@ -1089,4 +1268,19 @@ static void uninit(struct ao *ao)
      .set_pause      = set_pause,
      .list_devs      = ca_get_device_list,
      .priv_size      = sizeof(struct priv),

@@ -10,9 +10,10 @@ No other libass feature is turned on here, so everything else stays at its
 upstream default, as on the ExoPlayer path.
 
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index 252ab54..448a33d 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
-@@ -261,6 +270,10 @@ static void assobjects_init(struct sd *sd)
+@@ -270,6 +270,10 @@ static void assobjects_init(struct sd *sd)
  
      ctx->ass_track = ass_new_track(ctx->ass_library);
      ctx->ass_track->track_type = TRACK_TYPE_ASS;

@@ -28,7 +28,7 @@ do {
         BuildVulkan(),
         ZipBaseBuild(library: .libshaderc),
         ZipBaseBuild(library: .lcms2),
-        ZipBaseBuild(library: .libplacebo),
+        BuildPlacebo(),
         ZipBaseBuild(library: .libdav1d),
         BuildFFMPEG(),
 
@@ -334,6 +334,12 @@ private class BuildMPV: BaseBuild {
             "-Dmoltenvk=enabled",  // from patch option
 
             "-Djavascript=disabled",
+            // mpv 0.42's libcurl stream backend stays off: Apple has no
+            // libcurl to link, and network files keep FFmpeg's http
+            // protocol with its keep-alive patches (ffmpeg 0080, 0081; mpv
+            // 0241). subrandr (0.42) has no Apple build either.
+            "-Dlibcurl=disabled",
+            "-Dsubrandr=disabled",
             "-Dzimg=disabled",
             "-Djpeg=disabled",
             "-Dvapoursynth=disabled",
@@ -657,6 +663,33 @@ private class BuildFFMPEG: BaseBuild {
         "--enable-filter=vflip_vulkan", "--enable-filter=xfade_vulkan",
     ]
 
+}
+
+/// libplacebo from source: mpv 0.42 needs 7.387.0 or newer and there is no
+/// Apple prebuilt of it. Configured as the published mpvkit build was
+/// (OpenGL, Vulkan through MoltenVK, shaderc, lcms2, libdovi), static; its
+/// vendored 3rdparty submodules come with the recursive clone.
+private class BuildPlacebo: BaseBuild {
+    init() {
+        super.init(library: .libplacebo)
+    }
+
+    override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
+        [
+            "-Dopengl=enabled",
+            "-Dvulkan=enabled",
+            "-Dshaderc=enabled",
+            "-Dlcms=enabled",
+            "-Ddovi=enabled",
+            "-Dlibdovi=enabled",
+            "-Dxxhash=disabled",
+            "-Dunwind=disabled",
+            "-Dglslang=disabled",
+            "-Dd3d11=disabled",
+            "-Ddemos=false",
+            "-Dtests=false",
+        ]
+    }
 }
 
 private class BuildASS: BaseBuild {

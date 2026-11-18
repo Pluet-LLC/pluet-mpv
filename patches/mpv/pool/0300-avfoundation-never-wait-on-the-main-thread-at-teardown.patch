@@ -44,7 +44,7 @@ timing out and its late completion, and the OSD layer handoff.
 
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index a3d3e19..2b644cd 100644
+index dadb5b5..b185cf1 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -48,6 +48,7 @@
@@ -723,7 +723,7 @@ index a3d3e19..2b644cd 100644
 +        avf_link_refresh_geometry(link);
      });
 -    [displayLayer release];
-     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1, 2);
      vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
      p->ready_queue = dispatch_queue_create("avfoundation ready",
 @@ -4392,62 +4744,6 @@ static int preinit(struct vo *vo)

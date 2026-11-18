@@ -667,10 +667,10 @@ index 0000000..a7fd3f1
 +    return strdup(String(describing: failure))
 +}
 diff --git a/audio/out/buffer.c b/audio/out/buffer.c
-index 277b524..a7e38f9 100644
+index 3e80b2b..58e286e 100644
 --- a/audio/out/buffer.c
 +++ b/audio/out/buffer.c
-@@ -685,8 +685,11 @@ static bool ao_play_data(struct ao *ao)
+@@ -689,8 +689,11 @@ static bool ao_play_data(struct ao *ao)
      MP_TRACE(ao, "in=%d space=%d(%d) pl=%d, eof=%d\n",
               samples, space, state.free_samples, p->playing, got_eof);
  
@@ -681,8 +681,8 @@ index 277b524..a7e38f9 100644
          goto eof;
 +    }
  
-     return samples > 0 && (samples < space || ao->untimed);
- 
+     // For ao_drain(), an untimed AO took everything.
+     if (ao->untimed && !samples)
 diff --git a/audio/out/internal.h b/audio/out/internal.h
 index 85fa777..7b64ea3 100644
 --- a/audio/out/internal.h
@@ -702,7 +702,7 @@ index 85fa777..7b64ea3 100644
      // Return the list of devices currently available in the system. Use
      // ao_device_list_add() to add entries. The selected device will be set as
 diff --git a/common/global.h b/common/global.h
-index c05b70e..7a029b0 100644
+index 6cdbea5..14d78c8 100644
 --- a/common/global.h
 +++ b/common/global.h
 @@ -1,6 +1,8 @@
@@ -714,10 +714,11 @@ index c05b70e..7a029b0 100644
  // This should be accessed by glue code only, never normal code.
  // The only purpose of this is to make mpv library-safe.
  // Think hard before adding new members.
-@@ -11,6 +13,9 @@ struct mpv_global {
-     char *configdir;
+@@ -12,6 +14,10 @@ struct mpv_global {
      struct stats_base *stats;
      struct demux_packet_pool *packet_pool;
+     struct curl_ctx *curl;
++
 +    // Per-player failure state must survive destruction/recreation of its AO.
 +    // Only ao_spatial reads/writes it (on the AO and player threads).
 +    atomic_bool spatial_format_latch[2];
@@ -725,10 +726,10 @@ index c05b70e..7a029b0 100644
  
  #endif
 diff --git a/meson.build b/meson.build
-index 04ed6b0..5748825 100644
+index dfccfd0..7bed62e 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -824,6 +824,14 @@ if features['avfoundation']
+@@ -868,6 +868,14 @@ if features['avfoundation']
      sources += files('audio/out/ao_avfoundation.m')
  endif
  
@@ -744,20 +745,20 @@ index 04ed6b0..5748825 100644
                               'CoreImage', 'QuartzCore', 'Metal']
  if cc.has_header('UIKit/UIKit.h')
 diff --git a/meson.options b/meson.options
-index 1ac622a..289c8ea 100644
+index 2cbe3e0..d24cc6a 100644
 --- a/meson.options
 +++ b/meson.options
-@@ -126,3 +126,5 @@ option('win32-subsystem', type : 'string', value: 'windows', description : 'Wind
+@@ -130,3 +130,5 @@ option('win32-subsystem', type : 'string', value: 'windows', description : 'Wind
  option('html-build', type: 'feature', value: 'disabled', description: 'HTML manual generation')
  option('manpage-build', type: 'feature', value: 'auto', description: 'manpage generation')
  option('pdf-build', type: 'feature', value: 'disabled', description: 'PDF manual generation')
 +
 +option('spatial-audio', type: 'feature', value: 'auto', description: 'TrueHD Atmos and DTS:X through SpatialAudioBridge')
 diff --git a/player/main.c b/player/main.c
-index 37eb6b1..51acf4d 100644
+index 2fbb19d..3e40979 100644
 --- a/player/main.c
 +++ b/player/main.c
-@@ -285,6 +285,8 @@ struct MPContext *mp_create(void)
+@@ -289,6 +289,8 @@ struct MPContext *mp_create(void)
      mp_mutex_init(&mpctx->abort_lock);
  
      mpctx->global = talloc_zero(mpctx, struct mpv_global);

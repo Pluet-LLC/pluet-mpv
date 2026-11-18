@@ -43,10 +43,10 @@ With initial_request_size=524288 the mkvmerge resume is one connection:
 not change (180 -> 177 ms at 40 ms).
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 817290d..48c2010 100644
+index c2bac78..5b126d1 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -8105,6 +8105,24 @@ Miscellaneous
+@@ -8503,6 +8503,24 @@ Miscellaneous
      other options such as e.g. user agent are not available with all protocols,
      and printing errors for unknown options would end up being too noisy.)
  
@@ -72,10 +72,10 @@ index 817290d..48c2010 100644
  
  ``--backdrop-type=<auto|none|mica|acrylic|mica-alt>``
 diff --git a/stream/stream_lavf.c b/stream/stream_lavf.c
-index 7910b82..3e3c102 100644
+index 67723c2..85f8876 100644
 --- a/stream/stream_lavf.c
 +++ b/stream/stream_lavf.c
-@@ -404,6 +404,18 @@ static int open_f(stream_t *stream)
+@@ -389,6 +389,18 @@ static int open_f(stream_t *stream)
      av_dict_set(&dict, "reconnect", "1", 0);
      av_dict_set(&dict, "reconnect_delay_max", "7", 0);
  
@@ -93,4 +93,4 @@ index 7910b82..3e3c102 100644
 +
      mp_setup_av_network_options(&dict, NULL, stream->global, stream->log);
  
-     AVIOInterruptCB cb = {
+ #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION

@@ -109,10 +109,10 @@ index 61f56a5..b0ff14f 100644
          av_log_set_callback(av_log_default_callback);
          TA_FREEP(&log_instances);
 diff --git a/common/msg.c b/common/msg.c
-index 542f76d..22c9ecc 100644
+index 821d403..e9cc6bf 100644
 --- a/common/msg.c
 +++ b/common/msg.c
-@@ -127,6 +127,15 @@ struct mp_log_buffer {
+@@ -128,6 +128,15 @@ struct mp_log_buffer {
  static const struct mp_log null_log = {0};
  struct mp_log *const mp_null_log = (struct mp_log *)&null_log;
  
@@ -128,7 +128,7 @@ index 542f76d..22c9ecc 100644
  static bool match_mod(const char *name, const char *mod)
  {
      if (!strcmp(mod, "all"))
-@@ -802,6 +811,7 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
+@@ -901,6 +910,7 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
      m_option_type_msglevels.copy(NULL, &root->msg_levels, &opts->msg_levels);
  
      atomic_fetch_add(&root->reload_counter, 1);
@@ -136,7 +136,7 @@ index 542f76d..22c9ecc 100644
      mp_mutex_unlock(&root->lock);
  
      if (check_new_path(global, opts->log_file, &root->log_path)) {
-@@ -1009,6 +1019,7 @@ struct mp_log_buffer *mp_msg_log_buffer_new(struct mpv_global *global,
+@@ -1111,6 +1121,7 @@ struct mp_log_buffer *mp_msg_log_buffer_new(struct mpv_global *global,
      MP_TARRAY_APPEND(root, root->buffers, root->num_buffers, buffer);
  
      atomic_fetch_add(&root->reload_counter, 1);
@@ -144,7 +144,7 @@ index 542f76d..22c9ecc 100644
      mp_mutex_unlock(&root->lock);
  
      return buffer;
-@@ -1082,6 +1093,7 @@ found:
+@@ -1184,6 +1195,7 @@ found:
      talloc_free(buffer);
  
      atomic_fetch_add(&root->reload_counter, 1);
@@ -153,7 +153,7 @@ index 542f76d..22c9ecc 100644
  }
  
 diff --git a/common/msg.h b/common/msg.h
-index 61ae28d..cdc33ce 100644
+index d7c003e..fada626 100644
 --- a/common/msg.h
 +++ b/common/msg.h
 @@ -60,6 +60,10 @@ void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)

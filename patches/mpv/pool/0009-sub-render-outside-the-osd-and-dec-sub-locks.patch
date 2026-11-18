@@ -32,10 +32,10 @@ reports nothing. The sign is still late by the render time; that is
 libass cost, and no longer the player's.
 
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
-index 118221a..d60da5c 100644
+index 33b3878..5160296 100644
 --- a/sub/dec_sub.c
 +++ b/sub/dec_sub.c
-@@ -73,6 +73,23 @@ struct dec_sub {
+@@ -80,6 +80,23 @@ struct dec_sub {
      double last_vo_pts;
      struct sd *sd;
  
@@ -59,7 +59,7 @@ index 118221a..d60da5c 100644
      struct demux_packet *new_segment;
      struct demux_packet **cached_pkts;
      int cached_pkt_pos;
-@@ -137,6 +154,38 @@ static void destroy_cached_pkts(struct dec_sub *sub)
+@@ -144,6 +161,38 @@ static void destroy_cached_pkts(struct dec_sub *sub)
      sub->num_cached_pkts = 0;
  }
  
@@ -98,7 +98,7 @@ index 118221a..d60da5c 100644
  void sub_destroy(struct dec_sub *sub)
  {
      if (!sub)
-@@ -147,6 +196,7 @@ void sub_destroy(struct dec_sub *sub)
+@@ -154,6 +203,7 @@ void sub_destroy(struct dec_sub *sub)
          sub->sd->driver->uninit(sub->sd);
      }
      talloc_free(sub->sd);
@@ -106,7 +106,7 @@ index 118221a..d60da5c 100644
      mp_mutex_destroy(&sub->lock);
      talloc_free(sub);
  }
-@@ -209,6 +259,7 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+@@ -218,6 +268,7 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
      sub->opts = sub->opts_cache->opts;
      sub->shared_opts = sub->shared_opts_cache->opts;
      mp_mutex_init(&sub->lock);
@@ -114,7 +114,7 @@ index 118221a..d60da5c 100644
  
      sub->sd = init_decoder(sub);
      if (sub->sd) {
-@@ -261,6 +312,7 @@ bool sub_can_preload(struct dec_sub *sub)
+@@ -270,6 +321,7 @@ bool sub_can_preload(struct dec_sub *sub)
  void sub_preload(struct dec_sub *sub)
  {
      mp_mutex_lock(&sub->lock);
@@ -122,7 +122,7 @@ index 118221a..d60da5c 100644
  
      struct mp_dispatch_queue *demux_waiter = mp_dispatch_create(NULL);
      demux_set_stream_wakeup_cb(sub->sh, wakeup_demux, demux_waiter);
-@@ -338,16 +390,25 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+@@ -347,16 +399,25 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
  {
      *packets_read = true;
      mp_mutex_lock(&sub->lock);
@@ -150,7 +150,7 @@ index 118221a..d60da5c 100644
              sub->last_vo_pts = video_pts;
              update_segment(sub);
          }
-@@ -381,12 +442,20 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+@@ -390,12 +451,20 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
          if (is_new_segment(sub, pkt)) {
              sub->new_segment = demux_copy_packet(sub->packet_pool, pkt);
              // Note that this can be delayed to a much later point in time.
@@ -174,7 +174,7 @@ index 118221a..d60da5c 100644
      }
      if (sub->cached_pkts && sub->num_cached_pkts) {
          bool visible = is_packet_visible(sub->cached_pkts[sub->cached_pkt_pos], video_pts);
-@@ -401,6 +470,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+@@ -410,6 +479,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
  void sub_redecode_cached_packets(struct dec_sub *sub)
  {
      mp_mutex_lock(&sub->lock);
@@ -182,7 +182,7 @@ index 118221a..d60da5c 100644
      int index = sub->cached_pkt_pos;
      while (index < sub->num_cached_pkts) {
          sub->sd->driver->decode(sub->sd, sub->cached_pkts[index]);
-@@ -410,10 +480,18 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
+@@ -419,10 +489,18 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
  }
  
  // Unref sub_bitmaps.rc to free the result. May return NULL.
@@ -201,7 +201,7 @@ index 118221a..d60da5c 100644
  
      pts = pts_to_subtitle(sub, pts);
  
-@@ -424,7 +502,18 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+@@ -433,7 +511,18 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
  
      if (!(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
          sub->sd->driver->get_bitmaps)
@@ -221,7 +221,7 @@ index 118221a..d60da5c 100644
  
      mp_mutex_unlock(&sub->lock);
      return res;
-@@ -434,6 +523,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+@@ -443,6 +532,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
  char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
  {
      mp_mutex_lock(&sub->lock);
@@ -229,7 +229,7 @@ index 118221a..d60da5c 100644
      char *text = NULL;
  
      pts = pts_to_subtitle(sub, pts);
-@@ -464,6 +554,7 @@ done:
+@@ -473,6 +563,7 @@ done:
  struct sd_times sub_get_times(struct dec_sub *sub, double pts)
  {
      mp_mutex_lock(&sub->lock);
@@ -237,7 +237,7 @@ index 118221a..d60da5c 100644
      struct sd_times res = { .start = MP_NOPTS_VALUE, .end = MP_NOPTS_VALUE };
  
      pts = pts_to_subtitle(sub, pts);
-@@ -481,6 +572,7 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+@@ -490,6 +581,7 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
  void sub_reset(struct dec_sub *sub)
  {
      mp_mutex_lock(&sub->lock);
@@ -245,7 +245,7 @@ index 118221a..d60da5c 100644
      if (sub->sd->driver->reset)
          sub->sd->driver->reset(sub->sd);
      sub->last_pkt_pts = MP_NOPTS_VALUE;
-@@ -494,6 +586,7 @@ void sub_reset(struct dec_sub *sub)
+@@ -503,6 +595,7 @@ void sub_reset(struct dec_sub *sub)
  void sub_select(struct dec_sub *sub, bool selected)
  {
      mp_mutex_lock(&sub->lock);
@@ -253,7 +253,7 @@ index 118221a..d60da5c 100644
      if (sub->sd->driver->select)
          sub->sd->driver->select(sub->sd, selected);
      mp_mutex_unlock(&sub->lock);
-@@ -503,6 +596,22 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
+@@ -512,6 +605,22 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
  {
      int r = CONTROL_UNKNOWN;
      mp_mutex_lock(&sub->lock);
@@ -277,10 +277,10 @@ index 118221a..d60da5c 100644
      switch (cmd) {
      case SD_CTRL_SET_VIDEO_DEF_FPS:
 diff --git a/sub/osd.c b/sub/osd.c
-index 2788897..8c1d392 100644
+index 0a073bd..76a51d2 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
-@@ -167,6 +167,7 @@ struct osd_state *osd_create(struct mpv_global *global)
+@@ -168,6 +168,7 @@ struct osd_state *osd_create(struct mpv_global *global)
          .stats = stats_ctx_create(osd, global, "osd"),
      };
      mp_mutex_init(&osd->lock);
@@ -288,7 +288,7 @@ index 2788897..8c1d392 100644
      osd->opts = osd->opts_cache->opts;
  
      for (int n = 0; n < MAX_OSD_PARTS; n++) {
-@@ -186,12 +187,25 @@ struct osd_state *osd_create(struct mpv_global *global)
+@@ -187,13 +188,26 @@ struct osd_state *osd_create(struct mpv_global *global)
      return osd;
  }
  
@@ -309,12 +309,13 @@ index 2788897..8c1d392 100644
 +    wait_sub_render_done(osd);
 +    mp_mutex_unlock(&osd->lock);
      osd_destroy_backend(osd);
-     talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->external2);
+     talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->image_overlay);
+     talloc_free(osd->objs[OSDTYPE_DISC_MENU]->image_overlay);
 +    mp_cond_destroy(&osd->sub_render_done);
      mp_mutex_destroy(&osd->lock);
      talloc_free(osd);
  }
-@@ -214,6 +228,9 @@ void osd_set_text(struct osd_state *osd, const char *text)
+@@ -216,6 +230,9 @@ void osd_set_text(struct osd_state *osd, const char *text)
  void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
  {
      mp_mutex_lock(&osd->lock);
@@ -324,7 +325,7 @@ index 2788897..8c1d392 100644
      if (index >= 0 && index < 2) {
          struct osd_object *obj = osd->objs[OSDTYPE_SUB + index];
          obj->sub = dec_sub;
-@@ -324,12 +341,28 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+@@ -327,12 +344,28 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
  
      check_obj_resize(osd, osdres, obj);
  
@@ -356,14 +357,14 @@ index 2788897..8c1d392 100644
 +            osd->sub_render_busy = false;
 +            mp_cond_broadcast(&osd->sub_render_done);
 +        }
-     } else if (obj->type == OSDTYPE_EXTERNAL2) {
-         if (obj->external2 && obj->external2->format) {
-             res = sub_bitmaps_copy(NULL, obj->external2); // need to be owner
+     } else if (obj->type == OSDTYPE_EXTERNAL2 ||
+                obj->type == OSDTYPE_DISC_MENU) {
+         if (obj->image_overlay && obj->image_overlay->format) {
 diff --git a/sub/osd_state.h b/sub/osd_state.h
-index ef0ff20..1f8a8f9 100644
+index 57bd565..44ed1aa 100644
 --- a/sub/osd_state.h
 +++ b/sub/osd_state.h
-@@ -70,6 +70,11 @@ struct osd_state {
+@@ -72,6 +72,11 @@ struct osd_state {
  
      struct osd_object *objs[MAX_OSD_PARTS];
  
