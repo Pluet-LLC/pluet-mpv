@@ -77,3 +77,7 @@
 # Measurement only: whether subtitles and their frames share a refresh,
 # logged at the verbose level (test_avf_subref.sh).
 0312-avfoundation-log-whether-subtitles-and-frames-share-a-refresh.patch
+# Upstream 0056 (restart frames: subtitles and lead after a start, seek or
+# resume) behind --avfoundation-restart-frames, default off; every auto
+# pacing decision logged.
+0313-avfoundation-restart-frames-switch-and-pace-decision-log.patch

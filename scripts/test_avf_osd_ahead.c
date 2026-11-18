@@ -55,6 +55,15 @@ int main(void)
     int64_t composite = avf_osd_wait_until(now, now + lead, lead, true, true, true);
     check(composite > now + lead, "a composite frame waits for its subtitles");
 
+    // --avfoundation-restart-frames (0313): a restart frame waits at least
+    // 25 ms, behind or not, and its whole deadline when not behind.
+    check(avf_osd_restart_wait_until(now, now + lead, lead, true) == now + 25 * MS,
+          "a restart frame behind waits the least");
+    check(avf_osd_restart_wait_until(now, now + lead, lead, false) == now + lead / 2,
+          "a restart frame not behind waits to its deadline");
+    check(avf_osd_restart_wait_until(now, now + 10 * MS, lead, false) == now + 25 * MS,
+          "a restart frame past its deadline still waits the least");
+
     if (failures)
         return 1;
     printf("avfoundation subtitle wait policy: all checks passed\n");

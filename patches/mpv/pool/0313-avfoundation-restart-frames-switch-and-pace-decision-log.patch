@@ -1,0 +1,437 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vo_avfoundation: upstream 0056's restart frames behind a
+ switch (default off); log every auto pacing decision
+
+Upstream (edde746/mpv-build ff1e806, patch 0056): after a seek the third
+and fourth frames went to the layers without their subtitles, and at a
+resume the first frame reached the layers too late for the video layer but
+not the OSD layer (Plezy's HDMI captures on a 3rd generation Apple TV 4K).
+Ported onto 0307 behind --avfoundation-restart-frames (default no: every
+path below is skipped and the VO and vo.c behave as before):
+
+- for the first 8 timed frames after the start, a seek or a resume, a frame
+  waits for its own subtitles at least 25 ms, behind or not, and as long as
+  its deadline allows while the render thread is not behind, until one such
+  wait runs out (avf_osd_restart_wait_until());
+- such a frame whose refresh is then less than 3.5 refreshes past its
+  hand-over is stamped whole refreshes later (avf_host_restart_stamp_ns()).
+  0307 holds the hand-over for its pacing point, under a refresh after the
+  stamp is made, so the hand-over is taken as a refresh from now; 0307's
+  pacing stamp moves with it. The frames after follow it as any frame does
+  (avf_host_present_ns()). With 0307's short lead (1.3 to 2.3 refreshes) the
+  ninth frame then comes back to the ordinary schedule, so a frame or two
+  share a refresh there; the switch is meant to be tried with a long queue
+  lead as well as without;
+- vo.c tells the driver of a pause or a resume under the lock that picks
+  the frame, before drawing it, when the driver asks (vo->pause_with_frame,
+  set from the switch); otherwise as before.
+
+The upstream 0054 display link is not taken: 0307's refresh clock gives the
+grid. Upstream's change to 0049's deferred OSD lists is not needed (0049 is
+not in this series).
+
+Logged (verbose level): the switch in the "switches" line and run tag
+(r0/r1); "restart-frames after <start|seek|unpause>: N moved by R
+refreshes, W waited (G gave up)" when a window ends; and every auto pacing
+decision, "vsync-snap pace moved|held|settled: <from> -> <to>; window shown
+N dropped D (S set aside), stay before; <s> after <start|seek|unpause>", so
+a point moved on a misread after a seek is visible.
+
+Host tests: test_avf_osd_ahead.sh (restart waits), test_avf_subref.sh
+(restart stamp).
+
+LOCAL TEST ONLY: not pushed, not run on a device.
+
+diff --git a/video/out/vo.c b/video/out/vo.c
+index 664fd26..7214bb2 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -142,6 +142,7 @@ struct vo_internal {
+     bool want_redraw;               // redraw request from VO to player
+     bool send_reset;                // send VOCTRL_RESET
+     bool paused;
++    bool driver_paused;             // what the driver was told last (VO thread)
+     bool visible;
+     bool wakeup_on_done;
+     int queued_events;              // event mask for the user
+@@ -937,6 +938,18 @@ static bool render_frame(struct vo *vo)
+ 
+     mp_mutex_lock(&in->lock);
+ 
++    // A driver that asks for it (vo_avfoundation's after-seek switch,
++    // upstream 0056) hears of a pause or a resume before the frame picked
++    // under the same lock: the first frame after an unpause can be queued
++    // before the VO thread wakes, and was drawn ahead of the resume, as if
++    // still paused.
++    while (vo->pause_with_frame && in->driver_paused != in->paused) {
++        in->driver_paused = in->paused;
++        mp_mutex_unlock(&in->lock);
++        vo->driver->control(vo, in->driver_paused ? VOCTRL_PAUSE : VOCTRL_RESUME, NULL);
++        mp_mutex_lock(&in->lock);
++    }
++
+     if (in->frame_queued) {
+         talloc_free(in->current_frame);
+         in->current_frame = in->frame_queued;
+@@ -1136,7 +1149,6 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+ {
+     struct vo *vo = ptr;
+     struct vo_internal *in = vo->in;
+-    bool vo_paused = false;
+ 
+     mp_thread_set_name("vo");
+     mp_av_log_set_thread(vo->global);
+@@ -1192,8 +1204,9 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+         bool redraw = in->request_redraw;
+         bool send_reset = in->send_reset;
+         in->send_reset = false;
+-        bool send_pause = in->paused != vo_paused;
+-        vo_paused = in->paused;
++        bool send_pause = in->paused != in->driver_paused;
++        in->driver_paused = in->paused;
++        bool vo_paused = in->driver_paused;
+         mp_mutex_unlock(&in->lock);
+ 
+         if (send_reset)
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 8d6b293..2c90b22 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -483,6 +483,11 @@ struct vo {
+ 
+     bool probing;
+ 
++    // Set by the driver on the VO thread: tell it of a pause or a resume
++    // under the lock that picks the frame, before drawing it (see
++    // render_frame()), instead of after the frame drawn in that iteration.
++    bool pause_with_frame;
++
+     // --- The following fields are only changed with vo_reconfig(), and can
+     //     be accessed unsynchronized (read-only).
+ 
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index b1d3939..64752ef 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -264,6 +264,22 @@ static int64_t avf_osd_wait_until(int64_t now, int64_t present_ns,
+     return until > now ? until : 0;
+ }
+ 
++// --avfoundation-restart-frames (upstream 0056, ported; off by default): each
++// of the first AVF_RESTART_FRAMES timed frames after the start, a seek or a
++// resume waits for its own subtitles at least AVF_OSD_RESTART_WAIT_NS,
++// behind or not, and as long as its deadline allows while the render thread
++// is not behind, until one such wait runs out (after a seek the third and
++// fourth frames went out without theirs on Plezy's Apple TV).
++#define AVF_OSD_RESTART_WAIT_NS INT64_C(25000000)
++
++static int64_t avf_osd_restart_wait_until(int64_t now, int64_t present_ns,
++                                          int64_t queue_lead_ns, bool behind)
++{
++    int64_t until = present_ns - queue_lead_ns / 2;
++    int64_t least = now + AVF_OSD_RESTART_WAIT_NS;
++    return !behind && until > least ? until : least;
++}
++
+ // --- end avf osd ahead policy
+ 
+ // --- avf shader target (host-testable; keep freestanding) ---
+@@ -373,6 +389,7 @@ static bool avf_shader_target(int frame_w, int frame_h, int p_w, int p_h,
+     bool expect_monotonic;
+     bool subref_look;
+     int subref_report;
++    bool restart_frames;
+ };
+ 
+ // --avfoundation-vsync-snap: stamps placed inside their refresh (yes), left
+@@ -2119,6 +2136,16 @@ static bool avf_subref_predict(double lead_v, double lead_o, bool crossed)
+     // Media mode: the snapped stamp for the next frame, in media time.
+     int64_t next_media_stamp_ns;
+     bool next_media_stamp_valid;
++    // --avfoundation-restart-frames: timed frames left in the window after
++    // the start, a seek or a resume, whether the frame being drawn is one,
++    // whether restart frames still wait for their subtitles, and the frames
++    // it moved and by how many refreshes (for the log).
++    int restart_left;
++    bool next_restart;
++    bool restart_wait;
++    int restart_moved, restart_moved_refreshes, restart_waits, restart_gave_up;
++    int64_t last_restart_ns;        // last start, seek or resume (any switch)
++    const char *last_restart_kind;
+     // Measurement only: subtitle and video on the same refresh? (see
+     // "subtitle refresh match: the VO's side")
+     struct avf_subref subref;
+@@ -2962,6 +2989,36 @@ static int64_t avf_media_stamp_offset(int64_t offset_ns, int64_t last_stamp_ns,
+ }
+ // --- end avf media stamp ---
+ 
++// --- avf restart stamp (host-testable; keep freestanding) ---
++// --avfoundation-restart-frames (upstream 0056, ported onto 0307): a sample
++// that reaches the layers less than about three refreshes before the refresh
++// its stamp asks for (the first link instant at or after it) can show a
++// refresh late in the video layer and not in the OSD layer (Plezy's HDMI
++// captures). For the first AVF_RESTART_FRAMES timed frames after the start, a
++// seek or a resume, a stamp whose refresh comes less than 3.5 refreshes
++// after the hand-over moves on by whole refreshes until it does not; the
++// frames after follow it (avf_host_present_ns()). 0307 holds the hand-over
++// for its pacing point, under a refresh after the stamp is made, so the
++// hand-over is taken as handover_ns = now + a refresh. A period of 0 leaves
++// the stamp as it is.
++#define AVF_RESTART_FRAMES 8
++
++static int64_t avf_host_restart_stamp_ns(int64_t stamp_ns, int64_t handover_ns,
++                                         int64_t vsync_ns, int64_t period_ns)
++{
++    if (period_ns <= 0)
++        return stamp_ns;
++    int64_t rest_ns = (stamp_ns - vsync_ns) % period_ns;
++    if (rest_ns < 0)
++        rest_ns += period_ns;
++    int64_t refresh_ns = rest_ns ? stamp_ns + period_ns - rest_ns : stamp_ns;
++    int64_t min_ns = handover_ns + period_ns * 7 / 2;
++    if (refresh_ns >= min_ns)
++        return stamp_ns;
++    return stamp_ns + (min_ns - refresh_ns + period_ns - 1) / period_ns * period_ns;
++}
++// --- end avf restart stamp ---
++
+ // Slack over queue-lead-ms for avf_host_present_ns()'s window: how far ahead
+ // of a new frame's target an already queued frame can be stamped.
+ #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
+@@ -3329,8 +3386,23 @@ static void vsync_snap_report(struct vo *vo, int64_t now)
+         for (int i = 0; i < st->osd_marks; i++)
+             w.osd_at_s[w.osd_marks++] = st->osd_at_s[i];
+         st->pace_irregular = w.steady && w.slot_irregular;
++        double before_phase = p->vsync_pace.phase;
++        bool before_held = p->vsync_pace.held;
++        int64_t stay_frames = p->vsync_pace.frames, stay_drops = p->vsync_pace.drops;
+         int r = avf_vsync_pace_judge(&p->vsync_pace, &w, &st->pace_excused);
+         moved_pace = r == 1;
++        // Every decision of auto pacing, with what it saw and how long after
++        // the last start, seek or resume, so a misread after one shows.
++        if (r) {
++            double since = p->last_restart_ns ? (now - p->last_restart_ns) / 1e9 : -1;
++            MP_VERBOSE(vo, "vsync-snap pace %s: %.3f -> %.3f%s; window shown %lld dropped %lld "
++                       "(%d set aside), stay before %lld dropped of %lld; %.1fs after %s\n",
++                       r == 1 ? "moved" : p->vsync_pace.held && !before_held ? "held" : "settled",
++                       before_phase, p->vsync_pace.phase,
++                       p->vsync_pace.held ? " held" : "", (long long)lshown, (long long)ldropped,
++                       st->pace_excused, (long long)stay_drops, (long long)stay_frames, since,
++                       p->last_restart_kind ? p->last_restart_kind : "-");
++        }
+         if (r)
+             vsync_pace_save(vo);
+     }
+@@ -4636,6 +4708,7 @@ static void update_avfoundation_options(struct vo *vo)
+     int old_snap = p->opts->vsync_snap, old_pace = p->opts->vsync_snap_pace;
+     double old_lead = p->opts->vsync_snap_lead, old_phase = p->opts->vsync_snap_pace_phase;
+     bool old_after = p->opts->osd_after_video, old_ahead = p->opts->osd_slots_ahead;
++    bool old_restart = p->opts->restart_frames;
+ 
+     if (!m_config_cache_update(p->opts_cache))
+         return;
+@@ -4645,8 +4718,9 @@ static void update_avfoundation_options(struct vo *vo)
+     if (old_snap != p->opts->vsync_snap || old_pace != p->opts->vsync_snap_pace ||
+         old_lead != p->opts->vsync_snap_lead || old_phase != p->opts->vsync_snap_pace_phase ||
+         old_after != p->opts->osd_after_video || old_ahead != p->opts->osd_slots_ahead ||
+-        old_queue_lead_ms != p->opts->queue_lead_ms)
++        old_queue_lead_ms != p->opts->queue_lead_ms || old_restart != p->opts->restart_frames)
+         subref_switches(vo, "changed");
++    vo->pause_with_frame = p->opts->restart_frames;
+ 
+     if (old_queue_lead_ms != p->opts->queue_lead_ms)
+         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+@@ -6960,12 +7034,13 @@ static void subref_tag(struct priv *p, char *buf, size_t size)
+               : o->vsync_snap_pace == AVF_VSYNC_PACE_YES ? 'Y' : 'N';
+     double point = o->vsync_snap_pace_phase >= 0 ? o->vsync_snap_pace_phase
+                  : p->vsync_pace_period ? p->vsync_pace.phase : -1;
+-    snprintf(buf, size, "[%ss%.0f q%d p%c%.2f%s o%c]",
++    snprintf(buf, size, "[%ss%.0f q%d p%c%.2f%s o%c r%d]",
+              o->vsync_snap == AVF_VSYNC_SNAP_YES ? "" :
+              o->vsync_snap == AVF_VSYNC_SNAP_NO ? "snap-off " : "snap-measure ",
+              (1.0 - o->vsync_snap_lead) * 100, o->queue_lead_ms, pace, point,
+              o->vsync_snap_pace_phase >= 0 ? "pin" : "",
+-             o->osd_slots_ahead ? 's' : o->osd_after_video ? 'a' : 'b');
++             o->osd_slots_ahead ? 's' : o->osd_after_video ? 'a' : 'b',
++             o->restart_frames ? 1 : 0);
+ }
+ 
+ // The switches, in words: at a VO's first frame and whenever one changes.
+@@ -6979,13 +7054,14 @@ static void subref_switches(struct vo *vo, const char *why)
+     static const char *const paces[] = {"no", "yes", "auto"};
+     char tag[64];
+     subref_tag(p, tag, sizeof(tag));
+-    MP_VERBOSE(vo, "switches (%s): vsync-snap %s, snap-lead %.2f (stamp %.0f%% into the "
+-               "refresh), queue-lead-ms %d, pace %s, pace-phase %.2f, osd %s%s %s\n",
++    MP_VERBOSE(vo, "switches (%s): snap %s, snap-lead %.2f (stamp %.0f%%), queue-lead-ms %d, "
++               "pace %s, pace-phase %.2f, osd %s%s, restart-frames %s %s\n",
+                why, snaps[o->vsync_snap % 3], o->vsync_snap_lead,
+                (1.0 - o->vsync_snap_lead) * 100, o->queue_lead_ms,
+                paces[o->vsync_snap_pace % 3], o->vsync_snap_pace_phase,
+                o->osd_after_video ? "after" : "before",
+-               o->osd_slots_ahead ? " (slot ahead)" : "", tag);
++               o->osd_slots_ahead ? " (slot ahead)" : "",
++               o->restart_frames ? "yes" : "no", tag);
+ }
+ 
+ static void subref_fmt_counts(const struct avf_subref_tally *t, char *buf, size_t size)
+@@ -7679,6 +7755,48 @@ static void ahead_file_frame(struct vo *vo, struct vo_frame *frame)
+ // Present what the render thread has for this frame, waiting only as long
+ // as avf_osd_wait_until allows. A result that arrives later is shown with a
+ // later frame; of several ready ones only the newest is drawn.
++// The start, a seek or a resume: --avfoundation-restart-frames's window
++// opens (whatever the switch says, so turning it on mid-play acts from the
++// next one), and the time is kept for the pace log.
++static void restart_window(struct vo *vo, const char *kind)
++{
++    struct priv *p = vo->priv;
++    if (p->opts->restart_frames && p->restart_left && (p->restart_moved || p->restart_waits))
++        MP_VERBOSE(vo, "restart-frames: %d moved by %d refreshes, %d waited (%d gave up)\n",
++                   p->restart_moved, p->restart_moved_refreshes, p->restart_waits,
++                   p->restart_gave_up);
++    p->restart_left = AVF_RESTART_FRAMES;
++    p->restart_wait = true;
++    p->restart_moved = p->restart_moved_refreshes = p->restart_waits = p->restart_gave_up = 0;
++    p->last_restart_ns = mp_time_ns();
++    p->last_restart_kind = kind;
++}
++
++// A restart frame, which may have waited for its subtitles, gets its
++// refreshes back (avf_host_restart_stamp_ns()), once, after its subtitles
++// are drawn and before its samples are made; 0307's pacing then holds its
++// hand-over for the point as for any frame.
++static void restart_stamp(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->next_restart)
++        return;
++    p->next_restart = false;
++    int64_t now = mp_time_ns(), vsync, period, nominal;
++    if (!vsync_snap_grid(p, now, &vsync, &period, &nominal))
++        return;
++    int64_t old = p->next_present_host_ns;
++    int64_t moved = avf_host_restart_stamp_ns(old, now + period, vsync, period);
++    if (moved == old)
++        return;
++    p->next_present_host_ns = moved;
++    p->last_host_present_ns = moved;
++    if (p->vsync_frame_snapped)
++        p->vsync_frame_stamp_ns += moved - old;
++    p->restart_moved++;
++    p->restart_moved_refreshes += (int)((moved - old + period / 2) / period);
++}
++
+ static void ahead_present(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -7696,9 +7814,14 @@ static void ahead_present(struct vo *vo)
+         int64_t now = mp_time_ns();
+         bool behind = p->ahead_req.seq && s->served_epoch == p->ahead_req.epoch &&
+                       s->served_seq + 1 < p->ahead_req.seq;
+-        int64_t until = avf_osd_wait_until(now, p->next_present_host_ns,
+-            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), p->ahead_req.timed,
+-            composite, behind);
++        bool restart_wait = p->opts->restart_frames && p->next_restart &&
++                            p->restart_wait && p->ahead_req.timed && !composite;
++        int64_t until = restart_wait
++            ? avf_osd_restart_wait_until(now, p->next_present_host_ns,
++                  MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), behind)
++            : avf_osd_wait_until(now, p->next_present_host_ns,
++                  MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), p->ahead_req.timed,
++                  composite, behind);
+         if (behind)
+             p->ahead_perf.behind++;
+         if (until > now) {
+@@ -7710,6 +7833,16 @@ static void ahead_present(struct vo *vo)
+             p->ahead_perf.wait_max_ns = MPMAX(p->ahead_perf.wait_max_ns, waited);
+             if (!served)
+                 p->ahead_perf.gave_up++;
++            if (restart_wait) {
++                p->restart_waits++;
++                // The render thread is slower than the restart: the rest of
++                // the window waits as any frame does, and still gets its
++                // refreshes back.
++                if (!served) {
++                    p->restart_gave_up++;
++                    p->restart_wait = false;
++                }
++            }
+         }
+     }
+     int dropped;
+@@ -8282,6 +8415,8 @@ static int preinit(struct vo *vo)
+     });
+     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+     vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
++    vo->pause_with_frame = p->opts->restart_frames;
++    restart_window(vo, "start");
+     p->ready_queue = dispatch_queue_create("avfoundation ready",
+         dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                 QOS_CLASS_USER_INTERACTIVE, 0));
+@@ -8821,6 +8956,7 @@ static void flip_page(struct vo *vo)
+         } else {
+             render_osd(vo, p->next_pts);
+         }
++        restart_stamp(vo);
+ 
+         // Made before the OSD's sample, which takes its colour
+         // (update_osd_color; upstream 0052); the order they are enqueued in
+@@ -8933,6 +9069,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ 
+     mp_image_unrefp(&p->next_image);
+ 
++    p->next_restart = false;
+     if (!frame->current || (frame->repeat && !frame->redraw)) {
+         p->next_pts = MP_NOPTS_VALUE;
+         p->next_present_host_ns = mp_time_ns();
+@@ -8950,6 +9087,21 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         pts = frame->current->pts;
+ 
+     p->next_pts = pts;
++    // --avfoundation-restart-frames: only timed frames count against the
++    // window, and only where the refresh is known.
++    if (p->opts->restart_frames && p->restart_left > 0 && frame->pts > 0 &&
++        !frame->redraw && !p->vsync_paused && p->presentation_host && p->refresh_clock)
++    {
++        int64_t gv, gp, gn;
++        if (vsync_snap_grid(p, mp_time_ns(), &gv, &gp, &gn)) {
++            p->next_restart = true;
++            if (!--p->restart_left)
++                MP_VERBOSE(vo, "restart-frames after %s: %d moved by %d refreshes, %d waited "
++                           "(%d gave up)\n", p->last_restart_kind ? p->last_restart_kind : "-",
++                           p->restart_moved, p->restart_moved_refreshes, p->restart_waits,
++                           p->restart_gave_up);
++        }
++    }
+     p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
+     p->vsync_frame_snapped = false;
+     p->vsync_frame_unsent = false;
+@@ -9274,6 +9426,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         clear_osd_layer(vo);
+         subref_start_stretch(vo, p->subref.total.frames || p->subref.stretches
+                                  ? "seek" : "start");
++        restart_window(vo, p->subref.total.frames || p->subref.stretches ? "seek" : "start");
+         return VO_TRUE;
+     case VOCTRL_PAUSE:
+         subref_end_stretch(vo, mp_time_ns(), " (paused)");
+@@ -9285,6 +9438,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     case VOCTRL_RESUME:
+         // Playback resumes on a new schedule: learn its phase again.
+         subref_start_stretch(vo, "unpause");
++        restart_window(vo, "unpause");
+         p->vsync_paused = false;
+         avf_vsync_snap_unlock(&p->vsync_snap);
+         p->vsync_stats.have_prev = false;
+@@ -9362,6 +9516,11 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     // (subref lines). -report: any change logs the session's line now (the
+     // app sets it before closing the player).
+     {"subref-look", OPT_BOOL(subref_look)},
++    // Upstream 0056 ported onto 0307 (default no: as before): the first
++    // timed frames after the start, a seek or a resume wait for their own
++    // subtitles and are stamped at least 3.5 refreshes past their hand-over;
++    // vo.c tells this VO of a pause or a resume before the frame it draws.
++    {"restart-frames", OPT_BOOL(restart_frames)},
+     {"subref-report", OPT_INT(subref_report)},
+     // Promise the video renderer monotonically increasing stamps.
+     {"expect-monotonic", OPT_BOOL(expect_monotonic)},
