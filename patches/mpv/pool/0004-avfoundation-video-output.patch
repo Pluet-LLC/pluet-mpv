@@ -827,9 +827,9 @@ index 0000000..a738e00
 +        return;
 +
 +    const char *basename = mp_basename(shaderpath);
-+    struct bstr shadername;
-+    if (!mp_splitext(basename, &shadername))
-+        shadername = bstr0(basename);
++    // mpv 0.42 replaced mp_splitext() with mp_strip_ext() (root, or the
++    // whole name when there is no extension).
++    struct bstr shadername = mp_strip_ext(bstr0(basename));
 +
 +    for (int n = 0; opts[n * 2]; n++) {
 +        struct bstr k = bstr0(opts[n * 2 + 0]);
