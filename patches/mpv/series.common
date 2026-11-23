@@ -78,3 +78,8 @@
 # --sub-ass-render-threads caps 0205's libass threads (default auto; test
 # test_sub_ass_render_threads.sh).
 0305-sd-ass-render-threads-option.patch
+# --hr-seek-budget: a seek command without a precision flag is exact only
+# while the decoding it costs stays within the budget, else it lands on the
+# nearer keyframe, never behind where a forward skip started; default off
+# (test test_hr_seek_budget.sh).
+0314-player-hr-seek-budget.patch

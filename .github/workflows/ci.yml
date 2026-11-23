@@ -125,6 +125,8 @@ jobs:
                 subprocess.run(['bash', 'scripts/test_osd_sub_schedule_lock.sh', str(dest)], check=True)
                 # --sub-ass-render-threads reaching ass_set_threads().
                 subprocess.run(['bash', 'scripts/test_sub_ass_render_threads.sh', str(dest)], check=True)
+                # --hr-seek-budget's landing rule and its gate (0314).
+                subprocess.run(['bash', 'scripts/test_hr_seek_budget.sh', str(dest)], check=True)
                 # 0025's hwdec error recovery and its options (0306).
                 subprocess.run(['bash', 'scripts/test_hwdec_recovery.sh', str(dest)], check=True)
                 # vo_avfoundation's vsync snap on synthetic clocks (0307).

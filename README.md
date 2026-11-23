@@ -260,6 +260,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_mediacodec_vsync.sh` | the Choreographer vsync sampler against Android 11's behaviour | PR, main |
 | `test_osd_sub_schedule_lock.sh` | the OSD's subtitle schedule query keeps osd->lock free while a dec_sub renders, and pins the dec_subs against a swap; a stress run (patch 0304) | PR |
 | `test_sub_ass_render_threads.sh` | `--sub-ass-render-threads` reaches `ass_set_threads()`, auto by default (patch 0305) | PR |
+| `test_hr_seek_budget.sh` | `--hr-seek-budget`: exact within the budget, else the nearer keyframe, never behind the start of a forward skip; `+exact` and the player's own seeks untouched; off by default (patch 0314) | PR |
 | `test_pgs_palette.sh` | PGS palettes start transparent after an epoch boundary | PR, main |
 | `test_player_queue_frames.sh` | frame queueing and durations under vo_mediacodec | PR, main |
 | `test_player_release_held_frame.sh` | ending a file frees the decoder before the next opens (patch 0139) | PR, main |

@@ -1,0 +1,496 @@
+From: Pluet, LLC <358065800+pluetllc@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:00:00 +0000
+Subject: [PATCH] player: --hr-seek-budget
+
+A seek command without a precision flag is exact (hr-seek) for absolute
+seeks: the demuxer goes to the keyframe before the target and every frame up
+to it is decoded and thrown away. In a long-GOP encode (a keyframe every
+10 s) that is up to 10 s of decoding per skip, 260-720 ms on an M1 and
+several times that on an Apple TV with an A10X, where the network part of a
+seek on a LAN is under 30 ms. A keyframe seek alone is no answer: it lands
+on the keyframe before the target, so +10 s in a 10 s GOP can land where it
+started.
+
+--hr-seek-budget=<seconds> (default 0, off: today's behaviour) bounds that
+cost for seek commands (absolute and relative) that name no precision. The
+seek stays exact when the keyframe before the target is within the budget
+of it; otherwise it lands on the nearer of the two keyframes around the
+target, counting only a keyframe no further from the target than half the
+seek's distance, so a forward skip never lands behind where it started (nor
+a backward one ahead of it) and never misses by more than half the skip.
+If neither keyframe qualifies, or neither is known, the seek is exact.
++exact and +keyframes seeks, and every seek the player makes itself
+(--start, chapters, A-B loops, revert-seek, frame steps), are untouched:
+cmd_seek alone sets MPSEEK_FLAG_BUDGET. The decided seek is then carried
+out as an ordinary exact or keyframe seek (SEEK_FORWARD for the keyframe
+after), so nothing new happens downstream.
+
+The keyframes come from demux_get_keyframes_around(): the packet cache where
+it holds the target (what an in-cache seek lands on), else an index the
+demuxer published with demux_set_keyframe_index(): Matroska's Cues once they
+are complete (read on opening, or at the first seek when 0240 defers them),
+and libavformat's keyframe index entries after opening (an MP4's sample
+table), except where it rewrites timestamps while reading. demux_mkv and
+demux_lavf call it from their own thread with in->lock not held; the index
+is kept per demux_stream under in->lock.
+
+scripts/test_hr_seek_budget.sh compiles hr_seek_budget_applies(),
+hr_seek_budget_landing() and kf_index_around() against fakes: within the
+budget exact; beyond it the nearer keyframe; never behind the start of a
+forward skip (a sweep over GOPs of 0.5-24 s, skips of 5-900 s either way
+and budgets of 0.25-5 s); +exact, +keyframes and the player's own seeks
+untouched; budget 0 decides nothing; and the option's table entry, the seek
+command's flag and the gate in mp_seek().
+
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index e9b2ece..f7b2a19 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -432,6 +432,28 @@ Playback Control
+ 
+     Default: ``yes``
+ 
++``--hr-seek-budget=<seconds>``
++    How much decoding a ``seek`` command without a precision flag may cost to
++    land exactly (Pluet). When set, such a seek (absolute or relative,
++    whatever ``--hr-seek`` says) is exact if the keyframe before the target is
++    at most this many seconds before it. Otherwise it lands on the nearer of
++    the two keyframes around the target, counting only a keyframe that is no
++    further from the target than half the distance from the position the
++    seek started at: a forward seek never lands behind where it started, a
++    backward one never ahead of it. If neither keyframe qualifies, or they
++    are not known, the seek is exact.
++
++    Keyframes are known from the demuxer cache where it holds the target,
++    else from the file's own index (Matroska Cues once read, which is at the
++    first seek outside the cache; libavformat's index, e.g. an MP4's sample
++    table).
++
++    ``+exact`` and ``+keyframes`` seeks, and seeks the player makes itself
++    (``--start``, chapters, A-B loops, ``revert-seek``, frame steps), are not
++    affected. Not used in backward playback or without video.
++
++    Default: 0 (off: seeks behave as ``--hr-seek`` says).
++
+ ``--index=<mode>``
+     Controls how to seek in files. Note that if the index is missing from a
+     file, it will be built on the fly by default, so you don't need to change
+diff --git a/demux/demux.c b/demux/demux.c
+index 834c40c..0d40edf 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -468,6 +468,11 @@ struct demux_stream {
+     // for closed captions (demuxer_feed_caption)
+     struct sh_stream *cc;
+     bool ignore_eof;        // ignore stream in underrun detection
++
++    // Pluet: keyframe times from the demuxer's own index (the demuxer's
++    // timestamps, ascending), see demux_set_keyframe_index().
++    double *kf_index;
++    int num_kf_index;
+ };
+ 
+ static void switch_to_fresh_cache_range(struct demux_internal *in);
+@@ -980,6 +985,114 @@ void demux_set_ts_offset(struct demuxer *demuxer, double offset)
+     mp_mutex_unlock(&in->lock);
+ }
+ 
++static int compare_kf_time(const void *a, const void *b)
++{
++    double x = *(const double *)a, y = *(const double *)b;
++    return x < y ? -1 : x > y ? 1 : 0;
++}
++
++// Pluet: publish the keyframe times the demuxer's own index holds for sh
++// (seconds, in the demuxer's timestamps, any order), replacing any published
++// before. demux_get_keyframes_around() falls back on them where the packet
++// cache does not reach. Called by demuxer implementations.
++void demux_set_keyframe_index(struct demuxer *demuxer, struct sh_stream *sh,
++                              const double *pts, int num)
++{
++    struct demux_internal *in = demuxer->in;
++    mp_assert(demuxer == in->d_thread);
++
++    double *index = NULL;
++    int num_index = 0;
++    for (int n = 0; n < num; n++) {
++        if (pts[n] != MP_NOPTS_VALUE && isfinite(pts[n]))
++            MP_TARRAY_APPEND(NULL, index, num_index, pts[n]);
++    }
++    if (num_index)
++        qsort(index, num_index, sizeof(index[0]), compare_kf_time);
++
++    mp_mutex_lock(&in->lock);
++    struct demux_stream *ds = sh->ds;
++    talloc_free(ds->kf_index);
++    ds->kf_index = index ? talloc_steal(ds, index) : NULL;
++    ds->num_kf_index = num_index;
++    mp_mutex_unlock(&in->lock);
++
++    MP_VERBOSE(in, "stream %d: %d keyframes in the index\n", sh->index,
++               num_index);
++}
++
++// The last entry <= pts and the first >= pts of an ascending list, where the
++// out values are still MP_NOPTS_VALUE.
++static void kf_index_around(const double *index, int num, double pts,
++                            double *before, double *after)
++{
++    int lo = 0, hi = num; // lo: the first entry > pts
++    while (lo < hi) {
++        int mid = lo + (hi - lo) / 2;
++        if (index[mid] <= pts) {
++            lo = mid + 1;
++        } else {
++            hi = mid;
++        }
++    }
++    if (*before == MP_NOPTS_VALUE && lo > 0)
++        *before = index[lo - 1];
++    int first = lo > 0 && index[lo - 1] == pts ? lo - 1 : lo;
++    if (*after == MP_NOPTS_VALUE && first < num)
++        *after = index[first];
++}
++
++// Pluet: the keyframes of the selected video stream on either side of pts
++// (the player's timestamps): *before <= pts <= *after, MP_NOPTS_VALUE where
++// not known. From the packet cache where it holds pts (what an in-cache seek
++// lands on), else from the index the demuxer published.
++void demux_get_keyframes_around(struct demuxer *demuxer, double pts,
++                                double *before, double *after)
++{
++    struct demux_internal *in = demuxer->in;
++    mp_assert(demuxer == in->d_user);
++
++    *before = *after = MP_NOPTS_VALUE;
++    if (pts == MP_NOPTS_VALUE)
++        return;
++
++    mp_mutex_lock(&in->lock);
++    double raw = MP_ADD_PTS(pts, -in->ts_offset);
++    for (int n = 0; n < in->num_streams; n++) {
++        struct demux_stream *ds = in->streams[n]->ds;
++        if (!ds->selected || ds->type != STREAM_VIDEO ||
++            ds->sh->attached_picture || ds->sh->image)
++            continue;
++
++        for (int r = 0; r < in->num_ranges; r++) {
++            struct demux_cached_range *range = in->ranges[r];
++            if (range->seek_start == MP_NOPTS_VALUE ||
++                raw < range->seek_start || raw > range->seek_end)
++                continue;
++            struct demux_queue *queue = range->streams[ds->index];
++            double t = MP_NOPTS_VALUE;
++            struct demux_packet *kf = find_seek_target(queue, raw, 0);
++            if (kf)
++                compute_keyframe_times(kf, &t, NULL);
++            if (t != MP_NOPTS_VALUE && t <= raw)
++                *before = t;
++            t = MP_NOPTS_VALUE;
++            kf = find_seek_target(queue, raw, SEEK_FORWARD);
++            if (kf)
++                compute_keyframe_times(kf, &t, NULL);
++            if (t != MP_NOPTS_VALUE && t >= raw)
++                *after = t;
++            break;
++        }
++
++        kf_index_around(ds->kf_index, ds->num_kf_index, raw, before, after);
++        break;
++    }
++    *before = MP_ADD_PTS(*before, in->ts_offset);
++    *after = MP_ADD_PTS(*after, in->ts_offset);
++    mp_mutex_unlock(&in->lock);
++}
++
+ static void add_missing_streams(struct demux_internal *in,
+                                 struct demux_cached_range *range)
+ {
+diff --git a/demux/demux.h b/demux/demux.h
+index 00e3f5a..8691ee0 100644
+--- a/demux/demux.h
++++ b/demux/demux.h
+@@ -347,6 +347,10 @@ bool demux_read_interrupted(struct demuxer *demuxer);
+ void demux_flush(struct demuxer *demuxer);
+ int demux_seek(struct demuxer *demuxer, double rel_seek_secs, int flags);
+ void demux_set_ts_offset(struct demuxer *demuxer, double offset);
++void demux_set_keyframe_index(struct demuxer *demuxer, struct sh_stream *sh,
++                              const double *pts, int num);
++void demux_get_keyframes_around(struct demuxer *demuxer, double pts,
++                                double *before, double *after);
+ 
+ void demux_get_bitrate_stats(struct demuxer *demuxer, double *rates);
+ void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *r);
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index c3eab0f..2fc70c3 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -1468,6 +1468,40 @@ static void detect_dovi_split_streams(demuxer_t *demuxer)
+     }
+ }
+ 
++// Pluet: the keyframe entries libavformat's index holds for each video stream
++// after opening (an MP4's sample table, for one), for --hr-seek-budget
++// (demux_get_keyframes_around()).
++static void publish_keyframe_index(demuxer_t *demuxer)
++{
++    lavf_priv_t *priv = demuxer->priv;
++    AVFormatContext *avfc = priv->avfc;
++
++    // Timestamps the demuxer rewrites as it reads are not the index's.
++    if (priv->linearize_ts || demuxer->ts_resets_possible)
++        return;
++
++    for (int n = 0; n < priv->num_streams; n++) {
++        struct sh_stream *sh = priv->streams[n]->sh;
++        if (!sh || sh->type != STREAM_VIDEO || sh->attached_picture ||
++            n >= (int)avfc->nb_streams)
++            continue;
++        AVStream *st = avfc->streams[n];
++        int count = avformat_index_get_entries_count(st);
++        double *pts = NULL;
++        int num = 0;
++        for (int i = 0; i < count; i++) {
++            const AVIndexEntry *e = avformat_index_get_entry(st, i);
++            if (e && (e->flags & AVINDEX_KEYFRAME) &&
++                e->timestamp != AV_NOPTS_VALUE)
++                MP_TARRAY_APPEND(NULL, pts, num,
++                                 mp_pts_from_av(e->timestamp, &st->time_base));
++        }
++        if (num)
++            demux_set_keyframe_index(demuxer, sh, pts, num);
++        talloc_free(pts);
++    }
++}
++
+ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
+ {
+     AVFormatContext *avfc = NULL;
+@@ -1741,6 +1775,8 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
+         priv->stream = NULL;
+     }
+ 
++    publish_keyframe_index(demuxer);
++
+     if (priv->stream) {
+         const char *sname = priv->stream->info->name;
+         priv->is_dvd = strcmp(sname, "dvdnav") == 0 ||
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+index e30b310..b0aa1a6 100644
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -1092,6 +1092,34 @@ static void add_block_position(demuxer_t *demuxer, struct mkv_track *track,
+     track->last_index_entry = mkv_d->num_indexes - 1;
+ }
+ 
++// Pluet: the Cues' times of each video track, for --hr-seek-budget
++// (demux_get_keyframes_around()). Nothing until the index is complete.
++static void publish_keyframe_index(demuxer_t *demuxer)
++{
++    mkv_demuxer_t *mkv_d = (mkv_demuxer_t *) demuxer->priv;
++
++    if (!mkv_d->index_complete)
++        return;
++
++    for (int n = 0; n < mkv_d->num_tracks; n++) {
++        struct mkv_track *track = mkv_d->tracks[n];
++        if (track->type != MATROSKA_TRACK_VIDEO || !track->stream)
++            continue;
++        double *pts = NULL;
++        int num = 0;
++        for (size_t i = 0; i < mkv_d->num_indexes; i++) {
++            mkv_index_t *index = &mkv_d->indexes[i];
++            if (index->tnum == track->tnum) {
++                double t = (double)index->timecode * mkv_d->tc_scale / 1e9 -
++                           track->codec_delay;
++                MP_TARRAY_APPEND(NULL, pts, num, t);
++            }
++        }
++        demux_set_keyframe_index(demuxer, track->stream, pts, num);
++        talloc_free(pts);
++    }
++}
++
+ static int demux_mkv_read_cues(demuxer_t *demuxer)
+ {
+     mkv_demuxer_t *mkv_d = (mkv_demuxer_t *) demuxer->priv;
+@@ -1145,6 +1173,7 @@ static int demux_mkv_read_cues(demuxer_t *demuxer)
+ 
+     // Do not attempt to create index on the fly.
+     mkv_d->index_complete = true;
++    publish_keyframe_index(demuxer);
+ 
+ done:
+     if (!mkv_d->index_complete)
+@@ -2800,6 +2829,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+     MP_VERBOSE(demuxer, "All headers are parsed!\n");
+ 
+     display_create_tracks(demuxer);
++    publish_keyframe_index(demuxer);
+     pair_dovi_tracks(demuxer);
+     add_coverart(demuxer);
+     process_tags(demuxer);
+diff --git a/options/options.c b/options/options.c
+index c38db28..c8bf923 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -901,6 +901,7 @@ static const m_option_t mp_opts[] = {
+         {"no", -1}, {"absolute", 0}, {"yes", 1}, {"always", 1}, {"default", 2})},
+     {"hr-seek-demuxer-offset", OPT_FLOAT(hr_seek_demuxer_offset)},
+     {"hr-seek-framedrop", OPT_BOOL(hr_seek_framedrop)},
++    {"hr-seek-budget", OPT_DOUBLE(hr_seek_budget), M_RANGE(0, 3600)},
+     {"autosync", OPT_CHOICE(autosync, {"no", -1}), M_RANGE(0, 10000)},
+ 
+     {"term-osd", OPT_CHOICE(term_osd,
+diff --git a/options/options.h b/options/options.h
+index 0efe4d9..67017bd 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -279,6 +279,7 @@ typedef struct MPOpts {
+     int hr_seek;
+     float hr_seek_demuxer_offset;
+     bool hr_seek_framedrop;
++    double hr_seek_budget;
+     double audio_delay;
+     float default_max_pts_correction;
+     int autosync;
+diff --git a/player/command.c b/player/command.c
+index a43a56d..92cc32b 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -6101,7 +6101,8 @@ static void cmd_seek(void *p)
+     mark_seek(mpctx);
+     switch (abs) {
+     case 0: { // Relative seek
+-        queue_seek(mpctx, MPSEEK_RELATIVE, v, precision, MPSEEK_FLAG_DELAY);
++        queue_seek(mpctx, MPSEEK_RELATIVE, v, precision,
++                   MPSEEK_FLAG_DELAY | MPSEEK_FLAG_BUDGET);
+         set_osd_function(mpctx, (v > 0) ? OSD_FFW : OSD_REW);
+         break;
+     }
+@@ -6122,7 +6123,8 @@ static void cmd_seek(void *p)
+             }
+             v = MPMAX(0, len + v);
+         }
+-        queue_seek(mpctx, MPSEEK_ABSOLUTE, v, precision, MPSEEK_FLAG_DELAY);
++        queue_seek(mpctx, MPSEEK_ABSOLUTE, v, precision,
++                   MPSEEK_FLAG_DELAY | MPSEEK_FLAG_BUDGET);
+         set_osd_function(mpctx,
+                          v > get_current_time(mpctx) ? OSD_FFW : OSD_REW);
+         break;
+diff --git a/player/core.h b/player/core.h
+index 3d22546..8657d80 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -84,6 +84,7 @@ enum seek_precision {
+ enum seek_flags {
+     MPSEEK_FLAG_DELAY = 1 << 0, // give player chance to coalesce multiple seeks
+     MPSEEK_FLAG_NOFLUSH = 1 << 1, // keeping remaining data for seamless loops
++    MPSEEK_FLAG_BUDGET = 1 << 2, // a seek command: --hr-seek-budget applies
+ };
+ 
+ struct seek_params {
+diff --git a/player/playloop.c b/player/playloop.c
+index 346e251..32230c1 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -300,6 +300,57 @@ static double calculate_framestep_pts(MPContext *mpctx, double current_time,
+     return current_time + pts;
+ }
+ 
++// Pluet: --hr-seek-budget. Where a seek lands when the budget decides it.
++enum hr_seek_budget_landing {
++    HR_SEEK_BUDGET_EXACT,   // on the target, decoding from the keyframe before
++    HR_SEEK_BUDGET_BEFORE,  // on the keyframe at or before the target
++    HR_SEEK_BUDGET_AFTER,   // on the keyframe at or after the target
++};
++
++// Whether --hr-seek-budget decides this seek: a seek command (absolute or
++// relative) that names no precision. +exact, +keyframes and every seek the
++// player makes itself (--start, chapters, A-B loops, revert-seek, frame
++// steps) are left as they are.
++static bool hr_seek_budget_applies(double budget, const struct seek_params *seek)
++{
++    return budget > 0 && (seek->flags & MPSEEK_FLAG_BUDGET) &&
++           seek->exact == MPSEEK_DEFAULT &&
++           (seek->type == MPSEEK_ABSOLUTE || seek->type == MPSEEK_RELATIVE);
++}
++
++// target: where the seek asks for; from: the position it starts from;
++// before/after: the keyframes either side of target (MP_NOPTS_VALUE where not
++// known). Exact when the keyframe before is within the budget of the target
++// (the decoding that costs is what the budget allows), or when nothing is
++// known. Otherwise the nearer of the two keyframes, of those no further from
++// the target than half the seek's distance, so a landing is never on the
++// wrong side of where the seek started from (a forward skip never goes back,
++// a backward one never forward) and never misses by more than half the skip.
++// Exact again if neither keyframe qualifies.
++static enum hr_seek_budget_landing hr_seek_budget_landing(double target,
++                                                         double from,
++                                                         double budget,
++                                                         double before,
++                                                         double after)
++{
++    if (before == MP_NOPTS_VALUE || before > target)
++        return HR_SEEK_BUDGET_EXACT;
++    if (target - before <= budget)
++        return HR_SEEK_BUDGET_EXACT;
++    double room = fabs(target - from) / 2;
++    bool use_before = target - before <= room;
++    bool use_after = after != MP_NOPTS_VALUE && after >= target &&
++                     after - target <= room;
++    if (use_before && use_after)
++        return after - target < target - before ? HR_SEEK_BUDGET_AFTER
++                                                : HR_SEEK_BUDGET_BEFORE;
++    if (use_before)
++        return HR_SEEK_BUDGET_BEFORE;
++    if (use_after)
++        return HR_SEEK_BUDGET_AFTER;
++    return HR_SEEK_BUDGET_EXACT;
++}
++
+ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+ {
+     struct MPOpts *opts = mpctx->opts;
+@@ -342,8 +393,40 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+     default: MP_ASSERT_UNREACHABLE();
+     }
+ 
++    // Pluet: --hr-seek-budget turns the seek into an exact one or a keyframe
++    // one, which the code below then carries out as it would have been asked.
++    int budget_dir = 0;
++    if (hr_seek_budget_applies(opts->hr_seek_budget, &seek) &&
++        seek_pts != MP_NOPTS_VALUE && opts->play_dir > 0 &&
++        mpctx->vo_chain && !mpctx->vo_chain->is_sparse)
++    {
++        double before, after;
++        demux_get_keyframes_around(mpctx->demuxer, seek_pts, &before, &after);
++        enum hr_seek_budget_landing landing =
++            hr_seek_budget_landing(seek_pts, current_time, opts->hr_seek_budget,
++                                   before, after);
++        static const char *const names[] = {
++            [HR_SEEK_BUDGET_EXACT] = "exact",
++            [HR_SEEK_BUDGET_BEFORE] = "keyframe before",
++            [HR_SEEK_BUDGET_AFTER] = "keyframe after",
++        };
++        MP_VERBOSE(mpctx, "hr-seek budget %.3f: from %f to %f, keyframes "
++                   "%f / %f: %s\n", opts->hr_seek_budget, current_time,
++                   seek_pts, before, after, names[landing]);
++        if (landing == HR_SEEK_BUDGET_EXACT) {
++            seek.exact = MPSEEK_EXACT;
++        } else {
++            seek.exact = MPSEEK_KEYFRAME;
++            budget_dir = landing == HR_SEEK_BUDGET_AFTER ? 1 : -1;
++        }
++    }
++
+     double demux_pts = seek_pts;
+ 
++    if (budget_dir)
++        demux_flags = (demux_flags & ~SEEK_FORWARD) |
++                      (budget_dir > 0 ? SEEK_FORWARD : 0);
++
+     bool hr_seek = seek.exact != MPSEEK_KEYFRAME && seek_pts != MP_NOPTS_VALUE &&
+         (seek.exact >= MPSEEK_EXACT || opts->hr_seek == 1 ||
+          (opts->hr_seek >= 0 && seek.type == MPSEEK_ABSOLUTE) ||
