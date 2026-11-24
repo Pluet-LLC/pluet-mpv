@@ -1,0 +1,28 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vm: keep the stream callbacks across a reset
+
+A DVD opened with dvdnav_open_stream2() reads through vm->dvdstreamcb,
+which forwards to vm->streamcb. vm_start() and dvdnav_reset() call
+vm_reset(vm, NULL, NULL, NULL), which cleared vm->streamcb while keeping
+the open dvd_reader_t: the next read (opening a VTS IFO) called a NULL
+seek callback and crashed. Keep the callbacks while that reader is open.
+---
+diff --git a/src/vm/vm.c b/src/vm/vm.c
+index 9276c91..be6deee 100644
+--- a/src/vm/vm.c
++++ b/src/vm/vm.c
+@@ -405,10 +405,11 @@ int vm_reset(vm_t *vm, const char *dvdroot,
+ 
+   vm->hop_channel                = 0;
+ 
+-  /* save target callbacks */
++  /* save target callbacks; a reset without new ones (vm_start, dvdnav_reset)
++   * keeps those of the DVD still open, which reads through them */
+   if(stream_cb)
+       vm->streamcb = *stream_cb;
+-  else
++  else if(!vm->dvd)
+       vm->streamcb = (dvdnav_stream_cb) { NULL, NULL, NULL };
+ 
+   /* bind local callbacks */

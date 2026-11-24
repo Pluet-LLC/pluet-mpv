@@ -1,0 +1,3 @@
+# DVD images read through a stream (mpv 0315): vm_reset must not drop the
+# stream callbacks of the open reader.
+0001-vm-keep-stream-callbacks-across-a-reset.patch
