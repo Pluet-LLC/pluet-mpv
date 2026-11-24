@@ -628,6 +628,39 @@
       "platforms": [
         "apple"
       ]
+    },
+    "libdvdread": {
+      "kind": "git",
+      "version": "7.1.1",
+      "url": "https://code.videolan.org/videolan/libdvdread.git",
+      "ref": "7.1.1",
+      "commit": "8e43bfea6cc731f48902ce55e41c540b497b6a84",
+      "provenance": "Resolved 2026-11-24 with git ls-remote: the annotated tag b8209dfe2a9d824029f14e09bbea03e975e89a1c dereferences to this commit.",
+      "platforms": [
+        "apple"
+      ]
+    },
+    "libdvdnav": {
+      "kind": "git",
+      "version": "7.0.0",
+      "url": "https://code.videolan.org/videolan/libdvdnav.git",
+      "ref": "7.0.0",
+      "commit": "38238caf599dc9405eddf1531c858c725015f776",
+      "provenance": "Resolved 2026-11-24 with git ls-remote: the annotated tag 3cb07c94d8fa7b42a316cc38df9fad208767b2a5 dereferences to this commit.",
+      "platforms": [
+        "apple"
+      ]
+    },
+    "libzvbi": {
+      "kind": "git",
+      "version": "v0.2.46",
+      "url": "https://github.com/zapping-vbi/zvbi.git",
+      "ref": "v0.2.46",
+      "commit": "34bb6f660c5c1bacd4a66cc7b22311e4ca3c1ab5",
+      "provenance": "Resolved 2026-11-24 with git ls-remote: the annotated tag 3c5df8e0de773220361a541f4d29e4f0171ff469 dereferences to this commit.",
+      "platforms": [
+        "apple"
+      ]
     }
   }
 }

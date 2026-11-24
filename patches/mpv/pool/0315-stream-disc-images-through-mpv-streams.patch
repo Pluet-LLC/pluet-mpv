@@ -1,0 +1,438 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:47:30 -0700
+Subject: [PATCH] stream: play Blu-ray and DVD disc images read through mpv's
+ streams (disc://)
+
+A disc image (.iso) that is not a local file could not play as a disc:
+libbluray and libdvdnav open paths only. A media server sends an image
+over http(s), and a network share through Pluet's own byte server, so
+neither reached the disc code.
+
+libbluray (bd_open_stream) and libdvdread (dvdnav_open_stream2) both take
+a block reader. disc://<address> opens the address with stream_create and
+hands its sectors to libbluray, then to libdvdnav if it is not a Blu-ray.
+The main title plays (or --edition's), the other titles are editions and
+the chapters are the title's, exactly as for bd:// and dvd://.
+
+Only random access is needed, no directory listing, so any seekable mpv
+stream works. Folders (BDMV, VIDEO_TS) still need a local path.
+---
+ meson.build                |  4 ++
+ stream/disc_image.h        | 29 ++++++++++++++
+ stream/stream.c            |  4 ++
+ stream/stream_bluray.c     | 74 ++++++++++++++++++++++++++++++++----
+ stream/stream_disc_image.c | 72 +++++++++++++++++++++++++++++++++++
+ stream/stream_dvdnav.c     | 78 +++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 253 insertions(+), 8 deletions(-)
+ create mode 100644 stream/disc_image.h
+ create mode 100644 stream/stream_disc_image.c
+
+diff --git a/meson.build b/meson.build
+index 7bed62e..bd3513e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -731,6 +731,10 @@ if features['libbluray']
+     sources += files('stream/stream_bluray.c')
+ endif
+ 
++if features['libbluray'] or features['dvdnav']
++    sources += files('stream/stream_disc_image.c')
++endif
++
+ libm = cc.find_library('m', required: false)
+ if libm.found()
+     dependencies += libm
+diff --git a/stream/disc_image.h b/stream/disc_image.h
+new file mode 100644
+index 0000000..bd404e8
+--- /dev/null
++++ b/stream/disc_image.h
+@@ -0,0 +1,29 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++struct stream;
++
++// Open `s` as the disc in `image`, a stream holding a Blu-ray or DVD disc
++// image (.iso) that need not be a local file: an http(s) address works,
++// as libbluray and libdvdread are given its sectors through the stream.
++// The main title plays unless --edition says otherwise; the other titles
++// are editions. On success `s` owns `image`; otherwise the caller keeps it
++// and `s->priv` is NULL. STREAM_UNSUPPORTED: not that kind of disc.
++int mp_bluray_open_image(struct stream *s, struct stream *image);
++int mp_dvdnav_open_image(struct stream *s, struct stream *image);
+diff --git a/stream/stream.c b/stream/stream.c
+index 1388ab2..b4d412d 100644
+--- a/stream/stream.c
++++ b/stream/stream.c
+@@ -61,6 +61,7 @@ extern const stream_info_t stream_info_ifo_dvda;
+ extern const stream_info_t stream_info_dvda;
+ extern const stream_info_t stream_info_bdmv_dir;
+ extern const stream_info_t stream_info_bluray;
++extern const stream_info_t stream_info_disc_image;
+ extern const stream_info_t stream_info_edl;
+ extern const stream_info_t stream_info_libarchive;
+ extern const stream_info_t stream_info_cb;
+@@ -88,6 +89,9 @@ static const stream_info_t *const stream_list[] = {
+     &stream_info_bdmv_dir,
+     &stream_info_bluray,
+ #endif
++#if HAVE_LIBBLURAY || HAVE_DVDNAV
++    &stream_info_disc_image,
++#endif
+ #if HAVE_LIBARCHIVE
+     &stream_info_libarchive,
+ #endif
+diff --git a/stream/stream_bluray.c b/stream/stream_bluray.c
+index e445499..9328ea2 100644
+--- a/stream/stream_bluray.c
++++ b/stream/stream_bluray.c
+@@ -44,6 +44,7 @@
+ #include "options/path.h"
+ #include "osdep/threads.h"
+ #include "stream.h"
++#include "disc_image.h"
+ #include "osdep/io.h"
+ #include "sub/osd.h"
+ #include "sub/img_convert.h"
+@@ -121,6 +122,10 @@ struct bd_overlay_plane {
+ 
+ struct bluray_priv_s {
+     BLURAY *bd;
++    // The disc image read through one of mpv's own streams (an http(s)
++    // address, or anything else stream_create opens), see disc_image.h.
++    // Owned once the open succeeds.
++    struct stream *image;
+     struct mp_log *bluray_log;
+     bool probing;               // open is an .iso auto-detection probe
+     BLURAY_TITLE_INFO *title_info;
+@@ -623,6 +628,7 @@ static void bluray_stream_close(stream_t *s)
+         }
+         bd_close(priv->bd);
+     }
++    priv->bd = NULL;
+     mp_mutex_lock(&bluray_log_lock);
+     // If we created the global log, unset it.
+     if (bluray_log == priv->bluray_log)
+@@ -631,6 +637,16 @@ static void bluray_stream_close(stream_t *s)
+     mp_mutex_destroy(&priv->overlay_lock);
+ }
+ 
++static void bluray_stream_close_image(stream_t *s)
++{
++    struct bluray_priv_s *priv = s->priv;
++    bluray_stream_close(s);
++    if (priv && priv->image) {
++        free_stream(priv->image);
++        priv->image = NULL;
++    }
++}
++
+ static const char *bd_event_str(uint32_t event)
+ {
+ #if BLURAY_VERSION >= BLURAY_VERSION_CODE(1, 3, 0)
+@@ -1448,6 +1464,19 @@ static bool select_initial_title(stream_t *s, int title_guess) {
+     return true;
+ }
+ 
++// libbluray's block reader for an image read through an mpv stream: the
++// number of whole 2048-byte blocks read, or -1.
++static int bd_image_read_blocks(void *handle, void *buf, int lba, int num_blocks)
++{
++    struct stream *image = handle;
++    if (lba < 0 || num_blocks <= 0)
++        return -1;
++    if (!stream_seek(image, (int64_t)lba * 2048))
++        return -1;
++    int got = stream_read(image, buf, num_blocks * 2048);
++    return got < 0 ? -1 : got / 2048;
++}
++
+ static int bluray_stream_open_internal(stream_t *s)
+ {
+     struct bluray_priv_s *b = s->priv;
+@@ -1524,13 +1553,20 @@ static int bluray_stream_open_internal(stream_t *s)
+ #endif
+     }
+ 
+-    char *device_tmp = mp_get_user_path(NULL, s->global, device);
+-    char *keyfile = NULL;
+-    if (b->opts->keyfile && b->opts->keyfile[0])
+-        keyfile = mp_get_user_path(NULL, s->global, b->opts->keyfile);
+-    int opened = bd_open_disc(bd, device_tmp, keyfile);
+-    talloc_free(keyfile);
+-    talloc_free(device_tmp);
++    int opened;
++    if (b->image) {
++        // The image's 2048-byte sectors through the stream: libbluray reads
++        // the UDF file system itself, so nothing but random access is needed.
++        opened = bd_open_stream(bd, b->image, bd_image_read_blocks);
++    } else {
++        char *device_tmp = mp_get_user_path(NULL, s->global, device);
++        char *keyfile = NULL;
++        if (b->opts->keyfile && b->opts->keyfile[0])
++            keyfile = mp_get_user_path(NULL, s->global, b->opts->keyfile);
++        opened = bd_open_disc(bd, device_tmp, keyfile);
++        talloc_free(keyfile);
++        talloc_free(device_tmp);
++    }
+     if (!opened) {
+         if (!b->probing)
+             MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
+@@ -1740,6 +1776,30 @@ const stream_info_t stream_info_bluray = {
+     .stream_origin = STREAM_ORIGIN_UNSAFE,
+ };
+ 
++int mp_bluray_open_image(stream_t *s, struct stream *image)
++{
++    struct bluray_priv_s *b = talloc_zero(s, struct bluray_priv_s);
++    s->priv = b;
++    struct MPOpts *opts = mp_get_config_group(NULL, s->global, &mp_opt_root);
++    b->cfg_title = opts->edition_id >= 0 ? opts->edition_id
++                 : opts->disc_menu ? BLURAY_MENU_TITLE : BLURAY_DEFAULT_TITLE;
++    talloc_free(opts);
++    b->cfg_device = talloc_strdup(b, image->url);
++    b->image = image;
++    b->probing = true;
++    int r = bluray_stream_open_internal(s);
++    if (r != STREAM_OK) {
++        // The caller keeps the image (it may be a DVD).
++        b->image = NULL;
++        talloc_free(b);
++        s->priv = NULL;
++        return r;
++    }
++    b->probing = false;
++    s->close = bluray_stream_close_image;
++    return r;
++}
++
+ static bool check_bdmv(const char *path)
+ {
+     if (strcasecmp(mp_basename(path), "MovieObject.bdmv"))
+diff --git a/stream/stream_disc_image.c b/stream/stream_disc_image.c
+new file mode 100644
+index 0000000..b084b0e
+--- /dev/null
++++ b/stream/stream_disc_image.c
+@@ -0,0 +1,72 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// disc://<address>: a Blu-ray or DVD image (.iso) read through mpv's own
++// streams, so an image a media server sends over http(s) plays as a disc:
++// main title, its chapters, the other titles as editions. Tried as a
++// Blu-ray first, then as a DVD.
++
++#include "config.h"
++
++#include "common/msg.h"
++#include "disc_image.h"
++#include "stream.h"
++
++static int disc_image_open(stream_t *s)
++{
++    const char *url = s->path;
++    if (!url || !url[0]) {
++        MP_ERR(s, "disc:// needs the address of a disc image.\n");
++        return STREAM_ERROR;
++    }
++
++    int flags = STREAM_READ | (s->stream_origin & STREAM_ORIGIN_MASK);
++    struct stream *image = stream_create(url, flags, s->cancel, s->global);
++    if (!image) {
++        MP_ERR(s, "Couldn't open the disc image %s\n", url);
++        return STREAM_ERROR;
++    }
++    if (image->seekable == false) {
++        MP_ERR(s, "The disc image can't be read out of order: %s\n", url);
++        free_stream(image);
++        return STREAM_ERROR;
++    }
++
++#if HAVE_LIBBLURAY
++    if (mp_bluray_open_image(s, image) == STREAM_OK) {
++        MP_INFO(s, "Blu-ray disc image.\n");
++        return STREAM_OK;
++    }
++#endif
++#if HAVE_DVDNAV
++    if (mp_dvdnav_open_image(s, image) == STREAM_OK) {
++        MP_INFO(s, "DVD disc image.\n");
++        return STREAM_OK;
++    }
++#endif
++
++    MP_ERR(s, "Not a Blu-ray or DVD disc image this player can play: %s\n", url);
++    free_stream(image);
++    return STREAM_UNSUPPORTED;
++}
++
++const stream_info_t stream_info_disc_image = {
++    .name = "disc_image",
++    .open = disc_image_open,
++    .protocols = (const char*const[]){ "disc", NULL },
++    .stream_origin = STREAM_ORIGIN_UNSAFE,
++};
+diff --git a/stream/stream_dvdnav.c b/stream/stream_dvdnav.c
+index 19f724f..b07d3c7 100644
+--- a/stream/stream_dvdnav.c
++++ b/stream/stream_dvdnav.c
+@@ -26,6 +26,7 @@
+ #include <string.h>
+ #include <errno.h>
+ #include <assert.h>
++#include <sys/uio.h>
+ 
+ #ifdef __linux__
+ #include <linux/cdrom.h>
+@@ -49,6 +50,7 @@
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+ #include "stream.h"
++#include "disc_image.h"
+ #include "demux/demux.h"
+ #include "video/csputils.h"
+ #include "video/out/vo.h"
+@@ -65,6 +67,9 @@
+ 
+ struct priv {
+     dvdnav_t *dvdnav;                   // handle to libdvdnav stuff
++    struct stream *image;               // disc image read through an mpv
++                                        // stream (disc_image.h); owned once
++                                        // the open succeeds
+     struct mp_log *log;                 // borrowed from the stream
+     struct mp_log *lib_log;             // used by libdvdnav's log callback
+     bool probing;                       // open is an .iso auto-detection probe
+@@ -1462,11 +1467,49 @@ static void dvdnav_log(void *p, dvdnav_logger_level_t level,
+     mp_msg(priv->lib_log, lvl, "\n");
+ }
+ 
++// libdvdread's reader for an image read through an mpv stream. Seek: 0 or
++// -1; reads: bytes read, or -1.
++static int image_seek(void *p, uint64_t pos)
++{
++    struct priv *priv = p;
++    return stream_seek(priv->image, pos) ? 0 : -1;
++}
++
++static int image_read(void *p, void *buf, int len)
++{
++    struct priv *priv = p;
++    return stream_read(priv->image, buf, len);
++}
++
++static int image_readv(void *p, void *iovec, int blocks)
++{
++    struct priv *priv = p;
++    struct iovec *iov = iovec;
++    int total = 0;
++    for (int n = 0; n < blocks; n++) {
++        int got = stream_read(priv->image, iov[n].iov_base, iov[n].iov_len);
++        if (got < 0)
++            return -1;
++        total += got;
++        if (got < (int)iov[n].iov_len)
++            break;
++    }
++    return total;
++}
++
+ static dvdnav_status_t nav_open(stream_t *stream, dvdnav_t **dest, const char *path)
+ {
+     struct priv *priv = stream->priv;
+     priv->lib_log = mp_log_new(stream, stream->log, "/libdvdnav");
+     const dvdnav_logger_cb logger_cb = { .pf_log = dvdnav_log };
++    if (priv->image) {
++        static dvdnav_stream_cb image_cb = {
++            .pf_seek = image_seek,
++            .pf_read = image_read,
++            .pf_readv = image_readv,
++        };
++        return dvdnav_open_stream2(dest, priv, &logger_cb, &image_cb);
++    }
+     return dvdnav_open2(dest, priv, &logger_cb, path);
+ }
+ 
+@@ -1518,7 +1561,7 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
+     if (!(priv->filename = mp_get_user_path(priv, stream->global, filename)))
+         return NULL;
+ 
+-    priv->dvd_speed = priv->opts->speed;
++    priv->dvd_speed = priv->image ? 0 : priv->opts->speed;
+     dvd_set_speed(stream, priv->filename, priv->dvd_speed);
+ 
+     if (nav_open(stream, &priv->dvdnav, priv->filename) != DVDNAV_STATUS_OK)
+@@ -1692,6 +1735,39 @@ const stream_info_t stream_info_dvdnav = {
+     .stream_origin = STREAM_ORIGIN_UNSAFE,
+ };
+ 
++static void stream_dvdnav_close_image(stream_t *s)
++{
++    struct priv *priv = s->priv;
++    stream_dvdnav_close(s);
++    if (priv->image) {
++        free_stream(priv->image);
++        priv->image = NULL;
++    }
++}
++
++int mp_dvdnav_open_image(stream_t *stream, struct stream *image)
++{
++    struct priv *priv = talloc_zero(stream, struct priv);
++    stream->priv = priv;
++    struct MPOpts *opts = mp_get_config_group(NULL, stream->global, &mp_opt_root);
++    priv->track = opts->edition_id >= 0 ? opts->edition_id :
++                  (opts->disc_menu ? TITLE_MENU : TITLE_LONGEST);
++    talloc_free(opts);
++    priv->device = talloc_strdup(priv, image->url);
++    priv->image = image;
++    priv->probing = true;
++    int r = open_s_internal(stream);
++    if (r != STREAM_OK) {
++        // The caller keeps the image.
++        priv->image = NULL;
++        talloc_free(priv);
++        stream->priv = NULL;
++        return r;
++    }
++    stream->close = stream_dvdnav_close_image;
++    return r;
++}
++
+ static bool check_ifo(const char *path)
+ {
+     if (strcasecmp(mp_basename(path), "video_ts.ifo"))
+-- 
+2.54.0 (Apple Git-157)
+

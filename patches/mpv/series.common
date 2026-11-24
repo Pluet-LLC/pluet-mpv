@@ -78,3 +78,6 @@
 # --sub-ass-render-threads caps 0205's libass threads (default auto; test
 # test_sub_ass_render_threads.sh).
 0305-sd-ass-render-threads-option.patch
+# disc://<address>: Blu-ray and DVD images (.iso) read through mpv streams,
+# so an image sent over http(s) plays as a disc (Pluet formats, 8).
+0315-stream-disc-images-through-mpv-streams.patch

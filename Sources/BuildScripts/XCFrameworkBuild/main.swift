@@ -21,6 +21,13 @@ do {
         // libbluray
         ZipBaseBuild(library: .libbluray),
 
+        // DVD: libdvdread, then libdvdnav on it (decrypted discs only; no libdvdcss)
+        BuildDvdread(),
+        BuildDvdnav(),
+
+        // Teletext for FFmpeg's libzvbi_teletext decoder
+        BuildZvbi(),
+
         // ffmpeg
         ZipBaseBuild(library: .openssl),
         ZipBaseBuild(library: .libuavs3d),
@@ -120,7 +127,8 @@ enum Versions {
 
 enum Library: String, CaseIterable {
     case libmpv, FFmpeg, libshaderc, vulkan, lcms2, libdovi, openssl, libunibreak, libfreetype,
-        libfribidi, libharfbuzz, libass, libplacebo, libdav1d, libuchardet, libbluray, libluajit, libuavs3d
+        libfribidi, libharfbuzz, libass, libplacebo, libdav1d, libuchardet, libbluray, libluajit, libuavs3d,
+        libdvdread, libdvdnav, libzvbi
 
     /// Component name in `versions.json` and `patches/`. The only mapping
     /// between Swift raw values and canonical component names.
@@ -198,6 +206,12 @@ enum Library: String, CaseIterable {
             return ["Libluajit"]
         case .libuavs3d:
             return ["Libuavs3d"]
+        case .libdvdread:
+            return ["Libdvdread"]
+        case .libdvdnav:
+            return ["Libdvdnav"]
+        case .libzvbi:
+            return ["Libzvbi"]
         }
     }
 }
@@ -356,6 +370,11 @@ private class BuildMPV: BaseBuild {
         } else {
             array.append("-Dlibbluray=disabled")
         }
+        // DVD folders and images (VIDEO_TS, .iso): libdvdnav over libdvdread.
+        // DVD-Audio (dvda) stays off.
+        let dvdnavLibPath = URL.currentDirectory + [Library.libdvdnav.rawValue, platform.rawValue, "thin", arch.rawValue]
+        array.append(FileManager.default.fileExists(atPath: dvdnavLibPath.path) ? "-Ddvdnav=enabled" : "-Ddvdnav=disabled")
+        array.append("-Ddvda=disabled")
         if !(platform == .macos && arch.executable) {
             array.append("-Dcplayer=false")
         }
@@ -550,7 +569,7 @@ private class BuildFFMPEG: BaseBuild {
         let dependencyLibrary = [
             Library.libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan,
             .libshaderc, .lcms2, .libplacebo, .libdav1d, .libdovi, .libuavs3d,
-            .openssl,
+            .openssl, .libzvbi,
         ]
         for library in dependencyLibrary {
             let path =
@@ -688,6 +707,56 @@ private class BuildPlacebo: BaseBuild {
             "-Dd3d11=disabled",
             "-Ddemos=false",
             "-Dtests=false",
+        ]
+    }
+}
+
+/// libdvdread from source (meson), static. No libdvdcss: decrypted discs
+/// and folders only, as the App Store requires.
+private class BuildDvdread: BaseBuild {
+    init() {
+        super.init(library: .libdvdread)
+    }
+
+    override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
+        ["-Ddefault_library=static", "-Dlibdvdcss=disabled", "-Denable_docs=false"]
+    }
+}
+
+/// libdvdnav from source (meson), static, on BuildDvdread's library.
+private class BuildDvdnav: BaseBuild {
+    init() {
+        super.init(library: .libdvdnav)
+    }
+
+    override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
+        ["-Ddefault_library=static", "-Denable_docs=false"]
+    }
+}
+
+/// libzvbi from source (autotools), static: the teletext decoder only. No
+/// capture devices, proxy, PNG export or translations.
+private class BuildZvbi: BaseBuild {
+    init() {
+        super.init(library: .libzvbi)
+    }
+
+    override func beforeBuild() throws {
+        try super.beforeBuild()
+        if !FileManager.default.fileExists(atPath: (directoryURL + "configure").path) {
+            try Utility.launch(path: "/bin/sh", arguments: ["-c", "autoreconf -fi -I m4"],
+                currentDirectoryURL: directoryURL,
+                environment: ["PATH": "/opt/homebrew/bin:/opt/homebrew/opt/gettext/bin:" + BaseBuild.defaultPath])
+        }
+    }
+
+    override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
+        let host = arch == .x86_64 ? "x86_64-apple-darwin" : "aarch64-apple-darwin"
+        return [
+            "--host=\(host)", "--enable-static", "--disable-shared", "--with-pic",
+            "--disable-v4l", "--disable-dvb", "--disable-bktr", "--disable-proxy",
+            "--disable-nls", "--without-doxygen", "--disable-tests", "--disable-examples",
+            "--without-x", "ac_cv_lib_png_png_destroy_write_struct=no",
         ]
     }
 }
