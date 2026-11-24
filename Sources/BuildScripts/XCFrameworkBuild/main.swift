@@ -759,6 +759,18 @@ private class BuildZvbi: BaseBuild {
             "--without-x", "ac_cv_lib_png_png_destroy_write_struct=no",
         ]
     }
+
+    /// Only the library and its pkg-config file: the tools under contrib/,
+    /// daemon/ and test/ are desktop programs that don't link for iOS/tvOS.
+    override func build(platform: PlatformType, arch: ArchType) throws {
+        let buildURL = scratch(platform: platform, arch: arch)
+        try? FileManager.default.createDirectory(at: buildURL, withIntermediateDirectories: true, attributes: nil)
+        let environ = environment(platform: platform, arch: arch)
+        try configure(buildURL: buildURL, environ: environ, platform: platform, arch: arch)
+        for target in [["-C", "src", "-j8"], ["-C", "src", "install"], ["install-pkgconfigDATA"]] {
+            try Utility.launch(path: "/usr/bin/make", arguments: target, currentDirectoryURL: buildURL, environment: environ)
+        }
+    }
 }
 
 private class BuildASS: BaseBuild {
