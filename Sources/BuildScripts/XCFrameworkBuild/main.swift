@@ -757,6 +757,9 @@ private class BuildZvbi: BaseBuild {
             "--disable-v4l", "--disable-dvb", "--disable-bktr", "--disable-proxy",
             "--disable-nls", "--without-doxygen", "--disable-tests", "--disable-examples",
             "--without-x", "ac_cv_lib_png_png_destroy_write_struct=no",
+            // Cross builds: configure cannot run its malloc/realloc probes and
+            // would link against rpl_realloc, which nothing provides.
+            "ac_cv_func_malloc_0_nonnull=yes", "ac_cv_func_realloc_0_nonnull=yes",
         ]
     }
 
