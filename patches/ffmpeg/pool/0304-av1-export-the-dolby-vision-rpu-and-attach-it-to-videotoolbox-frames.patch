@@ -1,0 +1,339 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH] av1: export the Dolby Vision RPU in HEVC's layout; attach it
+ to VideoToolbox frames
+
+Dolby Vision profile 10 (AV1: 10.0, 10.1, 10.4) carries its RPU in ITU-T
+T.35 metadata OBUs wrapped in EMDF. The AV1 decoders (native and libdav1d)
+parse it into AV_FRAME_DATA_DOVI_METADATA but, unlike the HEVC decoder,
+export no AV_FRAME_DATA_DOVI_RPU_BUFFER. Apple's display pipeline takes a
+Dolby Vision frame's RPU as the pixel buffer's DolbyVisionRPUData
+attachment, in the layout the HEVC decoder exports (the UNSPEC62 NAL payload
+after its header: the 0x19 prefix and the RPU, emulation prevention
+included), which a Dolby Vision HEVC VideoToolbox session attaches to its
+output by itself. VideoToolbox has no Dolby Vision AV1 session, so an AV1
+profile 10 frame reached the display as its base layer only.
+
+ff_dovi_attach_rpu_buffer() writes the parsed metadata back out with
+ff_dovi_rpu_generate() (FF_DOVI_WRAP_NAL, no metadata compression), from a
+DOVIContext the decoder keeps for that alone, checks that FFmpeg's own
+parser takes it back (CRC32 included; its refusals are logged at trace
+level), and attaches it as AV_FRAME_DATA_DOVI_RPU_BUFFER: an RPU the writer
+cannot reproduce (an empty DM v1 block list) is never handed on. Both AV1 decoders call it after attaching the
+metadata; a failure is logged at debug level and leaves the frame as it was.
+On a VideoToolbox frame the native decoder then hands the RPU to
+ff_videotoolbox_attach_dovi_rpu(), which sets it as DolbyVisionRPUData on
+the decoded buffer unless it has one. Software-decoded frames get the side
+data only: vo_avfoundation's profile 5 path (mpv 0004, region "avf dovi
+profile5 rpu") attaches it to a frame without an HDR10/HLG base (10.0) and
+leaves 10.1 and 10.4 frames presenting their base layer, as profile 8.
+
+The av1 and libdav1d decoders select dovi_rpuenc, which now selects
+dovi_rpudec for that check.
+
+scripts/test_dovi_rpu_layers.sh builds a host libavcodec of the Apple series
+and writes back every RPU in libdovi's test assets: each parses to the same
+header, mapping, colour metadata and extension blocks (profile 4's colour
+metadata excepted, which no AV1 stream carries), and the one the writer
+cannot reproduce is refused.
+
+Checked on the host with a profile 10.1 AV1 file encoded by libsvtav1 from a
+profile 8.1 HEVC file: every frame carries an RPU dovi_tool parses (CRC32
+intact), with the same mapping and the same level 1, 2, 4, 5, 6, 9, 11 and
+254 metadata as the source's, in another block order.
+
+diff --git a/configure b/configure
+index 722460c..78c1d45 100755
+--- a/configure
++++ b/configure
+@@ -2890,7 +2890,7 @@ cbs_vp9_select="cbs"
+ deflate_wrapper_deps="zlib"
+ dirac_parse_select="golomb"
+ dovi_rpudec_select="golomb"
+-dovi_rpuenc_select="golomb"
++dovi_rpuenc_select="golomb dovi_rpudec"
+ dnn_deps="avformat swscale"
+ dnn_deps_any="libtensorflow libopenvino libtorch"
+ error_resilience_select="me_cmp"
+@@ -2957,7 +2957,7 @@ asv2_encoder_select="aandcttables bswapdsp fdctdsp pixblockdsp"
+ atrac1_decoder_select="sinewin"
+ atrac3p_decoder_select="sinewin"
+ atrac3pal_decoder_select="sinewin"
+-av1_decoder_select="atsc_a53 cbs_av1 dovi_rpudec"
++av1_decoder_select="atsc_a53 cbs_av1 dovi_rpudec dovi_rpuenc"
+ bink_decoder_select="blockdsp hpeldsp"
+ binkaudio_dct_decoder_select="wma_freqs"
+ binkaudio_rdft_decoder_select="wma_freqs"
+@@ -3602,7 +3602,7 @@ libcelt_decoder_deps="libcelt"
+ libcodec2_decoder_deps="libcodec2"
+ libcodec2_encoder_deps="libcodec2"
+ libdav1d_decoder_deps="libdav1d"
+-libdav1d_decoder_select="atsc_a53 dovi_rpudec"
++libdav1d_decoder_select="atsc_a53 dovi_rpudec dovi_rpuenc"
+ libdavs2_decoder_deps="libdavs2"
+ libdavs2_decoder_select="avs2_parser"
+ libfdk_aac_decoder_deps="libfdk_aac"
+diff --git a/libavcodec/av1dec.c b/libavcodec/av1dec.c
+index be59548..fa356f7 100644
+--- a/libavcodec/av1dec.c
++++ b/libavcodec/av1dec.c
+@@ -29,6 +29,9 @@
+ #include "avcodec.h"
+ #include "av1_parse.h"
+ #include "av1dec.h"
++#if CONFIG_AV1_VIDEOTOOLBOX_HWACCEL
++#include "vt_internal.h"
++#endif
+ #include "atsc_a53.h"
+ #include "bytestream.h"
+ #include "codec_internal.h"
+@@ -760,6 +763,7 @@ static av_cold int av1_decode_free(AVCodecContext *avctx)
+     ff_cbs_fragment_free(&s->current_obu);
+     ff_cbs_close(&s->cbc);
+     ff_dovi_ctx_unref(&s->dovi);
++    ff_dovi_ctx_unref(&s->dovi_enc);
+ 
+     return 0;
+ }
+@@ -1028,6 +1032,17 @@ FF_ENABLE_DEPRECATION_WARNINGS
+         ret = ff_dovi_attach_side_data(&s->dovi, frame);
+         if (ret < 0)
+             return ret;
++
++        // The RPU in HEVC's layout too, for pipelines that take one per
++        // frame; under VideoToolbox it goes onto the decoded buffer as a
++        // Dolby Vision HEVC session's output carries it. A failure leaves
++        // the frame as it was (its metadata already attached).
++        if (ff_dovi_attach_rpu_buffer(&s->dovi_enc, &s->dovi, frame) < 0)
++            av_log(avctx, AV_LOG_DEBUG, "Could not write the Dolby Vision RPU buffer.\n");
++#if CONFIG_AV1_VIDEOTOOLBOX_HWACCEL
++        else if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX)
++            ff_videotoolbox_attach_dovi_rpu(frame);
++#endif
+     } else {
+         // ignore unsupported provider codes
+     }
+diff --git a/libavcodec/av1dec.h b/libavcodec/av1dec.h
+index 10c807f..e3b76c6 100644
+--- a/libavcodec/av1dec.h
++++ b/libavcodec/av1dec.h
+@@ -103,6 +103,8 @@ typedef struct AV1DecContext {
+     AV1RawOBU *mdcv_ref;   ///< RefStruct reference backing mdcv
+     AV1RawMetadataHDRMDCV *mdcv;
+     DOVIContext dovi;
++    // Writes each frame's RPU in HEVC's layout (ff_dovi_attach_rpu_buffer).
++    DOVIContext dovi_enc;
+     AVFifo *itut_t35_fifo;
+ 
+     uint16_t tile_num;
+diff --git a/libavcodec/dovi_rpu.h b/libavcodec/dovi_rpu.h
+index 1b74983..6fec8e8 100644
+--- a/libavcodec/dovi_rpu.h
++++ b/libavcodec/dovi_rpu.h
+@@ -174,6 +174,24 @@ enum {
+ int ff_dovi_rpu_generate(DOVIContext *s, const AVDOVIMetadata *metadata,
+                          int flags, uint8_t **out_rpu, int *out_size);
+ 
++/**
++ * Attach the RPU that [frame]'s AV_FRAME_DATA_DOVI_METADATA describes as
++ * AV_FRAME_DATA_DOVI_RPU_BUFFER, in the layout the HEVC decoder exports it
++ * (the UNSPEC62 NAL payload after its two-byte header: the 0x19 prefix, the
++ * RPU, emulation prevention included), for a decoder whose bitstream wraps
++ * the RPU otherwise (AV1: ITU-T T.35 and EMDF). Display pipelines that take
++ * an RPU per frame (Apple's DolbyVisionRPUData) take it in that layout.
++ *
++ * `enc` is a context of the caller's own, used only for this: its state
++ * follows the RPUs generated with it. Its configuration is `dec`'s, without
++ * metadata compression. A frame without metadata, or that already has an
++ * RPU buffer, is left alone.
++ *
++ * Returns 0 or a negative error code; the frame is unchanged on error.
++ */
++int ff_dovi_attach_rpu_buffer(DOVIContext *enc, const DOVIContext *dec,
++                              AVFrame *frame);
++
+ 
+ /***************************************************
+  * The following section is for internal use only. *
+diff --git a/libavcodec/dovi_rpuenc.c b/libavcodec/dovi_rpuenc.c
+index fa351c2..18da565 100644
+--- a/libavcodec/dovi_rpuenc.c
++++ b/libavcodec/dovi_rpuenc.c
+@@ -20,9 +20,13 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <stddef.h>
++#include <string.h>
++
+ #include "libavutil/attributes.h"
+ #include "libavutil/avassert.h"
+ #include "libavutil/crc.h"
++#include "libavutil/log.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/refstruct.h"
+ 
+@@ -940,3 +944,84 @@ int ff_dovi_rpu_generate(DOVIContext *s, const AVDOVIMetadata *metadata,
+         return 0;
+     }
+ }
++
++// The verifying parse below reports what it refuses at trace level: an RPU
++// this writer cannot represent is a property of the stream, met on every
++// frame, and the caller already says so once.
++typedef struct QuietLog {
++    const AVClass *class;
++    int level_offset;
++} QuietLog;
++
++static const AVClass quiet_log_class = {
++    .class_name                = "dovi_rpu_check",
++    .item_name                 = av_default_item_name,
++    .version                   = LIBAVUTIL_VERSION_INT,
++    .log_level_offset_offset   = offsetof(QuietLog, level_offset),
++};
++
++// Whether FFmpeg's own parser takes the RPU written in the NAL layout (0x19
++// prefix, emulation prevention): a consumer must never be handed one that
++// does not describe the frame.
++static int rpu_parses(const uint8_t *nal, int size)
++{
++    QuietLog quiet = { &quiet_log_class, AV_LOG_TRACE - AV_LOG_PANIC };
++    DOVIContext check = { .logctx = &quiet };
++    uint8_t *raw = av_malloc(size + AV_INPUT_BUFFER_PADDING_SIZE);
++    int n = 0, ret;
++
++    if (!raw)
++        return AVERROR(ENOMEM);
++    for (int i = 0; i < size; i++) {
++        if (i >= 2 && nal[i] == 3 && !nal[i - 1] && !nal[i - 2])
++            continue;
++        raw[n++] = nal[i];
++    }
++    memset(raw + n, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++    ret = ff_dovi_rpu_parse(&check, raw, n, AV_EF_CRCCHECK);
++    ff_dovi_ctx_unref(&check);
++    av_free(raw);
++    return ret;
++}
++
++int ff_dovi_attach_rpu_buffer(DOVIContext *enc, const DOVIContext *dec,
++                              AVFrame *frame)
++{
++    const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
++    AVBufferRef *buf;
++    uint8_t *rpu = NULL;
++    int size = 0, ret;
++
++    if (!sd || av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER))
++        return 0;
++
++    enc->logctx = dec->logctx;
++    enc->cfg = dec->cfg;
++    enc->cfg.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
++    if (!enc->cfg.dv_profile)
++        return 0;
++
++    ret = ff_dovi_rpu_generate(enc, (const AVDOVIMetadata *)sd->data,
++                               FF_DOVI_WRAP_NAL, &rpu, &size);
++    if (ret < 0)
++        return ret;
++    if (!rpu || size <= 0) {
++        av_free(rpu);
++        return 0;
++    }
++    if ((ret = rpu_parses(rpu, size)) < 0) {
++        av_free(rpu);
++        return ret == AVERROR(ENOMEM) ? ret : AVERROR_INVALIDDATA;
++    }
++
++    buf = av_buffer_create(rpu, size, NULL, NULL, 0);
++    if (!buf) {
++        av_free(rpu);
++        return AVERROR(ENOMEM);
++    }
++    if (!av_frame_new_side_data_from_buf(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER, buf)) {
++        av_buffer_unref(&buf);
++        return AVERROR(ENOMEM);
++    }
++    return 0;
++}
+diff --git a/libavcodec/libdav1d.c b/libavcodec/libdav1d.c
+index a1158a2..34e7001 100644
+--- a/libavcodec/libdav1d.c
++++ b/libavcodec/libdav1d.c
+@@ -47,6 +47,7 @@ typedef struct Libdav1dContext {
+     Dav1dContext *c;
+     AVBufferPool *pool;
+     DOVIContext dovi;
++    DOVIContext dovi_enc;
+     int pool_size;
+ 
+     Dav1dData data;
+@@ -454,6 +455,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
+         res = ff_dovi_attach_side_data(&dav1d->dovi, frame);
+         if (res < 0)
+             return res;
++        if (ff_dovi_attach_rpu_buffer(&dav1d->dovi_enc, &dav1d->dovi, frame) < 0)
++            av_log(c, AV_LOG_DEBUG, "Could not write the Dolby Vision RPU buffer.\n");
+     } else {
+         // ignore unsupported provider codes
+     }
+@@ -658,6 +661,7 @@ static av_cold int libdav1d_close(AVCodecContext *c)
+ 
+     av_buffer_pool_uninit(&dav1d->pool);
+     ff_dovi_ctx_unref(&dav1d->dovi);
++    ff_dovi_ctx_unref(&dav1d->dovi_enc);
+     dav1d_data_unref(&dav1d->data);
+     dav1d_close(&dav1d->c);
+ 
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index ae43a98..d586cff 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -161,6 +161,27 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
+     return 0;
+ }
+ 
++void ff_videotoolbox_attach_dovi_rpu(AVFrame *frame)
++{
++    CVPixelBufferRef pixbuf;
++    const AVFrameSideData *sd;
++    CFDataRef data;
++
++    if (frame->format != AV_PIX_FMT_VIDEOTOOLBOX)
++        return;
++    pixbuf = (CVPixelBufferRef)frame->data[3];
++    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++    if (!pixbuf || !sd || !sd->size ||
++        CVBufferGetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), NULL))
++        return;
++    data = CFDataCreate(kCFAllocatorDefault, sd->data, sd->size);
++    if (!data)
++        return;
++    CVBufferSetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), data,
++                          kCVAttachmentMode_ShouldPropagate);
++    CFRelease(data);
++}
++
+ int ff_videotoolbox_alloc_frame(AVCodecContext *avctx, AVFrame *frame)
+ {
+     size_t      size = sizeof(VTHWFrame);
+diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
+index f62f750..beb738f 100644
+--- a/libavcodec/vt_internal.h
++++ b/libavcodec/vt_internal.h
+@@ -77,6 +77,13 @@ int ff_videotoolbox_h264_decode_slice(AVCodecContext *avctx,
+                                       const uint8_t *buffer,
+                                       uint32_t size);
+ int ff_videotoolbox_common_end_frame(AVCodecContext *avctx, AVFrame *frame);
++/**
++ * Give a decoded VideoToolbox frame the Dolby Vision RPU of its
++ * AV_FRAME_DATA_DOVI_RPU_BUFFER as the DolbyVisionRPUData attachment, as a
++ * Dolby Vision HEVC session attaches it to its output, for a codec that has
++ * no such session (AV1 profile 10). A buffer that has one keeps it.
++ */
++void ff_videotoolbox_attach_dovi_rpu(AVFrame *frame);
+ CFDataRef ff_videotoolbox_av1c_extradata_create(AVCodecContext *avctx);
+ CFDataRef ff_videotoolbox_avcc_extradata_create(AVCodecContext *avctx);
+ CFDataRef ff_videotoolbox_hvcc_extradata_create(AVCodecContext *avctx);

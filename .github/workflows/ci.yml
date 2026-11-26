@@ -129,6 +129,11 @@ jobs:
                 subprocess.run(['bash', 'scripts/test_hwdec_recovery.sh', str(dest)], check=True)
                 # vo_avfoundation's vsync snap on synthetic clocks (0307).
                 subprocess.run(['bash', 'scripts/test_avf_vsync_snap.sh', str(dest)], check=True)
+                # Dolby Vision RPUs: mpv 0316's enhancement layer kind and
+                # FFmpeg 0304's RPU write-back, over libdovi's test RPUs with
+                # a host libavcodec of the ffmpeg/apple tree checked above.
+                subprocess.run(['bash', 'scripts/test_dovi_rpu_layers.sh', str(dest),
+                                str(work / 'ffmpeg-apple')], check=True)
               if component == 'ffmpeg' and group == 'apple':
                 # VideoToolbox's Dolby Vision profile 7 mode: plain C, stub types.
                 subprocess.run(['bash', 'scripts/test_vt_dovi_conversion_mode.sh', str(dest)], check=True)

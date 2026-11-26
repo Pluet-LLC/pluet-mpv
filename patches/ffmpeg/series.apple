@@ -34,3 +34,7 @@
 # file is handed to Apple's SecTrust for the host name (as curl's
 # --with-apple-sectrust): roots the device trusts are honoured.
 0303-tls-openssl-apple-sectrust-fallback.patch
+# Dolby Vision profile 10 (AV1): the RPU exported in HEVC's layout, and
+# attached to VideoToolbox frames as a Dolby Vision HEVC session's output
+# carries it (test test_dovi_rpu_layers.sh).
+0304-av1-export-the-dolby-vision-rpu-and-attach-it-to-videotoolbox-frames.patch

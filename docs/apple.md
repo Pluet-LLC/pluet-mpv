@@ -132,6 +132,29 @@ sets it on the decoders that have it, and
 `PLUET_DV_CONVERSION_MODE`, else `PLEZY_DV_CONVERSION_MODE`, once when the
 hardware decoder opens (FFmpeg patch 0300, mpv patch 0301).
 
+Neither VideoToolbox nor FFmpeg decodes the enhancement layer: a minimal one
+(MEL) loses nothing, a full one (FEL) loses picture. mpv's
+`video-params/dolby-vision-el` (and `video-dec-params/...`) says which the
+current frame's RPU describes, `mel` or `fel`, decided as libdovi's
+`is_mel()` (mpv patch 0316), so a player can ask whether to show Dolby
+Vision without the layer or, with `--vd-lavc-dv-conversion=hevc-strip` and
+`--vf=format:dolbyvision=no`, the HDR10 base.
+
+Dolby Vision profile 10 (AV1) has no VideoToolbox session of its own. The
+AV1 decoders export each frame's RPU as `AV_FRAME_DATA_DOVI_RPU_BUFFER` in
+the HEVC decoder's layout, written back from the parsed metadata and kept
+only when FFmpeg parses it again, and on a VideoToolbox frame the native
+decoder attaches it to the pixel buffer as `DolbyVisionRPUData`, as a Dolby
+Vision HEVC session's output carries it (FFmpeg patch 0304).
+Software-decoded 10.0 frames get it from vo_avfoundation's profile 5 path;
+10.1 and 10.4 decoded in software present their base layer.
+
+HDR10+ needs nothing of its own: FFmpeg parses the ST 2094-40 SEIs into
+`AV_FRAME_DATA_DYNAMIC_HDR_PLUS` (hwaccel included, with FFmpeg 0016
+forwarding the prefix SEIs to VideoToolbox), and vo_avfoundation attaches
+each frame's metadata to its display sample as
+`kCMSampleAttachmentKey_HDR10PlusPerFrameData` (mpv 0004, part 0030).
+
 The apple libdovi prebuilt (3.3.2) aborts the process if its parser panics,
 so VideoToolbox converts only RPUs whose size, prefix, final byte and CRC32
 libdovi would accept; any other RPU is dropped (the frame decodes through its

@@ -81,3 +81,7 @@
 # resume) behind --avfoundation-restart-frames, default off; every auto
 # pacing decision logged.
 0313-avfoundation-restart-frames-switch-and-pace-decision-log.patch
+# Dolby Vision profile 7: whether the RPU's enhancement layer is minimal or
+# full (video-params/dolby-vision-el), for the player's question about a FEL
+# title (test test_dovi_rpu_layers.sh).
+0316-video-dolby-vision-enhancement-layer-kind.patch

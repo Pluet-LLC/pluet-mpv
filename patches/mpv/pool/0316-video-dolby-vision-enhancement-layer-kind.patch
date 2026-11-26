@@ -1,0 +1,164 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH] video: say whether a Dolby Vision RPU has a full enhancement
+ layer (video-params/dolby-vision-el)
+
+A Dolby Vision profile 7 stream carries an enhancement layer that is either
+minimal (MEL: its residual is a no-op, the base layer and the RPU are the
+whole picture) or full (FEL: the picture needs the layer). VideoToolbox
+decodes neither: FFmpeg converts profile 7 to profile 8.1 and drops the
+layer (FFmpeg 0003/0300). For a MEL stream that loses nothing; for a FEL
+stream the player should ask whether to show Dolby Vision without the layer
+or the HDR10 base. The demuxer's configuration record cannot tell the two
+apart: only the RPU's NLQ parameters do.
+
+mp_image_from_av_frame() now reads them from FFmpeg's AVDOVIMetadata into
+mp_image_params.dovi_el, decided as libdovi's RpuDataNlq::is_mel() (what
+dovi_tool reports as "Profile: 7 (MEL)" or "(FEL)"): no residual (the
+disable_residual_flag, a non-zero rpu_format layout, or no NLQ method) is
+none; NLQ offset 0, vdr_in_max 1.0 and a zero linear dead zone in all three
+components is MEL; anything else is FEL. The field is dynamic metadata, as
+repr.dovi is: mp_image_params_equal() does not compare it, so a stream whose
+frames disagree never reconfigures the chain.
+
+video-params/dolby-vision-el (and video-dec-params/..., video-out-params/...)
+is "mel" or "fel", unavailable otherwise.
+
+scripts/test_dovi_rpu_layers.sh compiles the decision (the marked "dovi el
+kind" region of video/mp_image.c) against a host libavcodec of the
+patched FFmpeg and checks it on every RPU in libdovi's test assets against
+dovi_tool's own verdict, MEL, FEL and RPUs without a residual alike.
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 499fe3c..1092ce7 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2941,6 +2941,16 @@ Property list
+     ``video-params/chroma-location``
+         Chroma location as string. (Exact values subject to change.)
+ 
++    ``video-params/dolby-vision-el``
++        What the current frame's Dolby Vision RPU says of an enhancement
++        layer: ``mel`` (minimal: its residual changes nothing, so the base
++        layer with the RPU is the whole picture) or ``fel`` (full: the
++        picture needs the enhancement layer). Decided as libdovi's
++        ``is_mel()``. Unavailable without an RPU or for an RPU without a
++        residual (profiles 5, 8 and 10). Most useful as
++        ``video-dec-params/dolby-vision-el``, before filters such as
++        ``format:dolbyvision=no``.
++
+     ``video-params/rotate``
+         Intended display rotation in degrees (clockwise).
+ 
+diff --git a/player/command.c b/player/command.c
+index a43a56d..e3ac82a 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2644,6 +2644,9 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+             SUB_PROP_STR(m_opt_choice_str(pl_chroma_names, p->chroma_location))},
+         {"stereo-in",
+             SUB_PROP_STR(m_opt_choice_str(mp_stereo3d_names, p->stereo3d))},
++        {"dolby-vision-el",
++            SUB_PROP_STR(p->dovi_el == MP_DOVI_EL_FEL ? "fel" : "mel"),
++            .unavailable = p->dovi_el == MP_DOVI_EL_NONE},
+         {"rotate",          SUB_PROP_INT(p->rotate)},
+         {"alpha",
+             SUB_PROP_STR(m_opt_choice_str(pl_alpha_names, alpha)),
+diff --git a/video/mp_image.c b/video/mp_image.c
+index a90c127..a66a23e 100644
+--- a/video/mp_image.c
++++ b/video/mp_image.c
+@@ -570,6 +570,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
+     dst->params.sys_orig = src->params.sys_orig;
+     dst->params.no_dovi = src->params.no_dovi;
+     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
++    dst->params.dovi_el = src->params.dovi_el;
+ 
+     // ensure colorspace consistency
+     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);
+@@ -1099,6 +1100,56 @@ void mp_image_params_guess_csp(struct mp_image_params *params)
+ }
+ 
+ // Create a new mp_image reference to av_frame.
++// --- dovi el kind (host-testable: libavutil types only) ---
++// What a Dolby Vision RPU says of its enhancement layer, decided as libdovi's
++// RpuDataNlq::is_mel() (dovi_tool's "Profile: 7 (MEL)" / "(FEL)"): an RPU
++// with no residual (disable_residual_flag, a non-zero rpu_format layout, or
++// no NLQ method) has none; one whose NLQ is the identity in all three
++// components (offset 0, vdr_in_max 1.0, a zero linear dead zone) is a
++// minimal enhancement layer, which a decoder may drop without changing the
++// picture; anything else is a full enhancement layer. vdr_in_max and the
++// dead zone are fixed point with coef_log2_denom fractional bits, as FFmpeg
++// stores them (a float RPU is scaled the same way).
++static int mp_dovi_el_kind(int disable_residual, int rpu_format,
++                           int nlq_method, int coef_log2_denom,
++                           const uint16_t offset[3], const uint64_t in_max[3],
++                           const uint64_t dz_slope[3],
++                           const uint64_t dz_threshold[3])
++{
++    // nlq_method: 0 linear dead zone, anything else (FFmpeg's NONE, -1, or a
++    // reserved value) carries no residual mapping.
++    if (disable_residual || (rpu_format & 0x700) || nlq_method != 0 ||
++        coef_log2_denom < 0 || coef_log2_denom > 63)
++        return 0;
++    const uint64_t one = (uint64_t)1 << coef_log2_denom;
++    for (int c = 0; c < 3; c++) {
++        if (offset[c] || in_max[c] != one || dz_slope[c] || dz_threshold[c])
++            return 2;
++    }
++    return 1;
++}
++
++// mp_dovi_el_kind() of an FFmpeg-parsed RPU: an enum mp_dovi_el value.
++static int mp_dovi_el_from_av(const AVDOVIMetadata *metadata)
++{
++    const AVDOVIRpuDataHeader *hdr = av_dovi_get_header(metadata);
++    const AVDOVIDataMapping *map = av_dovi_get_mapping(metadata);
++    uint16_t offset[3];
++    uint64_t in_max[3], slope[3], threshold[3];
++    for (int c = 0; c < 3; c++) {
++        offset[c] = map->nlq[c].nlq_offset;
++        in_max[c] = map->nlq[c].vdr_in_max;
++        slope[c] = map->nlq[c].linear_deadzone_slope;
++        threshold[c] = map->nlq[c].linear_deadzone_threshold;
++    }
++    int method = map->nlq_method_idc == AV_DOVI_NLQ_LINEAR_DZ ? 0 : -1;
++    // 0, 1 and 2 are MP_DOVI_EL_NONE, _MEL and _FEL.
++    return mp_dovi_el_kind(hdr->disable_residual_flag, hdr->rpu_format, method,
++                           hdr->coef_log2_denom, offset, in_max, slope,
++                           threshold);
++}
++// --- end dovi el kind ---
++
+ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+ {
+     struct mp_image *dst = &(struct mp_image){0};
+@@ -1210,6 +1261,7 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+     if (sd) {
+ #ifdef PL_HAVE_LAV_DOLBY_VISION
+         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
++        dst->params.dovi_el = mp_dovi_el_from_av(metadata);
+         dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
+         MP_HANDLE_OOM(dovi);
+         pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,
+diff --git a/video/mp_image.h b/video/mp_image.h
+index f5c1562..82f4674 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -66,6 +66,16 @@ struct mp_image_params {
+     // Flags for f_enhancement_pair.c to not inherit flags from EL.
+     bool no_dovi;
+     bool no_enhancement_layer;
++    // Dolby Vision enhancement layer the frame's RPU describes (enum
++    // mp_dovi_el), read from FFmpeg's AVDOVIMetadata. Dynamic metadata: not
++    // compared by mp_image_params_equal(), so it never reconfigures the chain.
++    int dovi_el;
++};
++
++enum mp_dovi_el {
++    MP_DOVI_EL_NONE = 0, // no RPU, or one without a residual (profiles 5, 8, 10)
++    MP_DOVI_EL_MEL,      // minimal enhancement layer: its residual is a no-op
++    MP_DOVI_EL_FEL,      // full enhancement layer: the picture needs it
+ };
+ 
+ /* Memory management:
