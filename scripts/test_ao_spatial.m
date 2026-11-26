@@ -73,11 +73,13 @@ void *mp_spatial_create(int codec, bool lossless, int channels, void *synchroniz
     s->buffer_limit = buffer_limit;
     return s->refuse ? NULL : s;
 }
-void *mp_spatial_create_pcm(const int8_t *slots, int channels, void *synchronizer, size_t buffer_limit)
+void *mp_spatial_create_pcm(const int8_t *slots, int channels, int layout, void *synchronizer,
+                            size_t buffer_limit)
 {
     struct fake_sink *s = opening_sink;
     if (!s) return NULL;
     s->codec = 0;
+    s->layout = layout;
     s->pcm_channels = channels;
     memcpy(s->slots, slots, channels);
     s->synchronizer = synchronizer;
@@ -586,6 +588,29 @@ int main(void)
                   "only the 7.1.4 speakers are offered");
             uninit(mat);
         }
+        // A 9.1.6 channel check (FFmpeg's 9.1.6: wides as FLC/FRC, top
+        // middles as TSL/TSR) with the 9.1.6 layout: every channel in its
+        // Atmos 9.1.6 slot.
+        {
+            static const uint8_t ff916[16] = {
+                MP_SPEAKER_ID_FL, MP_SPEAKER_ID_FR, MP_SPEAKER_ID_FC, MP_SPEAKER_ID_LFE,
+                MP_SPEAKER_ID_BL, MP_SPEAKER_ID_BR, MP_SPEAKER_ID_FLC, MP_SPEAKER_ID_FRC,
+                MP_SPEAKER_ID_SL, MP_SPEAKER_ID_SR, MP_SPEAKER_ID_TFL, MP_SPEAKER_ID_TFR,
+                MP_SPEAKER_ID_TBL, MP_SPEAKER_ID_TBR, MP_SPEAKER_ID_TSL, MP_SPEAKER_ID_TSR,
+            };
+            // L R C LFE Ls Rs Rls Rrs Lw Rw Vhl Vhr Ltm Rtm Ltr Rtr
+            static const int8_t want[16] = {0, 1, 2, 3, 6, 7, 8, 9, 4, 5, 10, 11, 14, 15, 12, 13};
+            offered_speakers = 0;
+            struct ao *nine = new_ao(s, AF_FORMAT_S32);
+            ((struct priv *)nine->priv)->opt_force_mat = true;
+            ((struct priv *)nine->priv)->opt_layout = 16;
+            nine->channels.num = 16;
+            memcpy(nine->channels.speaker, ff916, 16);
+            CHECK(init(nine) == 0 && s->layout == 16 && s->pcm_channels == 16, "9.1.6 PCM opens in the 9.1.6 layout");
+            CHECK(!memcmp(s->slots, want, 16), "every 9.1.6 channel in its Atmos 9.1.6 slot");
+            uninit(nine);
+        }
+
         // A renderer refusing the PCM leaves it to the next output.
         struct ao *refusing = new_ao(s, AF_FORMAT_FLOAT);
         ((struct priv *)refusing->priv)->opt_force_mat = true;

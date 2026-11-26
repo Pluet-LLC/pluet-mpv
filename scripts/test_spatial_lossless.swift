@@ -160,6 +160,20 @@ struct Main {
             check(ok, "Force Dolby MAT \(name): every channel in its 7.1.4 slot, bit-identical, other slots silent")
         }
 
+        // 3b. A 9.1.6 channel check into the 9.1.6 layout.
+        do {
+            let slots = [0, 1, 2, 3, 6, 7, 8, 9, 4, 5, 10, 11, 14, 15, 12, 13]
+            var input = [Float](repeating: 0, count: 300 * 16)
+            for i in input.indices { input[i] = Float(i % 16 + 1) / 32 }
+            let decoder = PCMSlotDecoder(slots: slots, layout: 16)
+            let blocks = try input.withUnsafeBytes { try decoder.decode($0, end: false) }
+            var ok = blocks.count == 1 && blocks[0].channels == 16 && blocks[0].frames == 300
+            for f in 0..<300 where ok {
+                for (c, s) in slots.enumerated() { ok = ok && blocks[0].samples[f * 16 + s] == input[f * 16 + c] }
+            }
+            check(ok, "9.1.6 PCM: every channel in its Atmos 9.1.6 slot, bit-identical")
+        }
+
         // 4. Failure kinds.
         check(mpSpatialFailureKind(SpatialAudioError.unsupported("plain TrueHD"), lossless: true) == 2,
               "a stream without objects falls back to decoding (lossless route)")

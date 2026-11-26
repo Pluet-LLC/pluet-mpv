@@ -32,7 +32,8 @@ bitstream but TrueHD and DTS-HD (AC-3, E-AC-3) go to the next output as
 before.
 
 --ao-spatial-layout=7.1.4|9.1.6 (default 7.1.4) picks the rendered
-layout. Apple TV's Dolby MAT output was measured to carry 12 channels and
+layout, and the one Force Dolby MAT places decoded PCM in (with 9.1.6, a
+16-channel 9.1.6 file goes in unchanged; FFmpeg's FLC/FRC are the wides). Apple TV's Dolby MAT output was measured to carry 12 channels and
 fold 9.1.6 into 7.1.4; 9.1.6 is there to compare on a receiver. With it the
 output asks the session for 16 output channels (public
 setPreferredOutputNumberOfChannels), and on iOS and tvOS it logs the
@@ -44,10 +45,10 @@ the audio reconfig event, like current-ao.
 
 ---
 diff --git a/audio/out/ao_spatial.h b/audio/out/ao_spatial.h
-index e9d11c0..7911945 100644
+index e9d11c0..7992665 100644
 --- a/audio/out/ao_spatial.h
 +++ b/audio/out/ao_spatial.h
-@@ -10,9 +10,32 @@ enum {
+@@ -10,9 +10,33 @@ enum {
      MP_SPATIAL_DISCONTINUITY,
      // The stream cannot be rendered; fall back to PCM.
      MP_SPATIAL_FAILED,
@@ -74,15 +75,16 @@ index e9d11c0..7911945 100644
 +void *mp_spatial_create(int codec, bool lossless, int channels, void *synchronizer,
 +                        size_t buffer_limit);
 +// Interleaved float PCM at 48 kHz with `channels` channels; slots[i] is
-+// channel i's place in Apple's Atmos 7.1.4 order (L R C LFE Ls Rs Rls Rrs Vhl
-+// Vhr Ltr Rtr), or -1 to drop it.
-+void *mp_spatial_create_pcm(const int8_t *slots, int channels, void *synchronizer,
-+                            size_t buffer_limit);
++// channel i's place in Apple's Atmos order of `layout` channels: 12, 7.1.4
++// (L R C LFE Ls Rs Rls Rrs Vhl Vhr Ltr Rtr), or 16, 9.1.6 (L R C LFE Ls Rs
++// Rls Rrs Lw Rw Vhl Vhr Ltm Rtm Ltr Rtr); -1 drops it.
++void *mp_spatial_create_pcm(const int8_t *slots, int channels, int layout,
++                            void *synchronizer, size_t buffer_limit);
  void mp_spatial_destroy(void *output);
  void mp_spatial_begin(void *output, int64_t nanoseconds);
  size_t mp_spatial_write(void *output, const void *bytes, size_t size);
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
-index 3551e7e..5641c15 100644
+index 3551e7e..c1a15a8 100644
 --- a/audio/out/ao_spatial.m
 +++ b/audio/out/ao_spatial.m
 @@ -26,16 +26,33 @@
@@ -135,7 +137,7 @@ index 3551e7e..5641c15 100644
      void *output;
      AVSampleBufferRenderSynchronizer *synchronizer;
      int sstride;
-@@ -148,18 +173,107 @@ static void update_clock(struct ao *ao, bool ready, int64_t covered, bool tail,
+@@ -148,18 +173,128 @@ static void update_clock(struct ao *ao, bool ready, int64_t covered, bool tail,
      set_running(p, running);
  }
  
@@ -147,11 +149,22 @@ index 3551e7e..5641c15 100644
 +    MP_SPEAKER_ID_TFL, MP_SPEAKER_ID_TFR, MP_SPEAKER_ID_TBL, MP_SPEAKER_ID_TBR,
 +};
 +
-+// Each channel's place in the 7.1.4 layout. A layout with back but no side
-+// surrounds (mpv's "5.1") is a 5.1 whose surrounds sit at the side, as Apple's
-+// 5.1 has them.
-+static void atmos_slots(const struct mp_chmap *map, int8_t *slots)
++// Apple's Atmos 9.1.6 order (kAudioChannelLayoutTag_Atmos_9_1_6: L R C LFE
++// Ls Rs Rls Rrs Lw Rw Vhl Vhr Ltm Rtm Ltr Rtr). FFmpeg's "9.1.6" names the
++// wides FLC/FRC, so both pairs are wides here.
++static const int atmos_speakers_16[16] = {
++    MP_SPEAKER_ID_FL, MP_SPEAKER_ID_FR, MP_SPEAKER_ID_FC, MP_SPEAKER_ID_LFE,
++    MP_SPEAKER_ID_SL, MP_SPEAKER_ID_SR, MP_SPEAKER_ID_BL, MP_SPEAKER_ID_BR,
++    MP_SPEAKER_ID_WL, MP_SPEAKER_ID_WR, MP_SPEAKER_ID_TFL, MP_SPEAKER_ID_TFR,
++    MP_SPEAKER_ID_TSL, MP_SPEAKER_ID_TSR, MP_SPEAKER_ID_TBL, MP_SPEAKER_ID_TBR,
++};
++
++// Each channel's place in the 7.1.4 (layout 12) or 9.1.6 (16) layout. A
++// layout with back but no side surrounds (mpv's "5.1") is a 5.1 whose
++// surrounds sit at the side, as Apple's 5.1 has them.
++static void atmos_slots(const struct mp_chmap *map, int layout, int8_t *slots)
 +{
++    const int *order = layout == 16 ? atmos_speakers_16 : atmos_speakers;
 +    bool sides = false, backs = false;
 +    for (int i = 0; i < map->num; i++) {
 +        sides |= map->speaker[i] == MP_SPEAKER_ID_SL || map->speaker[i] == MP_SPEAKER_ID_SR;
@@ -159,10 +172,14 @@ index 3551e7e..5641c15 100644
 +    }
 +    for (int i = 0; i < map->num; i++) {
 +        slots[i] = -1;
-+        for (int n = 0; n < 12; n++) {
-+            if (map->speaker[i] == atmos_speakers[n])
++        for (int n = 0; n < layout; n++) {
++            if (map->speaker[i] == order[n])
 +                slots[i] = n;
 +        }
++        if (layout == 16 && map->speaker[i] == MP_SPEAKER_ID_FLC)
++            slots[i] = 8;
++        if (layout == 16 && map->speaker[i] == MP_SPEAKER_ID_FRC)
++            slots[i] = 9;
 +        if (backs && !sides && (slots[i] == 6 || slots[i] == 7))
 +            slots[i] -= 2;
 +    }
@@ -230,22 +247,28 @@ index 3551e7e..5641c15 100644
 +#endif
 +
 +    int8_t slots[MP_NUM_CHANNELS];
++    int pcm_layout = p->opt_layout == 16 ? 16 : 12;
 +    if (!codec) {
-+        // Decoded PCM, placed unchanged in the 7.1.4 layout: mpv remaps or
-+        // downmixes only a layout with speakers 7.1.4 has not, and resamples
-+        // only from a rate other than 48 kHz (Apple TV's output rate).
++        // Decoded PCM, placed unchanged in the 7.1.4 (or, with the 9.1.6
++        // layout, 9.1.6) layout: mpv remaps or downmixes only a layout with
++        // speakers that one has not, and resamples only from a rate other
++        // than 48 kHz (Apple TV's output rate).
 +        struct mp_chmap_sel sel = {0};
-+        for (int n = 0; n < 12; n++)
-+            mp_chmap_sel_add_speaker(&sel, atmos_speakers[n]);
++        for (int n = 0; n < pcm_layout; n++)
++            mp_chmap_sel_add_speaker(&sel, pcm_layout == 16 ? atmos_speakers_16[n] : atmos_speakers[n]);
++        if (pcm_layout == 16) {
++            mp_chmap_sel_add_speaker(&sel, MP_SPEAKER_ID_FLC);
++            mp_chmap_sel_add_speaker(&sel, MP_SPEAKER_ID_FRC);
++        }
 +        if (!ao_chmap_sel_adjust(ao, &sel, &ao->channels) || ao->channels.num <= 2)
 +            return -1;
 +        ao->format = AF_FORMAT_FLOAT;
 +        ao->samplerate = 48000;
-+        atmos_slots(&ao->channels, slots);
++        atmos_slots(&ao->channels, pcm_layout, slots);
      }
  
      // ao->sstride is set only after init().
-@@ -168,26 +282,44 @@ static int init(struct ao *ao)
+@@ -168,26 +303,44 @@ static int init(struct ao *ao)
      // The clock starts only once the renderer holds enough audio anyway.
      p->synchronizer.delaysRateChangeUntilHasSufficientMediaData = NO;
      // The sink buffers a second of passthrough ahead of the renderer.
@@ -276,7 +299,7 @@ index 3551e7e..5641c15 100644
 +        p->output = mp_spatial_create(codec, lossless, layout, (void *)p->synchronizer, limit);
 +    } else {
 +        p->kind = MP_SPATIAL_KIND_PCM;
-+        p->output = mp_spatial_create_pcm(slots, ao->channels.num,
++        p->output = mp_spatial_create_pcm(slots, ao->channels.num, pcm_layout,
 +                                          (void *)p->synchronizer, limit);
 +    }
      if (!p->output) {
@@ -300,11 +323,11 @@ index 3551e7e..5641c15 100644
 +    MP_VERBOSE(ao, "sending %s (%s)\n", p->kind == MP_SPATIAL_KIND_APAC ? "APAC" :
 +               p->kind == MP_SPATIAL_KIND_LPCM ? "the render as 24-bit linear PCM" :
 +               "decoded PCM as linear PCM beside the Atmos activator",
-+               p->kind != MP_SPATIAL_KIND_PCM && p->opt_layout == 16 ? "9.1.6" : "7.1.4");
++               p->opt_layout == 16 ? "9.1.6" : "7.1.4");
  
      // The output is APAC on the synchronizer, not a bitstream a receiver has
      // to stay locked to. With streamed silence mpv would never pause it, but
-@@ -206,8 +338,11 @@ static int init(struct ao *ao)
+@@ -206,8 +359,11 @@ static int init(struct ao *ao)
          return -1;
      }
  
@@ -317,7 +340,7 @@ index 3551e7e..5641c15 100644
      return 0;
  }
  
-@@ -218,6 +353,7 @@ static void uninit(struct ao *ao)
+@@ -218,6 +374,7 @@ static void uninit(struct ao *ao)
      // Not set when init() failed.
      if (!p->output)
          return;
@@ -325,7 +348,7 @@ index 3551e7e..5641c15 100644
      [p->synchronizer setRate:0 time:kCMTimeInvalid];
      mp_spatial_destroy(p->output);
      [p->synchronizer release];
-@@ -287,8 +423,9 @@ static void set_gain(struct ao *ao, float gain)
+@@ -287,8 +444,9 @@ static void set_gain(struct ao *ao, float gain)
  {
      struct priv *p = ao->priv;
  
@@ -337,7 +360,7 @@ index 3551e7e..5641c15 100644
          return;
      mp_spatial_volume(p->output, gain);
  }
-@@ -308,6 +445,16 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+@@ -308,6 +466,16 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
          offer_staged(ao);
          ready = final = false;
          covered = end_time = INT64_MIN;
@@ -354,7 +377,7 @@ index 3551e7e..5641c15 100644
      } else if (failure == MP_SPATIAL_FAILED && !p->reload_requested) {
          char *reason = mp_spatial_failure(p->output);
          MP_WARN(ao, "the renderer failed (%s), falling back to PCM\n",
-@@ -343,6 +490,8 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+@@ -343,6 +511,8 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
      state->playing = p->playing && !drained;
  }
  
@@ -363,7 +386,7 @@ index 3551e7e..5641c15 100644
  const struct ao_driver audio_out_spatial = {
      .description = "TrueHD and DTS-HD passthrough to Apple spatial audio",
      .name        = "spatial",
-@@ -356,4 +505,17 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+@@ -356,4 +526,17 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
      .end_of_stream = end_of_stream,
      .set_gain    = set_gain,
      .priv_size   = sizeof(struct priv),
@@ -382,10 +405,10 @@ index 3551e7e..5641c15 100644
 +    .options_prefix = "ao-spatial",
  };
 diff --git a/audio/out/ao_spatial.swift b/audio/out/ao_spatial.swift
-index a7fd3f1..71b1fb5 100644
+index a7fd3f1..278d1ad 100644
 --- a/audio/out/ao_spatial.swift
 +++ b/audio/out/ao_spatial.swift
-@@ -21,11 +21,35 @@ private final class SpatialOutput: Sendable {
+@@ -21,11 +21,36 @@ private final class SpatialOutput: Sendable {
  
      private let sink: SpatialAudioPassthroughSink
      private let synchronizer: AVSampleBufferRenderSynchronizer
@@ -405,13 +428,14 @@ index a7fd3f1..71b1fb5 100644
 +    }
 +
 +    /// Decoded PCM (Force Dolby MAT): interleaved float at 48 kHz, each channel
-+    /// put in its 7.1.4 slot and enqueued unchanged as linear PCM.
-+    convenience init(slots: [Int], synchronizer: AVSampleBufferRenderSynchronizer, bufferLimit: Int) throws {
-+        var configuration = APACConfiguration()
++    /// put in its slot of `layout` and enqueued unchanged as linear PCM.
++    convenience init(slots: [Int], layout: SpatialAudioLayout, synchronizer: AVSampleBufferRenderSynchronizer,
++                     bufferLimit: Int) throws {
++        var configuration = APACConfiguration(layout: layout)
 +        configuration.losslessPCM = true
 +        let renderer = try SpatialAudioRenderer(codec: .trueHDAtmos, configuration: configuration,
 +                                                synchronizer: synchronizer, output: AVSampleBufferAudioRenderer(),
-+                                                makeDecoder: { PCMSlotDecoder(slots: slots) })
++                                                makeDecoder: { PCMSlotDecoder(slots: slots, layout: layout.channelCount) })
 +        self.init(sink: SpatialAudioPassthroughSink(renderer: renderer, bufferLimit: bufferLimit, rawPCM: true),
 +                  synchronizer: synchronizer, lossless: true)
 +    }
@@ -423,7 +447,7 @@ index a7fd3f1..71b1fb5 100644
          let poller = Task { [weak self] in
              while !Task.isCancelled {
                  guard let output = self else { return }
-@@ -103,7 +127,7 @@ private final class SpatialOutput: Sendable {
+@@ -103,7 +128,7 @@ private final class SpatialOutput: Sendable {
              covered = .min
              end = .min
              final = false
@@ -432,7 +456,7 @@ index a7fd3f1..71b1fb5 100644
          }
          // Progress counts what was enqueued; the queue also misses audio
          // a route change flushed until the renderer has enqueued it again.
-@@ -112,7 +136,7 @@ private final class SpatialOutput: Sendable {
+@@ -112,7 +137,7 @@ private final class SpatialOutput: Sendable {
          final = progress.isFinal && queuedAfterFinal
          covered = Self.nanoseconds(min(progress.submittedEnd, queuedEnd ?? progress.timelineStart))
          end = Self.nanoseconds(progress.submittedEnd)
@@ -441,7 +465,7 @@ index a7fd3f1..71b1fb5 100644
      }
  
      func close() {
-@@ -130,10 +154,8 @@ private final class SpatialOutput: Sendable {
+@@ -130,10 +155,8 @@ private final class SpatialOutput: Sendable {
          }
      }
  
@@ -454,7 +478,7 @@ index a7fd3f1..71b1fb5 100644
      }
  
      static func nanoseconds(_ time: CMTime) -> Int64 {
-@@ -141,18 +163,80 @@ private final class SpatialOutput: Sendable {
+@@ -141,18 +164,85 @@ private final class SpatialOutput: Sendable {
      }
  }
  
@@ -489,13 +513,14 @@ index a7fd3f1..71b1fb5 100644
  }
  
 +@_cdecl("mp_spatial_create_pcm")
-+func mpSpatialCreatePCM(_ slots: UnsafePointer<Int8>, _ channels: Int32, _ pointer: UnsafeMutableRawPointer,
-+                        _ bufferLimit: Int) -> UnsafeMutableRawPointer? {
-+    guard #available(macOS 26, iOS 26, tvOS 26, *), channels > 0 else { return nil }
++func mpSpatialCreatePCM(_ slots: UnsafePointer<Int8>, _ channels: Int32, _ layoutChannels: Int32,
++                        _ pointer: UnsafeMutableRawPointer, _ bufferLimit: Int) -> UnsafeMutableRawPointer? {
++    guard #available(macOS 26, iOS 26, tvOS 26, *), channels > 0,
++          let layout = SpatialAudioLayout(rawValue: UInt32(layoutChannels)) else { return nil }
 +    let synchronizer = Unmanaged<AVSampleBufferRenderSynchronizer>.fromOpaque(pointer).takeUnretainedValue()
 +    let map = (0..<Int(channels)).map { Int(slots[$0]) }
 +    do {
-+        return Unmanaged.passRetained(try SpatialOutput(slots: map, synchronizer: synchronizer,
++        return Unmanaged.passRetained(try SpatialOutput(slots: map, layout: layout, synchronizer: synchronizer,
 +                                                        bufferLimit: bufferLimit)).toOpaque()
 +    } catch {
 +        NSLog("[ao_spatial] Cannot open the PCM output: %@", String(describing: error))
@@ -504,14 +529,18 @@ index a7fd3f1..71b1fb5 100644
 +}
 +
 +/// Decoded PCM for the lossless renderer: interleaved 32-bit float frames of
-+/// `slots.count` channels, each written to its 7.1.4 slot (the rest silent),
-+/// unchanged. Bytes may arrive split anywhere.
++/// `slots.count` channels, each written to its slot of `layout` channels
++/// (the rest silent), unchanged. Bytes may arrive split anywhere.
 +@available(macOS 26, iOS 26, tvOS 26, *)
 +final class PCMSlotDecoder: SpatialAudioRendererDecoding {
 +    private let slots: [Int]
++    private let layout: Int
 +    private var pending: [UInt8] = []
 +
-+    init(slots: [Int]) { self.slots = slots }
++    init(slots: [Int], layout: Int = 12) {
++        self.slots = slots
++        self.layout = layout
++    }
 +
 +    func decode(_ bytes: UnsafeRawBufferPointer, end: Bool) throws -> [PCMBlock] {
 +        pending.append(contentsOf: bytes)
@@ -519,19 +548,19 @@ index a7fd3f1..71b1fb5 100644
 +        let frames = pending.count / stride
 +        defer { if end { pending.removeAll() } }
 +        guard frames > 0 else { return [] }
-+        var samples = [Float](repeating: 0, count: frames * 12)
++        var samples = [Float](repeating: 0, count: frames * layout)
 +        pending.withUnsafeBytes { input in
 +            samples.withUnsafeMutableBufferPointer { output in
 +                for frame in 0..<frames {
-+                    for (channel, slot) in slots.enumerated() where (0..<12).contains(slot) {
-+                        output[frame * 12 + slot] = input.loadUnaligned(fromByteOffset: frame * stride + channel * 4,
++                    for (channel, slot) in slots.enumerated() where (0..<layout).contains(slot) {
++                        output[frame * layout + slot] = input.loadUnaligned(fromByteOffset: frame * stride + channel * 4,
 +                                                                         as: Float.self)
 +                    }
 +                }
 +            }
 +        }
 +        pending.removeFirst(frames * stride)
-+        return [PCMBlock(samples: samples, frames: frames, sampleRate: 48_000, channels: 12)]
++        return [PCMBlock(samples: samples, frames: frames, sampleRate: 48_000, channels: layout)]
 +    }
 +}
 +

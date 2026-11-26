@@ -6,7 +6,10 @@ import Synchronization
 // alongside this file. The sink's public API names these types, so they are
 // public too.
 public enum SpatialAudioCodec: UInt32, Sendable { case trueHDAtmos = 1, dtsX = 2 }
-public enum SpatialAudioLayout: UInt32, Sendable { case sevenOneFour = 12, nineOneSix = 16 }
+public enum SpatialAudioLayout: UInt32, Sendable {
+    case sevenOneFour = 12, nineOneSix = 16
+    var channelCount: Int { Int(rawValue) }
+}
 public struct APACConfiguration: Sendable {
     public init(layout: SpatialAudioLayout = .sevenOneFour) {}
     public var losslessPCM = false
