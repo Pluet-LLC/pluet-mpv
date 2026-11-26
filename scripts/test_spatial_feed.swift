@@ -6,7 +6,20 @@ import Synchronization
 // alongside this file. The sink's public API names these types, so they are
 // public too.
 public enum SpatialAudioCodec: UInt32, Sendable { case trueHDAtmos = 1, dtsX = 2 }
-public struct APACConfiguration: Sendable { public init() {} }
+public struct APACConfiguration: Sendable {
+    public init() {}
+    public var losslessPCM = false
+}
+// The decoded-PCM path's types (Force Dolby MAT), as the real renderer has them.
+struct PCMBlock: Sendable {
+    let samples: [Float]
+    let frames: Int
+    let sampleRate: Int
+    let channels: Int
+}
+protocol SpatialAudioRendererDecoding: AnyObject {
+    func decode(_ bytes: UnsafeRawBufferPointer, end: Bool) throws -> [PCMBlock]
+}
 enum SpatialAudioError: Error, Sendable {
     case decoding(String), unsupported(String), discontinuity(String), encoding(String)
 }
@@ -39,6 +52,12 @@ actor SpatialAudioRenderer {
 
     init(codec: SpatialAudioCodec, configuration: APACConfiguration,
          synchronizer: AVSampleBufferRenderSynchronizer) throws {
+        self.synchronizer = synchronizer
+    }
+
+    init(codec: SpatialAudioCodec, configuration: APACConfiguration, synchronizer: AVSampleBufferRenderSynchronizer,
+         output: AVSampleBufferAudioRenderer,
+         makeDecoder: @escaping @Sendable () throws -> any SpatialAudioRendererDecoding) throws {
         self.synchronizer = synchronizer
     }
 
@@ -162,7 +181,7 @@ struct BridgeChecks {
     static func run() async throws {
         let ms: Int64 = 1_000_000
         let synchronizer = AVSampleBufferRenderSynchronizer()
-        guard let output = mpSpatialCreate(2, Unmanaged.passUnretained(synchronizer).toOpaque(), 1 << 20) else {
+        guard let output = mpSpatialCreate(2, false, Unmanaged.passUnretained(synchronizer).toOpaque(), 1 << 20) else {
             check(false, "the output opens")
             return
         }

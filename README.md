@@ -235,6 +235,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_demux_mkv_defer_tags.sh` | Matroska Tags behind the clusters wait for the Cues on network streams and nowhere else; tags read after opening reach only the file's metadata (patch 0240) | PR, main |
 | `test_demux_refresh.sh` | a refresh seek queues nothing twice and keeps the next subtitle (patch 0208) | PR, main |
 | `test_http_persistent.sh` | HTTP keeps its connection across seeks, byte for byte, against servers that keep alive, close, ignore Range, send chunked bodies, redirect, cut a reply short, stall or go silent, and changes nothing on the wire without the new options (FFmpeg patches 0080, 0081; builds a minimal host FFmpeg) | PR, main |
+| `test_http_parallel.sh` | Large http(s) files through several connections (mpv patch 0318), byte for byte through the stream layer's walk at 2, 4 and 8 connections, a reply cut short, a server's connection limit, a seek away; prints the speedup over rate-limited loopback servers (builds a minimal host FFmpeg) | PR, main |
 | `test_hwdec_recovery.sh` | the hwdec mid-stream error recovery (0025) and `--hwdec-recover-keyframes`/`--hwdec-recover-max-frames`, defaults unchanged (patch 0306) | PR |
 | `test_hevc_hwaccel_tables.sh` | a frame started under a hwaccel is never decoded in software (FFmpeg 0302), and every `tab_mvf` reader is reviewed; structural | PR |
 | `test_lavc_busy_policy.sh` | decoders that wake the filter themselves are not spun | PR, main |

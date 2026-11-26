@@ -134,6 +134,11 @@ jobs:
                 # a host libavcodec of the ffmpeg/apple tree checked above.
                 subprocess.run(['bash', 'scripts/test_dovi_rpu_layers.sh', str(dest),
                                 str(work / 'ffmpeg-apple')], check=True)
+                # 0318: large http(s) files through several connections, against
+                # rate-limited loopback servers, with the ffmpeg/apple tree's
+                # http protocol (patches 0080/0081); prints the speedup.
+                subprocess.run(['bash', 'scripts/test_http_parallel.sh', str(dest),
+                                str(work / 'ffmpeg-apple')], check=True)
               if component == 'ffmpeg' and group == 'apple':
                 # VideoToolbox's Dolby Vision profile 7 mode: plain C, stub types.
                 subprocess.run(['bash', 'scripts/test_vt_dovi_conversion_mode.sh', str(dest)], check=True)
@@ -264,6 +269,20 @@ jobs:
 
       - name: Test spatial audio bridge
         run: bash scripts/test_spatial_feed.sh
+
+      # mpv 0317 and SpatialAudioBridge 0001 with the Rust core: the lossless
+      # route's linear PCM is the render bit for bit, Force Dolby MAT's slots,
+      # and the failure kinds (no media; a TrueHD Atmos IEC file adds the
+      # rendered comparison when given locally).
+      - name: Install the pinned Rust toolchain
+        run: |
+          brew install rustup
+          rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+          rustup toolchain install "$rust_version" --profile minimal --no-self-update \
+            --component rustc,cargo,rust-std --target aarch64-apple-darwin
+
+      - name: Test the lossless spatial route and Force Dolby MAT
+        run: bash scripts/test_spatial_lossless.sh
 
       # A real AVPlayer in a process that never services the main queue.
       - name: Test AVFoundation passthrough fallback

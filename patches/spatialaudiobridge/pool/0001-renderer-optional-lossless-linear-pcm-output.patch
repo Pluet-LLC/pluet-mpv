@@ -1,0 +1,241 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH] renderer: optional lossless linear PCM output, and raw PCM
+ input for the passthrough sink
+
+APACConfiguration.losslessPCM makes SpatialAudioRenderer enqueue the rendered
+speaker feeds as they are: interleaved 32-bit float linear PCM at 48 kHz in
+the layout's Atmos channel layout (kAudioChannelLayoutTag_Atmos_7_1_4), in
+independent packets of 1024 frames, with no encoder priming. APAC is a lossy
+codec (48.4 dB signal-to-error on a film at the default 3.072 Mbit/s); linear
+PCM keeps every bit the renderer produced, and the renderer is ready as soon
+as it holds audio instead of after the live encoder's 1.5 s. Everything else
+(timeline, discard and padding, progress, refill after an automatic flush)
+is the APAC path's: an LPCM packet is simply a sync packet. File and HLS
+output stay APAC.
+
+SpatialAudioPassthroughSink gains an internal rawPCM mode, for a host that
+feeds already decoded PCM through a renderer with its own decoder: the bytes
+skip the IEC 61937 unpacker.
+
+---
+diff --git a/Sources/SpatialAudioBridge/APACEncoder.swift b/Sources/SpatialAudioBridge/APACEncoder.swift
+index 11596c9..f15ab98 100644
+--- a/Sources/SpatialAudioBridge/APACEncoder.swift
++++ b/Sources/SpatialAudioBridge/APACEncoder.swift
+@@ -85,6 +85,8 @@ final class APACEncoder {
+     struct Packet {
+         let data: Data
+         let isIndependent: Bool
++        /// Frames the packet decodes to: 1024, except a final linear PCM packet.
++        var frames = 1024
+     }
+ 
+     /// Appends PCM and returns the packets it completes. The live encoder holds 71 packets (1.5 s)
+@@ -145,3 +147,50 @@ final class APACEncoder {
+         guard status == noErr else { throw SpatialAudioError.coreMedia(status) }
+     }
+ }
++
++/// What ``SpatialAudioRenderer`` enqueues: APAC packets, or the rendered feeds as linear PCM.
++@available(macOS 26, iOS 26, tvOS 26, *)
++protocol SpatialPacketEncoder: AnyObject {
++    var format: CMAudioFormatDescription { get }
++    var primingFrames: Int { get }
++    func encode(_ samples: ArraySlice<Float>, final: Bool) throws -> [APACEncoder.Packet]
++}
++
++@available(macOS 26, iOS 26, tvOS 26, *)
++extension SpatialPacketEncoder {
++    func encode(_ samples: ArraySlice<Float>) throws -> [APACEncoder.Packet] { try encode(samples, final: false) }
++}
++
++@available(macOS 26, iOS 26, tvOS 26, *)
++extension APACEncoder: SpatialPacketEncoder {}
++
++/// The rendered speaker feeds unchanged: interleaved 32-bit float linear PCM at 48 kHz in the
++/// layout's Atmos channel layout, cut into independent packets of 1024 frames. No priming and no
++/// delay; the final packet holds what is left.
++@available(macOS 26, iOS 26, tvOS 26, *)
++final class LPCMPacketizer: SpatialPacketEncoder {
++    let format: CMAudioFormatDescription
++    let primingFrames = 0
++    private let channels: Int
++    private var pending: [Float] = []
++
++    init(layout: SpatialAudioLayout) throws {
++        format = try pcmFormat(rate: 48_000, layout: layout)
++        channels = layout.channelCount
++    }
++
++    func encode(_ samples: ArraySlice<Float>, final: Bool) throws -> [APACEncoder.Packet] {
++        pending.append(contentsOf: samples)
++        let step = 1024 * channels
++        var packets: [APACEncoder.Packet] = []
++        var start = 0
++        while pending.count - start >= step || (final && pending.count - start >= channels) {
++            let end = min(start + step, pending.count - (pending.count - start) % channels)
++            let data = pending[start..<end].withUnsafeBytes { Data($0) }
++            packets.append(APACEncoder.Packet(data: data, isIndependent: true, frames: (end - start) / channels))
++            start = end
++        }
++        pending.removeFirst(start)
++        return packets
++    }
++}
+diff --git a/Sources/SpatialAudioBridge/SpatialAudioPassthroughSink.swift b/Sources/SpatialAudioBridge/SpatialAudioPassthroughSink.swift
+index 943eda8..409b17e 100644
+--- a/Sources/SpatialAudioBridge/SpatialAudioPassthroughSink.swift
++++ b/Sources/SpatialAudioBridge/SpatialAudioPassthroughSink.swift
+@@ -55,6 +55,8 @@ public final class SpatialAudioPassthroughSink: Sendable {
+ 
+     private let renderer: SpatialAudioRenderer
+     private let bufferLimit: Int
++    /// The bytes are interleaved linear PCM for the renderer's decoder, not IEC 61937 bursts.
++    private let rawPCM: Bool
+     private let state = Mutex(State())
+ 
+     /// `bufferLimit` bounds the passthrough bytes waiting for the renderer; the default holds about
+@@ -65,9 +67,10 @@ public final class SpatialAudioPassthroughSink: Sendable {
+                   bufferLimit: bufferLimit)
+     }
+ 
+-    init(renderer: SpatialAudioRenderer, bufferLimit: Int) {
++    init(renderer: SpatialAudioRenderer, bufferLimit: Int, rawPCM: Bool = false) {
+         self.renderer = renderer
+         self.bufferLimit = max(bufferLimit, 1)
++        self.rawPCM = rawPCM
+     }
+ 
+     deinit { close() }
+@@ -143,8 +146,9 @@ public final class SpatialAudioPassthroughSink: Sendable {
+                         state.progress = nil
+                     }
+                 })
+-            let feeder = Task { [renderer] in
+-                await Self.feed(events, continuation, renderer: renderer, at: time, after: previous?.feeder, report: report)
++            let feeder = Task { [renderer, rawPCM] in
++                await Self.feed(events, continuation, renderer: renderer, rawPCM: rawPCM, at: time,
++                                after: previous?.feeder, report: report)
+             }
+             state.timeline = Timeline(events: continuation, feeder: feeder)
+         }
+@@ -221,7 +225,8 @@ public final class SpatialAudioPassthroughSink: Sendable {
+ 
+     /// Owns the renderer for one timeline; nothing else changes it while the timeline lasts.
+     private static func feed(_ events: AsyncStream<Event>, _ continuation: AsyncStream<Event>.Continuation,
+-                             renderer: SpatialAudioRenderer, at time: CMTime, after previous: Task<Void, Never>?,
++                             renderer: SpatialAudioRenderer, rawPCM: Bool, at time: CMTime,
++                             after previous: Task<Void, Never>?,
+                              report: Report) async {
+         do {
+             // The first begin releases a previous feeder waiting for capacity; once it has left,
+@@ -260,9 +265,9 @@ public final class SpatialAudioPassthroughSink: Sendable {
+                     switch event {
+                     case .data(let chunk):
+                         defer { report.consumed(chunk.count) }
+-                        let stream = try unpacker.unpack(chunk)
++                        let stream = rawPCM ? chunk : try unpacker.unpack(chunk)
+                         guard !stream.isEmpty else { continue }
+-                        try await renderer.enqueue(stream, time: time + unpacker.skippedDuration)
++                        try await renderer.enqueue(stream, time: rawPCM ? time : time + unpacker.skippedDuration)
+                         enqueued = true
+                     case .end:
+                         if enqueued {
+diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
+index f53b4a3..f662555 100644
+--- a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
++++ b/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
+@@ -64,7 +64,7 @@ public actor SpatialAudioRenderer {
+     private let gain: Float
+     private var decoder: any SpatialAudioRendererDecoding
+     private let makeDecoder: @Sendable () throws -> any SpatialAudioRendererDecoding
+-    private var encoder: APACEncoder
++    private var encoder: any SpatialPacketEncoder
+     /// Whether the codecs have taken input since they were made, so ``begin(at:)`` needs new ones.
+     private var codecsUsed = false
+     private var timeline = CMTime.zero
+@@ -169,7 +169,7 @@ public actor SpatialAudioRenderer {
+         }
+         self.makeDecoder = factory
+         decoder = try factory()
+-        encoder = try APACEncoder(configuration: configuration)
++        encoder = try Self.makeEncoder(configuration)
+         audioRenderer = output
+         self.synchronizer = synchronizer
+         if let native = output as? AVSampleBufferAudioRenderer { synchronizer.addRenderer(native) }
+@@ -205,7 +205,7 @@ public actor SpatialAudioRenderer {
+         // Unused codecs are as good as new, so repeated resets without input allocate nothing.
+         if codecsUsed {
+             decoder = try makeDecoder()
+-            encoder = try APACEncoder(configuration: configuration)
++            encoder = try Self.makeEncoder(configuration)
+             codecsUsed = false
+         }
+         timeline = time
+@@ -372,12 +372,14 @@ public actor SpatialAudioRenderer {
+                 }
+                 let start = CMTimeSubtract(CMTimeAdd(timeline, CMTime(value: packets * 1024, timescale: 48_000)),
+                                            CMTime(value: Int64(encoder.primingFrames), timescale: 48_000))
+-                let buffer = try Self.sampleBuffer([packet.data], format: encoder.format, at: start)
++                let buffer = encoder is LPCMPacketizer
++                    ? try linearPCMBuffer(packet, format: encoder.format, at: start)
++                    : try Self.sampleBuffer([packet.data], format: encoder.format, at: start)
+                 audioRenderer.enqueue(buffer)
+                 packets += 1
+                 // Packets that hold only encoder priming end before the timeline.
+                 if packets * 1024 > encoder.primingFrames { report(final: false) }
+-                queued.append((buffer, start, CMTimeAdd(start, CMTime(value: 1024, timescale: 48_000)), packet.isIndependent))
++                queued.append((buffer, start, CMTimeAdd(start, CMTime(value: Int64(packet.frames), timescale: 48_000)), packet.isIndependent))
+                 // Keep unplayed audio from its preceding sync packet, even during a long batch.
+                 let now = synchronizer.currentTime()
+                 if let unplayed = queued.firstIndex(where: { $0.end > now }),
+@@ -501,6 +503,32 @@ public actor SpatialAudioRenderer {
+         return false
+     }
+ 
++    /// APAC, or the rendered feeds as linear PCM when the configuration asks for lossless output.
++    private static func makeEncoder(_ configuration: APACConfiguration) throws -> any SpatialPacketEncoder {
++        configuration.losslessPCM ? try LPCMPacketizer(layout: configuration.layout) : try APACEncoder(configuration: configuration)
++    }
++
++    /// One linear PCM packet as a sample buffer of its frames.
++    private func linearPCMBuffer(_ packet: APACEncoder.Packet, format: CMAudioFormatDescription, at time: CMTime) throws -> CMSampleBuffer {
++        var block: CMBlockBuffer?
++        try Self.check(CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
++            blockLength: packet.data.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
++            dataLength: packet.data.count, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block))
++        guard let block else { throw SpatialAudioError.encoding("Could not allocate PCM") }
++        try packet.data.withUnsafeBytes {
++            try Self.check(CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0,
++                                                         dataLength: packet.data.count))
++        }
++        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48_000), presentationTimeStamp: time,
++                                        decodeTimeStamp: .invalid)
++        var buffer: CMSampleBuffer?
++        try Self.check(CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
++            sampleCount: packet.frames, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 0,
++            sampleSizeArray: nil, sampleBufferOut: &buffer))
++        guard let buffer else { throw SpatialAudioError.encoding("Could not create a PCM sample buffer") }
++        return buffer
++    }
++
+     /// A copy of a one-packet buffer that the renderer decodes but does not play.
+     private static func trimmed(_ buffer: CMSampleBuffer) -> CMSampleBuffer? {
+         var copy: CMSampleBuffer?
+diff --git a/Sources/SpatialAudioBridge/Types.swift b/Sources/SpatialAudioBridge/Types.swift
+index b80c531..a25bc4c 100644
+--- a/Sources/SpatialAudioBridge/Types.swift
++++ b/Sources/SpatialAudioBridge/Types.swift
+@@ -72,6 +72,11 @@ public struct APACConfiguration: Sendable {
+     /// Off by default, as in Apple TV's own Atmos playback, so converted tracks play at the level of
+     /// native Atmos content. DTS:X exposes no dialogue level.
+     public var normalizesDialogue: Bool
++    /// Enqueues the rendered speaker feeds as 32-bit float linear PCM in the layout's Atmos channel
++    /// layout instead of encoding them to APAC: nothing is lost after rendering, and the renderer
++    /// is ready as soon as it holds audio instead of after the encoder's 1.5 s. Only
++    /// `SpatialAudioRenderer` and the passthrough sink use it; file and HLS output stay APAC.
++    public var losslessPCM = false
+ 
+     public init(layout: SpatialAudioLayout = .sevenOneFour, gainDB: Float = 0,
+                 bitRate: Int? = nil, startTime: CMTime = .zero, syncPacketFrequency: Int = 75,

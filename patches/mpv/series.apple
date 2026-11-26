@@ -85,3 +85,13 @@
 # full (video-params/dolby-vision-el), for the player's question about a FEL
 # title (test test_dovi_rpu_layers.sh).
 0316-video-dolby-vision-enhancement-layer-kind.patch
+# TrueHD Atmos and DTS:X rendered to 7.1.4 go out as lossless linear PCM over
+# HDMI (--ao-spatial-output, APAC elsewhere and as the fallback), and Force
+# Dolby MAT sends decoded multichannel PCM the same way
+# (--ao-spatial-force-mat); spatial-audio-output says which. With
+# SpatialAudioBridge 0001 (tests test_ao_spatial.sh, test_spatial_lossless.sh).
+0317-ao-spatial-lossless-linear-pcm-and-force-dolby-mat.patch
+# Large http(s) files read through several connections, chunks ahead of a
+# reader that reads on (--stream-http-connections=4,
+# --stream-http-chunk-size=2MiB; test test_http_parallel.sh).
+0318-stream-lavf-read-large-http-files-through-several-connections.patch

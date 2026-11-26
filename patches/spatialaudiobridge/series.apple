@@ -1,0 +1,4 @@
+# Apple patch series for SpatialAudioBridge (compiled into libmpv by
+# scripts/build_spatial.py). One pool filename per line; order is authoritative.
+# ao_spatial's lossless 7.1.4 route and Force Dolby MAT (mpv 0317).
+0001-renderer-optional-lossless-linear-pcm-output.patch

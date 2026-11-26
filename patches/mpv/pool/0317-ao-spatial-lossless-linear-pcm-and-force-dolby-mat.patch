@@ -1,0 +1,592 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH] ao_spatial: the rendered 7.1.4 as lossless linear PCM over
+ HDMI, and Force Dolby MAT for decoded multichannel PCM
+
+The spatial output rendered TrueHD Atmos and DTS:X objects to 7.1.4 and
+always encoded that as APAC, a lossy codec (49 dB signal-to-error against the
+render on a TrueHD Atmos film excerpt), before tvOS decoded it again and sent
+Dolby MAT. With SpatialAudioBridge patch 0001 the renderer can enqueue the
+rendered feeds as 32-bit float linear PCM in Apple's Atmos 7.1.4 layout
+instead, bit for bit, beside the same Atmos activator.
+
+--ao-spatial-output=auto|apac|lpcm picks it. auto (the default) sends linear
+PCM where the audio session's route is HDMI, the receiver or soundbar the
+lossless MAT path is for, and APAC everywhere else (AirPlay, headphones,
+built-in speakers), where the system spatializes APAC. If the renderer turns
+linear PCM down (its status fails, or AVFoundation reports an error), the
+output reloads with APAC and keeps to it for this player
+(MP_SPATIAL_OUTPUT_FAILED, mpv_global.spatial_lpcm_failed); a stream
+without objects still falls back to decoding as before.
+
+--ao-spatial-force-mat (default no) also takes decoded PCM of more than two
+channels: bed-only TrueHD, DTS-HD MA without DTS:X, multichannel PCM, and
+anything else mpv decodes to 5.1 or more. The output offers only the 7.1.4
+speakers (mpv remaps or downmixes nothing else), asks for float at 48 kHz
+(the Apple TV's output rate), places each channel unchanged in its 7.1.4
+slot (a 5.1 with back surrounds at the sides, as Apple's 5.1 has them) and
+plays it through the same lossless renderer and activator, so tvOS sends
+Dolby MAT instead of multichannel PCM. mpv's own volume already applies to
+decoded PCM, so the renderer stays at unity there. Stereo and every
+bitstream but TrueHD and DTS-HD (AC-3, E-AC-3) go to the next output as
+before.
+
+The spatial-audio-output property says what the output sends: "apac",
+"lpcm" or "pcm" (Force Dolby MAT), unavailable otherwise; it changes with
+the audio reconfig event, like current-ao.
+
+---
+diff --git a/audio/out/ao_spatial.h b/audio/out/ao_spatial.h
+index e9d11c0..5f7c106 100644
+--- a/audio/out/ao_spatial.h
++++ b/audio/out/ao_spatial.h
+@@ -10,9 +10,30 @@ enum {
+     MP_SPATIAL_DISCONTINUITY,
+     // The stream cannot be rendered; fall back to PCM.
+     MP_SPATIAL_FAILED,
++    // The renderer turned down linear PCM: open again with APAC, or leave
++    // decoded PCM to the next output.
++    MP_SPATIAL_OUTPUT_FAILED,
+ };
+ 
+-void *mp_spatial_create(int codec, void *synchronizer, size_t buffer_limit);
++// What the output sends the system (the spatial-audio-output property).
++enum {
++    MP_SPATIAL_KIND_NONE,
++    // TrueHD Atmos or DTS:X rendered to 7.1.4 and encoded as APAC.
++    MP_SPATIAL_KIND_APAC,
++    // Rendered to 7.1.4 and sent as 32-bit float linear PCM: lossless.
++    MP_SPATIAL_KIND_LPCM,
++    // Decoded PCM sent as linear PCM next to the Atmos activator (Force
++    // Dolby MAT): lossless.
++    MP_SPATIAL_KIND_PCM,
++};
++
++// codec: 1 TrueHD, 2 DTS-HD. lossless: linear PCM instead of APAC.
++void *mp_spatial_create(int codec, bool lossless, void *synchronizer, size_t buffer_limit);
++// Interleaved float PCM at 48 kHz with `channels` channels; slots[i] is
++// channel i's place in Apple's Atmos 7.1.4 order (L R C LFE Ls Rs Rls Rrs Vhl
++// Vhr Ltr Rtr), or -1 to drop it.
++void *mp_spatial_create_pcm(const int8_t *slots, int channels, void *synchronizer,
++                            size_t buffer_limit);
+ void mp_spatial_destroy(void *output);
+ void mp_spatial_begin(void *output, int64_t nanoseconds);
+ size_t mp_spatial_write(void *output, const void *bytes, size_t size);
+diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
+index 3551e7e..7c62c92 100644
+--- a/audio/out/ao_spatial.m
++++ b/audio/out/ao_spatial.m
+@@ -26,16 +26,33 @@
+ // compressed sink does: the output asks the player to decode the track
+ // instead, and the next track or file opens a fresh output and tries the
+ // renderer again.
++//
++// The rendered 7.1.4 goes out as 32-bit float linear PCM in Apple's Atmos
++// 7.1.4 layout where the route is HDMI (--ao-spatial-output=auto): nothing is
++// lost after rendering, where APAC is a lossy codec. Elsewhere (AirPlay,
++// headphones, built-in speakers) it stays APAC, which the system spatializes.
++// If the renderer turns linear PCM down, the output reopens with APAC and
++// keeps to it for this player.
++//
++// With --ao-spatial-force-mat, decoded multichannel PCM (bed-only TrueHD,
++// DTS-HD MA without DTS:X, multichannel PCM tracks, anything else decoded to
++// more than two channels) also comes here: it is placed in the same 7.1.4
++// layout at 48 kHz, unchanged, and plays beside the Atmos activator, so the
++// system sends Dolby MAT instead of multichannel PCM. Stereo, and every
++// bitstream but TrueHD and DTS-HD, is left to the next output.
+ 
+ #include <stdatomic.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+ #include "ao.h"
++#include "audio/chmap_sel.h"
+ #include "audio/format.h"
+ #include "common/common.h"
++#include "common/global.h"
+ #include "common/msg.h"
+ #include "internal.h"
++#include "options/m_option.h"
+ #include "ao_spatial.h"
+ 
+ #import <AVFoundation/AVFoundation.h>
+@@ -47,7 +64,13 @@
+ #define STOP_LEAD   INT64_C(250000000)
+ #define RESUME_LEAD INT64_C(500000000)
+ 
++enum { SPATIAL_OUTPUT_AUTO, SPATIAL_OUTPUT_APAC, SPATIAL_OUTPUT_LPCM };
++
+ struct priv {
++    int opt_output;
++    bool opt_force_mat;
++    // MP_SPATIAL_KIND_*: what this output sends.
++    int kind;
+     void *output;
+     AVSampleBufferRenderSynchronizer *synchronizer;
+     int sstride;
+@@ -148,18 +171,107 @@ static void update_clock(struct ao *ao, bool ready, int64_t covered, bool tail,
+     set_running(p, running);
+ }
+ 
++// Apple's Atmos 7.1.4 order (kAudioChannelLayoutTag_Atmos_7_1_4: L R C LFE
++// Ls Rs Rls Rrs Vhl Vhr Ltr Rtr) in mpv's speakers.
++static const int atmos_speakers[12] = {
++    MP_SPEAKER_ID_FL, MP_SPEAKER_ID_FR, MP_SPEAKER_ID_FC, MP_SPEAKER_ID_LFE,
++    MP_SPEAKER_ID_SL, MP_SPEAKER_ID_SR, MP_SPEAKER_ID_BL, MP_SPEAKER_ID_BR,
++    MP_SPEAKER_ID_TFL, MP_SPEAKER_ID_TFR, MP_SPEAKER_ID_TBL, MP_SPEAKER_ID_TBR,
++};
++
++// Each channel's place in the 7.1.4 layout. A layout with back but no side
++// surrounds (mpv's "5.1") is a 5.1 whose surrounds sit at the side, as Apple's
++// 5.1 has them.
++static void atmos_slots(const struct mp_chmap *map, int8_t *slots)
++{
++    bool sides = false, backs = false;
++    for (int i = 0; i < map->num; i++) {
++        sides |= map->speaker[i] == MP_SPEAKER_ID_SL || map->speaker[i] == MP_SPEAKER_ID_SR;
++        backs |= map->speaker[i] == MP_SPEAKER_ID_BL || map->speaker[i] == MP_SPEAKER_ID_BR;
++    }
++    for (int i = 0; i < map->num; i++) {
++        slots[i] = -1;
++        for (int n = 0; n < 12; n++) {
++            if (map->speaker[i] == atmos_speakers[n])
++                slots[i] = n;
++        }
++        if (backs && !sides && (slots[i] == 6 || slots[i] == 7))
++            slots[i] -= 2;
++    }
++}
++
++// Whether the rendered 7.1.4 goes out as linear PCM: asked for, or on auto
++// where the sound goes over HDMI. Not after the renderer turned it down here.
++static bool use_lpcm(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (p->opt_output == SPATIAL_OUTPUT_APAC)
++        return false;
++    if (atomic_load(&ao->global->spatial_lpcm_failed)) {
++        MP_VERBOSE(ao, "linear PCM failed on this player; APAC\n");
++        return false;
++    }
++    if (p->opt_output == SPATIAL_OUTPUT_LPCM)
++        return true;
++#if TARGET_OS_IPHONE
++    AVAudioSessionPortDescription *port =
++        AVAudioSession.sharedInstance.currentRoute.outputs.firstObject;
++    MP_VERBOSE(ao, "route: %s\n", port ? port.portType.UTF8String : "none");
++    return [port.portType isEqualToString:AVAudioSessionPortHDMI];
++#else
++    return false;
++#endif
++}
++
+ static int init(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
+-    int codec;
++    atomic_store(&ao->global->spatial_output_kind, MP_SPATIAL_KIND_NONE);
++    int codec = 0;
+     if (ao->format == AF_FORMAT_S_TRUEHD) {
+         codec = 1;
+     } else if (ao->format == AF_FORMAT_S_DTSHD) {
+         codec = 2;
+-    } else {
++    } else if (af_fmt_is_spdif(ao->format) || !p->opt_force_mat) {
+         MP_VERBOSE(ao, "only TrueHD and DTS-HD passthrough are handed to the renderer\n");
+         return -1;
++    } else if (ao->channels.num <= 2) {
++        MP_VERBOSE(ao, "Force Dolby MAT: %d channel(s) stay on the usual output\n",
++                   ao->channels.num);
++        return -1;
++    } else if (atomic_load(&ao->global->spatial_lpcm_failed)) {
++        MP_VERBOSE(ao, "Force Dolby MAT: linear PCM failed on this player\n");
++        return -1;
++    }
++
++#if TARGET_OS_IPHONE
++    // As mpv's other Apple outputs do when they open; before the route is
++    // read.
++    AVAudioSession *session = AVAudioSession.sharedInstance;
++    [session setCategory:AVAudioSessionCategoryPlayback
++                    mode:AVAudioSessionModeMoviePlayback
++                 options:0
++                   error:nil];
++    if (@available(iOS 15.0, tvOS 15.0, *))
++        [session setSupportsMultichannelContent:YES error:nil];
++    [session setActive:YES error:nil];
++#endif
++
++    int8_t slots[MP_NUM_CHANNELS];
++    if (!codec) {
++        // Decoded PCM, placed unchanged in the 7.1.4 layout: mpv remaps or
++        // downmixes only a layout with speakers 7.1.4 has not, and resamples
++        // only from a rate other than 48 kHz (Apple TV's output rate).
++        struct mp_chmap_sel sel = {0};
++        for (int n = 0; n < 12; n++)
++            mp_chmap_sel_add_speaker(&sel, atmos_speakers[n]);
++        if (!ao_chmap_sel_adjust(ao, &sel, &ao->channels) || ao->channels.num <= 2)
++            return -1;
++        ao->format = AF_FORMAT_FLOAT;
++        ao->samplerate = 48000;
++        atmos_slots(&ao->channels, slots);
+     }
+ 
+     // ao->sstride is set only after init().
+@@ -168,26 +280,25 @@ static int init(struct ao *ao)
+     // The clock starts only once the renderer holds enough audio anyway.
+     p->synchronizer.delaysRateChangeUntilHasSufficientMediaData = NO;
+     // The sink buffers a second of passthrough ahead of the renderer.
+-    p->output = mp_spatial_create(codec, (void *)p->synchronizer,
+-                                  (size_t)ao->samplerate * p->sstride);
++    size_t limit = (size_t)ao->samplerate * p->sstride;
++    if (codec) {
++        bool lossless = use_lpcm(ao);
++        p->kind = lossless ? MP_SPATIAL_KIND_LPCM : MP_SPATIAL_KIND_APAC;
++        p->output = mp_spatial_create(codec, lossless, (void *)p->synchronizer, limit);
++    } else {
++        p->kind = MP_SPATIAL_KIND_PCM;
++        p->output = mp_spatial_create_pcm(slots, ao->channels.num,
++                                          (void *)p->synchronizer, limit);
++    }
+     if (!p->output) {
+         MP_VERBOSE(ao, "the renderer refused the stream\n");
+         [p->synchronizer release];
+         p->synchronizer = nil;
+         return -1;
+     }
+-
+-#if TARGET_OS_IPHONE
+-    // As mpv's other Apple outputs do when they open.
+-    AVAudioSession *session = AVAudioSession.sharedInstance;
+-    [session setCategory:AVAudioSessionCategoryPlayback
+-                    mode:AVAudioSessionModeMoviePlayback
+-                 options:0
+-                   error:nil];
+-    if (@available(iOS 15.0, tvOS 15.0, *))
+-        [session setSupportsMultichannelContent:YES error:nil];
+-    [session setActive:YES error:nil];
+-#endif
++    MP_VERBOSE(ao, "sending %s\n", p->kind == MP_SPATIAL_KIND_APAC ? "APAC" :
++               p->kind == MP_SPATIAL_KIND_LPCM ? "the rendered 7.1.4 as linear PCM" :
++               "decoded PCM as linear PCM beside the Atmos activator");
+ 
+     // The output is APAC on the synchronizer, not a bitstream a receiver has
+     // to stay locked to. With streamed silence mpv would never pause it, but
+@@ -206,8 +317,11 @@ static int init(struct ao *ao)
+         return -1;
+     }
+ 
+-    mp_spatial_volume(p->output, atomic_load(&ao->gain));
++    // mpv's software volume reaches decoded PCM itself.
++    mp_spatial_volume(p->output, p->kind == MP_SPATIAL_KIND_PCM ? 1.0f
++                                                                : atomic_load(&ao->gain));
+     begin_timeline(ao);
++    atomic_store(&ao->global->spatial_output_kind, p->kind);
+     return 0;
+ }
+ 
+@@ -218,6 +332,7 @@ static void uninit(struct ao *ao)
+     // Not set when init() failed.
+     if (!p->output)
+         return;
++    atomic_store(&ao->global->spatial_output_kind, MP_SPATIAL_KIND_NONE);
+     [p->synchronizer setRate:0 time:kCMTimeInvalid];
+     mp_spatial_destroy(p->output);
+     [p->synchronizer release];
+@@ -287,8 +402,9 @@ static void set_gain(struct ao *ao, float gain)
+ {
+     struct priv *p = ao->priv;
+ 
+-    // ao_alloc() sets the gain before init() has opened the output.
+-    if (!p->output)
++    // ao_alloc() sets the gain before init() has opened the output. Decoded
++    // PCM has it applied by mpv already.
++    if (!p->output || p->kind == MP_SPATIAL_KIND_PCM)
+         return;
+     mp_spatial_volume(p->output, gain);
+ }
+@@ -308,6 +424,16 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+         offer_staged(ao);
+         ready = final = false;
+         covered = end_time = INT64_MIN;
++    } else if (failure == MP_SPATIAL_OUTPUT_FAILED && !p->reload_requested) {
++        char *reason = mp_spatial_failure(p->output);
++        MP_WARN(ao, "the renderer turned down linear PCM (%s); %s\n",
++                reason ? reason : "unknown error",
++                p->kind == MP_SPATIAL_KIND_PCM ? "the next output takes the PCM"
++                                               : "reopening with APAC");
++        free(reason);
++        p->reload_requested = true;
++        atomic_store(&ao->global->spatial_lpcm_failed, true);
++        ao_request_reload(ao);
+     } else if (failure == MP_SPATIAL_FAILED && !p->reload_requested) {
+         char *reason = mp_spatial_failure(p->output);
+         MP_WARN(ao, "the renderer failed (%s), falling back to PCM\n",
+@@ -343,6 +469,8 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+     state->playing = p->playing && !drained;
+ }
+ 
++#define OPT_BASE_STRUCT struct priv
++
+ const struct ao_driver audio_out_spatial = {
+     .description = "TrueHD and DTS-HD passthrough to Apple spatial audio",
+     .name        = "spatial",
+@@ -356,4 +484,11 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+     .end_of_stream = end_of_stream,
+     .set_gain    = set_gain,
+     .priv_size   = sizeof(struct priv),
++    .options = (const struct m_option[]) {
++        {"output", OPT_CHOICE(opt_output, {"auto", SPATIAL_OUTPUT_AUTO},
++                              {"apac", SPATIAL_OUTPUT_APAC}, {"lpcm", SPATIAL_OUTPUT_LPCM})},
++        {"force-mat", OPT_BOOL(opt_force_mat)},
++        {0}
++    },
++    .options_prefix = "ao-spatial",
+ };
+diff --git a/audio/out/ao_spatial.swift b/audio/out/ao_spatial.swift
+index a7fd3f1..b63d355 100644
+--- a/audio/out/ao_spatial.swift
++++ b/audio/out/ao_spatial.swift
+@@ -21,11 +21,35 @@ private final class SpatialOutput: Sendable {
+ 
+     private let sink: SpatialAudioPassthroughSink
+     private let synchronizer: AVSampleBufferRenderSynchronizer
++    /// The renderer enqueues linear PCM, which it can turn down.
++    private let lossless: Bool
+     private let state = Mutex(State())
+ 
+-    init(codec: SpatialAudioCodec, synchronizer: AVSampleBufferRenderSynchronizer, bufferLimit: Int) throws {
+-        sink = try SpatialAudioPassthroughSink(codec: codec, synchronizer: synchronizer, bufferLimit: bufferLimit)
++    convenience init(codec: SpatialAudioCodec, lossless: Bool, synchronizer: AVSampleBufferRenderSynchronizer,
++                     bufferLimit: Int) throws {
++        var configuration = APACConfiguration()
++        configuration.losslessPCM = lossless
++        self.init(sink: try SpatialAudioPassthroughSink(codec: codec, configuration: configuration,
++                                                        synchronizer: synchronizer, bufferLimit: bufferLimit),
++                  synchronizer: synchronizer, lossless: lossless)
++    }
++
++    /// Decoded PCM (Force Dolby MAT): interleaved float at 48 kHz, each channel
++    /// put in its 7.1.4 slot and enqueued unchanged as linear PCM.
++    convenience init(slots: [Int], synchronizer: AVSampleBufferRenderSynchronizer, bufferLimit: Int) throws {
++        var configuration = APACConfiguration()
++        configuration.losslessPCM = true
++        let renderer = try SpatialAudioRenderer(codec: .trueHDAtmos, configuration: configuration,
++                                                synchronizer: synchronizer, output: AVSampleBufferAudioRenderer(),
++                                                makeDecoder: { PCMSlotDecoder(slots: slots) })
++        self.init(sink: SpatialAudioPassthroughSink(renderer: renderer, bufferLimit: bufferLimit, rawPCM: true),
++                  synchronizer: synchronizer, lossless: true)
++    }
++
++    private init(sink: SpatialAudioPassthroughSink, synchronizer: AVSampleBufferRenderSynchronizer, lossless: Bool) {
++        self.sink = sink
+         self.synchronizer = synchronizer
++        self.lossless = lossless
+         let poller = Task { [weak self] in
+             while !Task.isCancelled {
+                 guard let output = self else { return }
+@@ -103,7 +127,7 @@ private final class SpatialOutput: Sendable {
+             covered = .min
+             end = .min
+             final = false
+-            return Self.kind(of: failure)
++            return kind(of: failure)
+         }
+         // Progress counts what was enqueued; the queue also misses audio
+         // a route change flushed until the renderer has enqueued it again.
+@@ -112,7 +136,7 @@ private final class SpatialOutput: Sendable {
+         final = progress.isFinal && queuedAfterFinal
+         covered = Self.nanoseconds(min(progress.submittedEnd, queuedEnd ?? progress.timelineStart))
+         end = Self.nanoseconds(progress.submittedEnd)
+-        return Self.kind(of: failure)
++        return kind(of: failure)
+     }
+ 
+     func close() {
+@@ -130,10 +154,8 @@ private final class SpatialOutput: Sendable {
+         }
+     }
+ 
+-    private static func kind(of failure: (any Error)?) -> Int32 {
+-        guard let failure else { return 0 } // MP_SPATIAL_OK
+-        if case .discontinuity? = failure as? SpatialAudioError { return 1 } // MP_SPATIAL_DISCONTINUITY
+-        return 2 // MP_SPATIAL_FAILED
++    private func kind(of failure: (any Error)?) -> Int32 {
++        mpSpatialFailureKind(failure, lossless: lossless)
+     }
+ 
+     static func nanoseconds(_ time: CMTime) -> Int64 {
+@@ -141,18 +163,78 @@ private final class SpatialOutput: Sendable {
+     }
+ }
+ 
++/// MP_SPATIAL_*: the stream itself (not Atmos or DTS:X, malformed) fails as
++/// before; with linear PCM, anything else is the renderer turning it down.
++@available(macOS 26, iOS 26, tvOS 26, *)
++func mpSpatialFailureKind(_ failure: (any Error)?, lossless: Bool) -> Int32 {
++    guard let failure else { return 0 } // MP_SPATIAL_OK
++    switch failure as? SpatialAudioError {
++    case .discontinuity?: return 1 // MP_SPATIAL_DISCONTINUITY
++    case .unsupported?, .decoding?: return 2 // MP_SPATIAL_FAILED
++    default: return lossless ? 3 : 2 // MP_SPATIAL_OUTPUT_FAILED, MP_SPATIAL_FAILED
++    }
++}
++
+ @_cdecl("mp_spatial_create")
+-func mpSpatialCreate(_ codec: Int32, _ pointer: UnsafeMutableRawPointer, _ bufferLimit: Int) -> UnsafeMutableRawPointer? {
++func mpSpatialCreate(_ codec: Int32, _ lossless: Bool, _ pointer: UnsafeMutableRawPointer, _ bufferLimit: Int) -> UnsafeMutableRawPointer? {
+     guard #available(macOS 26, iOS 26, tvOS 26, *), let codec = SpatialAudioCodec(rawValue: UInt32(codec)) else { return nil }
+     let synchronizer = Unmanaged<AVSampleBufferRenderSynchronizer>.fromOpaque(pointer).takeUnretainedValue()
+     do {
+-        return Unmanaged.passRetained(try SpatialOutput(codec: codec, synchronizer: synchronizer, bufferLimit: bufferLimit)).toOpaque()
++        return Unmanaged.passRetained(try SpatialOutput(codec: codec, lossless: lossless, synchronizer: synchronizer,
++                                                        bufferLimit: bufferLimit)).toOpaque()
+     } catch {
+         NSLog("[ao_spatial] Cannot open output: %@", String(describing: error))
+         return nil
+     }
+ }
+ 
++@_cdecl("mp_spatial_create_pcm")
++func mpSpatialCreatePCM(_ slots: UnsafePointer<Int8>, _ channels: Int32, _ pointer: UnsafeMutableRawPointer,
++                        _ bufferLimit: Int) -> UnsafeMutableRawPointer? {
++    guard #available(macOS 26, iOS 26, tvOS 26, *), channels > 0 else { return nil }
++    let synchronizer = Unmanaged<AVSampleBufferRenderSynchronizer>.fromOpaque(pointer).takeUnretainedValue()
++    let map = (0..<Int(channels)).map { Int(slots[$0]) }
++    do {
++        return Unmanaged.passRetained(try SpatialOutput(slots: map, synchronizer: synchronizer,
++                                                        bufferLimit: bufferLimit)).toOpaque()
++    } catch {
++        NSLog("[ao_spatial] Cannot open the PCM output: %@", String(describing: error))
++        return nil
++    }
++}
++
++/// Decoded PCM for the lossless renderer: interleaved 32-bit float frames of
++/// `slots.count` channels, each written to its 7.1.4 slot (the rest silent),
++/// unchanged. Bytes may arrive split anywhere.
++@available(macOS 26, iOS 26, tvOS 26, *)
++final class PCMSlotDecoder: SpatialAudioRendererDecoding {
++    private let slots: [Int]
++    private var pending: [UInt8] = []
++
++    init(slots: [Int]) { self.slots = slots }
++
++    func decode(_ bytes: UnsafeRawBufferPointer, end: Bool) throws -> [PCMBlock] {
++        pending.append(contentsOf: bytes)
++        let stride = slots.count * 4
++        let frames = pending.count / stride
++        defer { if end { pending.removeAll() } }
++        guard frames > 0 else { return [] }
++        var samples = [Float](repeating: 0, count: frames * 12)
++        pending.withUnsafeBytes { input in
++            samples.withUnsafeMutableBufferPointer { output in
++                for frame in 0..<frames {
++                    for (channel, slot) in slots.enumerated() where (0..<12).contains(slot) {
++                        output[frame * 12 + slot] = input.loadUnaligned(fromByteOffset: frame * stride + channel * 4,
++                                                                         as: Float.self)
++                    }
++                }
++            }
++        }
++        pending.removeFirst(frames * stride)
++        return [PCMBlock(samples: samples, frames: frames, sampleRate: 48_000, channels: 12)]
++    }
++}
++
+ @_cdecl("mp_spatial_destroy")
+ func mpSpatialDestroy(_ pointer: UnsafeMutableRawPointer) {
+     if #available(macOS 26, iOS 26, tvOS 26, *) {
+diff --git a/common/global.h b/common/global.h
+index 6cdbea5..d30e9ee 100644
+--- a/common/global.h
++++ b/common/global.h
+@@ -1,6 +1,8 @@
+ #ifndef MPV_MPV_H
+ #define MPV_MPV_H
+ 
++#include <stdatomic.h>
++
+ // This should be accessed by glue code only, never normal code.
+ // The only purpose of this is to make mpv library-safe.
+ // Think hard before adding new members.
+@@ -12,6 +14,13 @@ struct mpv_global {
+     struct stats_base *stats;
+     struct demux_packet_pool *packet_pool;
+     struct curl_ctx *curl;
++
++    // ao_spatial, per player: what it sends now (MP_SPATIAL_KIND_*, for the
++    // spatial-audio-output property), and whether the renderer turned down
++    // linear PCM on this player, which then keeps to APAC. Written on the
++    // AO thread, read anywhere.
++    atomic_int spatial_output_kind;
++    atomic_bool spatial_lpcm_failed;
+ };
+ 
+ #endif
+diff --git a/player/command.c b/player/command.c
+index e3ac82a..ca6bc15 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -72,6 +72,8 @@
+ #include "audio/aframe.h"
+ #include "audio/format.h"
+ #include "audio/out/ao.h"
++#include "audio/out/ao_spatial.h"
++#include "common/global.h"
+ #include "video/out/bitmap_packer.h"
+ #include "options/path.h"
+ #include "screenshot.h"
+@@ -1957,6 +1959,20 @@ static int mp_property_ao(void *ctx, struct m_property *p, int action, void *arg
+     return m_property_strdup_ro(action, arg, mpctx->ao ? ao_get_name(mpctx->ao) : NULL);
+ }
+ 
++// What the spatial output sends: "apac" (rendered Atmos or DTS:X, encoded),
++// "lpcm" (rendered, lossless linear PCM) or "pcm" (decoded PCM, lossless,
++// beside the Atmos activator: Force Dolby MAT). Unavailable otherwise.
++static int mp_property_spatial_output(void *ctx, struct m_property *p, int action,
++                                      void *arg)
++{
++    MPContext *mpctx = ctx;
++    static const char *const names[] = {NULL, "apac", "lpcm", "pcm"};
++    int kind = atomic_load(&mpctx->global->spatial_output_kind);
++    if (!mpctx->ao || kind <= 0 || kind >= MP_ARRAY_SIZE(names))
++        return M_PROPERTY_UNAVAILABLE;
++    return m_property_strdup_ro(action, arg, names[kind]);
++}
++
+ /// Audio delay (RW)
+ static int mp_property_audio_delay(void *ctx, struct m_property *prop,
+                                    int action, void *arg)
+@@ -4820,6 +4836,7 @@ static const struct m_property mp_properties_base[] = {
+     {"audio-device", mp_property_audio_device},
+     {"audio-device-list", mp_property_audio_devices},
+     {"current-ao", mp_property_ao},
++    {"spatial-audio-output", mp_property_spatial_output},
+ 
+     // Video
+     {"video-target-params", mp_property_tgt_imgparams},
+@@ -4988,7 +5005,7 @@ static const char *const *const mp_event_property_change[] = {
+       "window-id", "track-list", "current-tracks"),
+     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
+       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
+-      "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
++      "current-ao", "spatial-audio-output", "audio-codec-name", "audio-params", "track-list", "current-tracks",
+       "audio-out-params", "volume-max", "volume-gain-min", "volume-gain-max", "mixer-active"),
+     E(MPV_EVENT_SEEK, "seeking", "core-idle", "eof-reached"),
+     E(MPV_EVENT_PLAYBACK_RESTART, "seeking", "core-idle", "eof-reached"),
+diff --git a/player/main.c b/player/main.c
+index 1eca7de..2f1a694 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -291,6 +291,8 @@ struct MPContext *mp_create(void)
+     mp_mutex_init(&mpctx->abort_lock);
+ 
+     mpctx->global = talloc_zero(mpctx, struct mpv_global);
++    atomic_init(&mpctx->global->spatial_output_kind, 0);
++    atomic_init(&mpctx->global->spatial_lpcm_failed, false);
+ 
+     demux_packet_pool_init(mpctx->global);
+     stats_global_init(mpctx->global);

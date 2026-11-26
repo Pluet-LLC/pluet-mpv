@@ -219,6 +219,33 @@ unpacks, converts and queues APAC on the output's synchronizer.
 - **Audio session.** Like mpv's other Apple outputs, it sets the session's
   category, mode and multichannel support and activates it when it opens, then
   leaves it to the host.
+- **Lossless 7.1.4 (patch 0317, SpatialAudioBridge 0001).**
+  `--ao-spatial-output=auto|apac|lpcm` (default `auto`). With `lpcm` the
+  renderer enqueues the rendered 7.1.4 as 32-bit float linear PCM in Apple's
+  Atmos 7.1.4 layout (`kAudioChannelLayoutTag_Atmos_7_1_4`: L R C LFE Ls Rs
+  Rls Rrs Vhl Vhr Ltr Rtr) instead of encoding APAC, beside the same Atmos
+  activator; `auto` does so where the audio session's route is HDMI and keeps
+  APAC elsewhere (AirPlay, headphones, built-in speakers). The PCM is the
+  render bit for bit (APAC measured 49.1 dB signal-to-error against the same
+  render on a TrueHD Atmos film excerpt), and the first audio is enqueued
+  after 0.03 s of input instead of APAC's 1.46 s. A renderer that turns
+  linear PCM down makes the output reload with APAC for the rest of the
+  player's life; a stream without objects still falls back to decoding.
+  Public API only. Not yet heard through a receiver: whether tvOS's MAT
+  output carries the twelve channels unchanged needs a receiver's channel
+  check.
+- **Force Dolby MAT (patch 0317).** `--ao-spatial-force-mat` (default no)
+  also takes decoded PCM of more than two channels (bed-only TrueHD, DTS-HD
+  MA without DTS:X, multichannel PCM, anything else decoded to 5.1 or more):
+  the 7.1.4 speakers only are offered (mpv remaps or downmixes nothing
+  else), float at 48 kHz, each channel unchanged in its 7.1.4 slot (a 5.1
+  with back surrounds at the sides), through the same lossless renderer and
+  activator. mpv's own volume already applies to decoded PCM, so the
+  renderer stays at unity there. Stereo, AC-3 and E-AC-3 go to the next
+  output as before.
+- **`spatial-audio-output`.** What the output sends: `apac`, `lpcm` or
+  `pcm` (Force Dolby MAT); unavailable otherwise. It changes with the audio
+  reconfig event, as `current-ao` does.
 
 ### How it is built
 
@@ -242,6 +269,38 @@ slice.
 | `scripts/test_spatial_feed.sh` | The production Swift bridge with the pinned sink and IEC unpacker against a fake renderer. | `ci.yml`, `publish.yml` |
 | `scripts/test_spatial_archives.sh <patched-mpv> <platform>` | The installed slices: exports, a link with force-loaded libdovi, an Objective-C consumer through `mpv.pc`. | `publish.yml`, after each platform build |
 | `scripts/test_spatial_swiftpm.sh <release-dir>` | An Objective-C-only app on iOS and tvOS linked through the packaged SwiftPM product (needs XcodeGen). | `publish.yml`, after packaging |
-| `scripts/test_spatial_renderer.sh <patched-mpv> <built-spatial-dir> <iec-file> <1=truehd\|2=dtshd> <expect-failure:0\|1> [libdovi-archive]` | A real, muted renderer on macOS. Make the IEC file with FFmpeg's `spdif` muxer (`-dtshd_rate 768000` for DTS-HD). | manual |
+| `scripts/test_spatial_renderer.sh <patched-mpv> <built-spatial-dir> <iec-file> <1=truehd\|2=dtshd> <expect-failure:0\|1> [libdovi-archive]` | A real, muted renderer on macOS. Make the IEC file with FFmpeg's `spdif` muxer (`-dtshd_rate 768000` for DTS-HD). `SPATIAL_LOSSLESS=1` plays the rendered 7.1.4 as linear PCM. | manual |
+| `scripts/test_spatial_lossless.sh [patched-mpv] [iec-truehd-atmos]` | SpatialAudioBridge's real renderer and decoder with the Rust core against a capturing output: linear PCM is the render bit for bit, in the Atmos 7.1.4 layout, with exact timestamps; without the option it is APAC; Force Dolby MAT's slot mapping; the failure kinds. With a TrueHD Atmos IEC file it also compares the whole render and prints APAC's signal-to-error and each route's start. | `ci.yml` |
 
 None of these opens an audio device or establishes receiver behaviour.
+
+## Network files through several connections (patch 0318)
+
+A large http(s) file is read through several connections
+(`stream/http_parallel.c`). The file is cut into chunks
+(`--stream-http-chunk-size`, 2 MiB); a worker per connection
+(`--stream-http-connections`, 4; 1 turns it off) fetches chunks with ranged
+requests into connections + 3 chunk buffers (14 MiB at the defaults) that
+the reader copies from as bytes arrive. Until the reader has read on 4 MiB
+from one position (a file's headers, a start, a seek), it is served as by one
+connection, on one open-ended reply that runs on across chunks; then the chunks ahead of it are fetched
+too, one per connection, each a bounded request that the next one reuses the
+connection for (FFmpeg 0080/0081). A seek stops fetches the reader left and
+keeps their bytes. Failed fetches are retried with backoff after FFmpeg's own
+reconnects; a server that refuses another connection while others work is
+read through as many as work.
+
+Only read-only http(s) (and dav/webdav) files of known size, at least 32 MiB
+and seekable, never loopback hosts (an app's own byte server). HLS, live
+streams and every other protocol read as before; the demuxer gets the same
+bytes, so seeks land where they did.
+
+Measured with mpv on a 24 Mbit/s Matroska file from a throttled LAN server,
+1 -> 4 connections: each connection limited to 1.5 MB/s with 60 ms before
+each reply, start 2.20 -> 1.44 s, cache after 10 s 0.1 -> 6 s,
+cache-pauses in 30 s 7 -> 1, a resume at 50 s as fast as before; one 4 MB/s
+line shared by all connections, start 1.14 -> 0.78 s, a resume as fast as
+before; unthrottled, the same.
+`scripts/test_http_parallel.sh` checks every byte through the stream layer's
+walk, retries, a server's connection limit and seeks, and prints the speedup.
+

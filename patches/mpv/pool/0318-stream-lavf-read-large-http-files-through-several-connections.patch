@@ -1,0 +1,1026 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH] stream_lavf: read large http(s) files through several
+ connections
+
+A single TCP connection over a long or lossy path carries only so much:
+on a remote media server one connection often gives a fraction of the
+line, and a high-bitrate remux then buffers while the line sits idle.
+stream/http_parallel.c reads the file through several connections
+instead, with the same options (headers, cookies, TLS, timeouts,
+FFmpeg's reconnect) as the stream layer's own.
+
+The file is cut into chunks (--stream-http-chunk-size, 2 MiB). A worker
+thread per connection (--stream-http-connections, 4; 1 turns it off)
+fetches whole chunks with ranged requests (FFmpeg's offset and
+end_offset) into a few chunk buffers the reader copies from; bytes are
+handed over as they arrive, so the chunk the reader is in costs no more
+latency than one connection does, and a reader that lands inside a chunk
+is served from where it landed. Until it has read on, the reader's chunk is
+fetched on one open-ended reply that runs on into the next chunks, as a
+single connection would. Once the reader has read on 4 MiB from one
+position (past a file's headers and the first frames after a seek, so a
+start or a seek never shares the line with read-ahead), the chunks ahead
+of it are fetched too, one per connection.
+A seek moves the window: fetches the reader left are stopped (their bytes
+are kept), and fetched chunks stay until their buffer is needed, so the
+demuxer's reads of a header, an index at the end and the start again
+cost nothing twice. The connection the stream layer opened becomes the
+first worker's. Memory: connections + 3 chunk buffers (14 MiB at the
+defaults).
+
+Connections carry on from where their last reply ended: FFmpeg's http
+protocol (patches 0080/0081) continues a bounded reply on the same
+connection, or sends the next ranged request over it once a reply was
+read to its end. A failed fetch is retried with backoff (0.25, 0.5, 1 s)
+on a new connection, after FFmpeg's own reconnects; a server that refuses
+another connection while others work (a per-client limit) is read through
+as many as work from then on.
+
+Only for read-only http:// and https:// (and dav/webdav) files whose size
+is known, at least 32 MiB and seekable, and never for loopback hosts (an
+app's own byte server for shares). Live streams, HLS (opened by
+libavformat) and everything else read as before. The bytes the demuxer
+gets are the same, so exact seeks are unchanged.
+
+Measured with mpv (macOS, --vo=null --ao=null) on a 24 Mbit/s Matroska
+file from a server on the LAN, 1 -> 4 connections, 2-3 runs each:
+- each connection limited to 1.5 MB/s, 60 ms before each reply: start
+  2.20 -> 1.44 s, cache after 10 s 0.1 -> 6 s, cache-pauses in 30 s
+  7 -> 1; resume at 50 s unchanged (1.72-1.76 -> 1.75-1.76 s), with
+  6 s cached after 10 s instead of none;
+- one 4 MB/s line shared by every connection: start 1.12-1.16 ->
+  0.77-0.79 s, resume at 50 s unchanged (0.91-0.94 -> 0.94-0.95 s), cache
+  after 10 s 0.9 -> 4 s from the start;
+- unthrottled: the same (start 0.04 s, cache full either way).
+scripts/test_http_parallel.sh checks every byte through the stream
+layer's walk, retries and a server's connection limit, and prints the
+speedup (24 MiB at 2 MB/s per connection: 3.5x with 4).
+---
+diff --git a/meson.build b/meson.build
+index bd3513e..1cc001e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -197,6 +197,7 @@ sources = files(
+     'stream/stream_concat.c',
+     'stream/stream_edl.c',
+     'stream/stream_file.c',
++    'stream/http_parallel.c',
+     'stream/stream_lavf.c',
+     'stream/stream_memory.c',
+     'stream/stream_mf.c',
+diff --git a/stream/stream_lavf.c b/stream/stream_lavf.c
+index 85f8876..eccaab2 100644
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -30,6 +30,7 @@
+ #include "options/m_option.h"
+ 
+ #include "cookies.h"
++#include "http_parallel.h"
+ 
+ #include "misc/bstr.h"
+ #include "mpv_talloc.h"
+@@ -38,14 +39,36 @@
+ 
+ struct stream_lavf_opts {
+     char **avopts;
++    int http_connections;
++    int64_t http_chunk_size;
+ };
+ 
+ const struct m_sub_options stream_lavf_conf = {
+     .opts = (const m_option_t[]) {
+         {"stream-lavf-o", OPT_KEYVALUELIST(avopts)},
++        {"stream-http-connections", OPT_INT(http_connections), M_RANGE(1, 8)},
++        {"stream-http-chunk-size", OPT_BYTE_SIZE(http_chunk_size),
++         M_RANGE(256 * 1024, 64 * 1024 * 1024)},
+         {0}
+     },
+     .size = sizeof(struct stream_lavf_opts),
++    .defaults = &(const struct stream_lavf_opts){
++        .http_connections = 4,
++        .http_chunk_size = 2 * 1024 * 1024,
++    },
++};
++
++// Files at least this large read through several connections.
++#define PARALLEL_MIN_SIZE (32 * 1024 * 1024)
++
++struct priv {
++    struct stream *stream;
++    AVIOContext *avio;
++    // Several connections (http_parallel.c), which then own avio's.
++    struct mp_http_parallel *parallel;
++    int64_t size;
++    // http_parallel.c stops the reply of the connection it took over.
++    volatile int adopt_abort;
+ };
+ 
+ static const char *const http_like[] =
+@@ -56,14 +79,16 @@ static struct mp_tags *read_icy(stream_t *stream);
+ 
+ static int fill_buffer(stream_t *s, void *buffer, int max_len)
+ {
+-    AVIOContext *avio = s->priv;
+-    int r = avio_read_partial(avio, buffer, max_len);
++    struct priv *p = s->priv;
++    int r = p->parallel ? mp_http_parallel_read(p->parallel, buffer, max_len)
++                        : avio_read_partial(p->avio, buffer, max_len);
+     return (r <= 0) ? -1 : r;
+ }
+ 
+ static int write_buffer(stream_t *s, void *buffer, int len)
+ {
+-    AVIOContext *avio = s->priv;
++    struct priv *p = s->priv;
++    AVIOContext *avio = p->avio;
+     avio_write(avio, buffer, len);
+     avio_flush(avio);
+     if (avio->error)
+@@ -73,8 +98,14 @@ static int write_buffer(stream_t *s, void *buffer, int len)
+ 
+ static int seek(stream_t *s, int64_t newpos)
+ {
+-    AVIOContext *avio = s->priv;
+-    if (avio_seek(avio, newpos, SEEK_SET) < 0) {
++    struct priv *p = s->priv;
++    if (p->parallel) {
++        if (newpos < 0 || newpos > p->size)
++            return 0;
++        mp_http_parallel_seek(p->parallel, newpos);
++        return 1;
++    }
++    if (avio_seek(p->avio, newpos, SEEK_SET) < 0) {
+         return 0;
+     }
+     return 1;
+@@ -82,13 +113,23 @@ static int seek(stream_t *s, int64_t newpos)
+ 
+ static int64_t get_size(stream_t *s)
+ {
+-    AVIOContext *avio = s->priv;
+-    return avio_size(avio);
++    struct priv *p = s->priv;
++    return p->parallel ? p->size : avio_size(p->avio);
+ }
+ 
+ static void close_f(stream_t *stream)
+ {
+-    AVIOContext *avio = stream->priv;
++    struct priv *p = stream->priv;
++    if (p->parallel) {
++        struct mp_http_parallel_stats st;
++        mp_http_parallel_get_stats(p->parallel, &st);
++        MP_VERBOSE(stream, "parallel http: %lld requests on %lld connections, %lld bytes "
++                   "(%lld unread), %lld retries\n", (long long)st.requests, (long long)st.opens,
++                   (long long)st.bytes, (long long)st.wasted, (long long)st.retries);
++        mp_http_parallel_destroy(p->parallel);
++        return;
++    }
++    AVIOContext *avio = p->avio;
+     /* NOTE: As of 2011 write streams must be manually flushed before close.
+      * Currently write_buffer() always flushes them after writing.
+      * avio_close() could return an error, but we have no way to return that
+@@ -100,7 +141,11 @@ static void close_f(stream_t *stream)
+ 
+ static int control(stream_t *s, int cmd, void *arg)
+ {
+-    AVIOContext *avio = s->priv;
++    struct priv *p = s->priv;
++    AVIOContext *avio = p->avio;
++    // A plain file over several connections: no protocol seeks or metadata.
++    if (p->parallel)
++        return STREAM_UNSUPPORTED;
+     switch(cmd) {
+     case STREAM_CTRL_AVSEEK: {
+         struct stream_avseek *c = arg;
+@@ -146,11 +191,34 @@ static int control(stream_t *s, int cmd, void *arg)
+ }
+ 
+ static int interrupt_cb(void *ctx)
++{
++    struct priv *p = ctx;
++    return p->adopt_abort || mp_cancel_test(p->stream->cancel);
++}
++
++static int parallel_interrupt(void *ctx)
+ {
+     struct stream *stream = ctx;
+     return mp_cancel_test(stream->cancel);
+ }
+ 
++static void parallel_log(void *ctx, int level, const char *msg)
++{
++    struct stream *stream = ctx;
++    int mpl = level <= AV_LOG_ERROR ? MSGL_ERR : level <= AV_LOG_WARNING ? MSGL_WARN : MSGL_V;
++    MP_MSG(stream, mpl, "parallel http: %s", msg);
++}
++
++// Loopback servers (an app's own byte server for shares) gain nothing from
++// more connections.
++static bool is_loopback(const char *url)
++{
++    char host[256];
++    av_url_split(NULL, 0, NULL, 0, host, sizeof(host), NULL, NULL, 0, url);
++    return !strcmp(host, "localhost") || !strncmp(host, "127.", 4) || !strcmp(host, "::1") ||
++           !strcmp(host, "[::1]");
++}
++
+ static const char * const prefix[] = { "lavf://", "ffmpeg://" };
+ 
+ void mp_setup_av_network_options(AVDictionary **dict, const char *target_fmt,
+@@ -332,8 +400,10 @@ static int open_f(stream_t *stream)
+ {
+     AVIOContext *avio = NULL;
+     int res = STREAM_ERROR;
+-    AVDictionary *dict = NULL;
++    AVDictionary *dict = NULL, *parallel_dict = NULL;
+     void *temp = talloc_new(NULL);
++    struct priv *p = talloc_zero(stream, struct priv);
++    p->stream = stream;
+ 
+     stream->seek = NULL;
+     stream->seekable = false;
+@@ -409,7 +479,7 @@ static int open_f(stream_t *stream)
+ 
+     AVIOInterruptCB cb = {
+         .callback = interrupt_cb,
+-        .opaque = stream,
++        .opaque = p,
+     };
+ 
+     filename = normalize_url(stream, filename);
+@@ -421,6 +491,16 @@ static int open_f(stream_t *stream)
+         av_dict_set(&dict, "timeout", "0", 0);
+     }
+ 
++    // Large http(s) files read through several connections (http_parallel.c),
++    // with the same options; the connection opened here becomes the first.
++    struct stream_lavf_opts *lavf_opts =
++        mp_get_config_group(temp, stream->global, &stream_lavf_conf);
++    bool parallel = flags == AVIO_FLAG_READ && lavf_opts->http_connections > 1 &&
++        (bstr_equals0(proto, "http") || bstr_equals0(proto, "https")) &&
++        !is_loopback(filename);
++    if (parallel)
++        av_dict_copy(&parallel_dict, dict, 0);
++
+     int err = avio_open2(&avio, filename, flags, &cb, &dict);
+     if (err < 0) {
+         if (err == AVERROR_PROTOCOL_NOT_FOUND)
+@@ -445,8 +525,34 @@ static int open_f(stream_t *stream)
+         }
+     }
+ 
+-    stream->priv = avio;
++    p->avio = avio;
++    stream->priv = p;
+     stream->seekable = avio->seekable & AVIO_SEEKABLE_NORMAL;
++    p->size = avio_size(avio);
++    if (parallel && stream->seekable && p->size >= PARALLEL_MIN_SIZE) {
++        struct mp_http_parallel_params params = {
++            .url = stream->effective_url ? stream->effective_url : filename,
++            .options = parallel_dict,
++            .size = p->size,
++            .connections = lavf_opts->http_connections,
++            .chunk_size = lavf_opts->http_chunk_size,
++            .sequential_threshold = 4 * 1024 * 1024,
++            .adopt = avio,
++            .adopt_abort = &p->adopt_abort,
++            .interrupt = parallel_interrupt,
++            .interrupt_ctx = stream,
++            .log = parallel_log,
++            .log_ctx = stream,
++        };
++        p->parallel = mp_http_parallel_create(&params);
++        // The connection is the reader's now, also when that failed.
++        p->avio = NULL;
++        if (!p->parallel) {
++            MP_ERR(stream, "cannot read through several connections\n");
++            stream->priv = NULL;
++            goto out;
++        }
++    }
+     stream->seek = stream->seekable ? seek : NULL;
+     stream->fill_buffer = fill_buffer;
+     stream->write_buffer = write_buffer;
+@@ -461,13 +567,14 @@ static int open_f(stream_t *stream)
+ 
+ out:
+     av_dict_free(&dict);
++    av_dict_free(&parallel_dict);
+     talloc_free(temp);
+     return res;
+ }
+ 
+ static struct mp_tags *read_icy(stream_t *s)
+ {
+-    AVIOContext *avio = s->priv;
++    AVIOContext *avio = ((struct priv *)s->priv)->avio;
+ 
+     if (!avio->av_class)
+         return NULL;
+diff --git a/stream/http_parallel.c b/stream/http_parallel.c
+new file mode 100644
+index 0000000..cbe9a9c
+--- /dev/null
++++ b/stream/http_parallel.c
+@@ -0,0 +1,619 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// The resource is cut into chunks. A worker thread per connection fetches
++// whole chunks with ranged requests (end_offset), into a small set of chunk
++// buffers the reader copies from; the reader waits only for the bytes it
++// asks for, which arrive as they are received, so the chunk it is in costs
++// no more latency than a single connection. Once the reader has read on
++// sequentially from one position, the chunks ahead of it are fetched too,
++// one per connection. A seek moves the window: fetches that left it are
++// stopped (their bytes are kept), and fetched chunks stay until their buffer
++// is needed, so the demuxer's reads of a header, an index at the end and the
++// start again cost nothing twice.
++//
++// A connection carries on from where its last reply ended: FFmpeg's http
++// protocol (patches 0080/0081) continues a bounded reply on the same
++// connection, or sends the next ranged request over it once a reply was read
++// to its end. A failed fetch is retried with backoff on a new connection; a
++// server that refuses more connections while others work makes the reader
++// use fewer from then on.
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include <libavformat/avformat.h>
++#include <libavutil/error.h>
++#include <libavutil/opt.h>
++
++#include "http_parallel.h"
++
++#define MAX_CONNECTIONS 8
++#define MAX_ATTEMPTS 4
++
++struct chunk {
++    int64_t index;      // -1: free
++    uint8_t *data;
++    int64_t length;     // bytes the chunk has (the last one is short)
++    // Bytes [begin, filled) of the chunk have arrived. A reader that lands
++    // inside a chunk is served from there, not from the chunk's start.
++    int64_t begin;
++    int64_t filled;
++    int fetcher;        // worker fetching it, or -1
++    bool failed;
++    bool read;          // the reader took bytes from it
++    uint64_t used;      // LRU stamp
++};
++
++struct worker {
++    struct mp_http_parallel *p;
++    pthread_t thread;
++    int id;
++    AVIOContext *avio;
++    // Where the connection's reply stands, or -1 without one.
++    int64_t pos;
++    // The reader left this worker's chunk: stop the fetch. Read by the
++    // connection's interrupt callback.
++    volatile int abort;
++    // The chunk it fetches (-1: none), and whether its reply runs on to the
++    // end of the resource, so it flows into the next chunk with no request.
++    int64_t chunk;
++    bool open_ended;
++    bool adopted;
++};
++
++struct mp_http_parallel {
++    struct mp_http_parallel_params params;
++    char *url;
++    AVDictionary *options;
++    int64_t chunk_size;
++
++    pthread_mutex_t lock;
++    pthread_cond_t wakeup;
++
++    struct chunk *chunks;
++    int num_chunks;
++    struct worker workers[MAX_CONNECTIONS];
++    int num_workers;
++    // Workers allowed to fetch; lowered when the server turns connections down.
++    int active_limit;
++    bool threads_started[MAX_CONNECTIONS];
++
++    int64_t pos;
++    // Where the reader's current sequential run began.
++    int64_t run_start;
++    bool closing;
++    uint64_t clock;
++    struct mp_http_parallel_stats stats;
++};
++
++static void logf_(struct mp_http_parallel *p, int level, const char *fmt, ...)
++{
++    if (!p->params.log)
++        return;
++    char buf[256];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, ap);
++    va_end(ap);
++    p->params.log(p->params.log_ctx, level, buf);
++}
++
++// Stops the fetch of worker `w`, also on an adopted connection, whose
++// interrupt callback is its opener's. Lock held.
++static void stop_worker(struct worker *w)
++{
++    w->abort = 1;
++    if (w->adopted && w->p->params.adopt_abort)
++        *w->p->params.adopt_abort = 1;
++}
++
++static int worker_interrupt(void *ctx)
++{
++    struct worker *w = ctx;
++    struct mp_http_parallel *p = w->p;
++    if (w->abort || p->closing)
++        return 1;
++    return p->params.interrupt ? p->params.interrupt(p->params.interrupt_ctx) : 0;
++}
++
++static void timed_wait(struct mp_http_parallel *p, int64_t ms)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_sec += ms / 1000;
++    ts.tv_nsec += (ms % 1000) * 1000000;
++    if (ts.tv_nsec >= 1000000000) {
++        ts.tv_sec++;
++        ts.tv_nsec -= 1000000000;
++    }
++    pthread_cond_timedwait(&p->wakeup, &p->lock, &ts);
++}
++
++static int64_t num_chunks_total(struct mp_http_parallel *p)
++{
++    return (p->params.size + p->chunk_size - 1) / p->chunk_size;
++}
++
++static struct chunk *find_chunk(struct mp_http_parallel *p, int64_t index)
++{
++    for (int n = 0; n < p->num_chunks; n++) {
++        if (p->chunks[n].index == index)
++            return &p->chunks[n];
++    }
++    return NULL;
++}
++
++// The chunks the reader wants now: its own, and once it reads on
++// sequentially, one more per connection ahead of it.
++static void window(struct mp_http_parallel *p, int64_t *first, int64_t *last)
++{
++    int64_t total = num_chunks_total(p);
++    *first = p->pos / p->chunk_size;
++    *last = *first;
++    if (p->pos - p->run_start >= p->params.sequential_threshold)
++        *last = *first + p->active_limit;
++    if (*last > total - 1)
++        *last = total - 1;
++}
++
++static bool in_window(struct mp_http_parallel *p, int64_t index)
++{
++    int64_t first, last;
++    window(p, &first, &last);
++    return index >= first && index <= last;
++}
++
++static void release_slot(struct mp_http_parallel *p, struct chunk *c)
++{
++    if (c->index >= 0 && !c->read)
++        p->stats.wasted += c->filled - c->begin;
++    c->index = -1;
++    c->begin = c->filled = 0;
++    c->failed = false;
++    c->read = false;
++}
++
++// A buffer for chunk `index`: its own, a free one, or the least recently
++// used one outside the window that nobody fetches.
++static struct chunk *slot_for(struct mp_http_parallel *p, int64_t index)
++{
++    struct chunk *c = find_chunk(p, index);
++    if (c)
++        return c;
++    struct chunk *victim = NULL;
++    for (int n = 0; n < p->num_chunks; n++) {
++        struct chunk *s = &p->chunks[n];
++        if (s->index < 0) {
++            victim = s;
++            break;
++        }
++        if (s->fetcher >= 0 || in_window(p, s->index))
++            continue;
++        if (!victim || s->used < victim->used)
++            victim = s;
++    }
++    if (!victim)
++        return NULL;
++    release_slot(p, victim);
++    victim->index = index;
++    victim->length = p->params.size - index * p->chunk_size;
++    if (victim->length > p->chunk_size)
++        victim->length = p->chunk_size;
++    victim->used = ++p->clock;
++    return victim;
++}
++
++// The chunk this worker fetches next, or NULL. Prefers the one its
++// connection already stands at, then the nearest to the reader.
++static struct chunk *pick(struct worker *w)
++{
++    struct mp_http_parallel *p = w->p;
++    if (w->id >= p->active_limit || p->pos >= p->params.size)
++        return NULL;
++    int64_t first, last;
++    window(p, &first, &last);
++    int64_t best = -1;
++    // The reader's own chunk starts where the reader is, unless what it has
++    // reaches there.
++    int64_t at = p->pos - first * p->chunk_size;
++    struct chunk *own = find_chunk(p, first);
++    if (own && own->fetcher < 0 && !own->failed && (at < own->begin || at > own->filled)) {
++        if (!own->read)
++            p->stats.wasted += own->filled - own->begin;
++        own->begin = own->filled = at;
++        own->read = false;
++    }
++    for (int64_t i = first; i <= last; i++) {
++        struct chunk *c = find_chunk(p, i);
++        if (c && (c->fetcher >= 0 || c->failed || c->filled == c->length))
++            continue;
++        // A chunk another idle connection stands at is that one's to fetch
++        // (an open-ended reply runs on into it with no request).
++        int64_t start = i * p->chunk_size + (c ? c->filled : 0);
++        bool others = false;
++        for (int n = 0; n < p->num_workers; n++) {
++            struct worker *o = &p->workers[n];
++            if (o != w && n < p->active_limit && o->avio && o->chunk < 0 && o->pos == start)
++                others = true;
++        }
++        if (others && w->pos != start)
++            continue;
++        if (w->pos == start) {
++            best = i;
++            break;
++        }
++        if (best < 0)
++            best = i;
++    }
++    if (best < 0)
++        return NULL;
++    bool fresh = !find_chunk(p, best);
++    struct chunk *c = slot_for(p, best);
++    if (c) {
++        if (fresh && best == first)
++            c->begin = c->filled = at;
++        c->fetcher = w->id;
++    }
++    return c;
++}
++
++static void close_connection(struct worker *w)
++{
++    if (w->avio)
++        avio_closep(&w->avio);
++    w->pos = -1;
++    w->adopted = false;
++    w->open_ended = false;
++}
++
++// A connection whose next bytes are `start`, asking for no more than `end`
++// (0: to the end of the resource).
++static int connect_at(struct worker *w, int64_t start, int64_t end)
++{
++    struct mp_http_parallel *p = w->p;
++    if (w->avio) {
++        // Grow or bound the request this reply continues with, then move.
++        // An open-ended reply stays open-ended while it is read on.
++        if (!(w->open_ended && end == 0 && w->pos == start))
++            av_opt_set_int(w->avio, "end_offset", end, AV_OPT_SEARCH_CHILDREN);
++        if (w->pos == start)
++            return 0;
++        pthread_mutex_lock(&p->lock);
++        p->stats.requests++;
++        pthread_mutex_unlock(&p->lock);
++        if (avio_seek(w->avio, start, SEEK_SET) == start) {
++            w->pos = start;
++            return 0;
++        }
++        close_connection(w);
++    }
++    AVDictionary *options = NULL;
++    av_dict_copy(&options, p->options, 0);
++    char buf[32];
++    snprintf(buf, sizeof(buf), "%lld", (long long)start);
++    av_dict_set(&options, "offset", buf, 0);
++    if (end) {
++        snprintf(buf, sizeof(buf), "%lld", (long long)end);
++        av_dict_set(&options, "end_offset", buf, 0);
++    }
++    AVIOInterruptCB cb = {.callback = worker_interrupt, .opaque = w};
++    pthread_mutex_lock(&p->lock);
++    p->stats.requests++;
++    p->stats.opens++;
++    pthread_mutex_unlock(&p->lock);
++    int err = avio_open2(&w->avio, p->url, AVIO_FLAG_READ, &cb, &options);
++    av_dict_free(&options);
++    if (err < 0) {
++        w->avio = NULL;
++        return err;
++    }
++    w->pos = start;
++    return 0;
++}
++
++// Fetches the rest of `c`. Called and returns with the lock held.
++static void fetch(struct worker *w, struct chunk *c)
++{
++    struct mp_http_parallel *p = w->p;
++    int attempts = 0;
++    w->abort = 0;
++    w->chunk = c->index;
++    while (c->filled < c->length && !p->closing && !w->abort) {
++        int64_t base = c->index * p->chunk_size;
++        int64_t start = base + c->filled, end = base + c->length;
++        // Until the reader reads on, it is served as by one connection: the
++        // reply for its chunk runs on into the next ones, with no request at
++        // a chunk's end. Chunks fetched ahead are asked for one by one.
++        bool open_ended = c->index == p->pos / p->chunk_size &&
++                          p->pos - p->run_start < p->params.sequential_threshold;
++        pthread_mutex_unlock(&p->lock);
++        int err = connect_at(w, start, open_ended ? 0 : end);
++        pthread_mutex_lock(&p->lock);
++        w->open_ended = err >= 0 && open_ended;
++        pthread_mutex_unlock(&p->lock);
++        int64_t got = 0;
++        while (err >= 0 && got < end - start) {
++            int want = end - start - got > 262144 ? 262144 : (int)(end - start - got);
++            int r = avio_read_partial(w->avio, c->data + (start - base) + got, want);
++            if (r <= 0) {
++                err = r ? r : AVERROR_EOF;
++                break;
++            }
++            got += r;
++            pthread_mutex_lock(&p->lock);
++            w->pos += r;
++            c->filled += r;
++            p->stats.bytes += r;
++            bool stop = w->abort || p->closing;
++            pthread_cond_broadcast(&p->wakeup);
++            pthread_mutex_unlock(&p->lock);
++            if (stop)
++                break;
++        }
++        pthread_mutex_lock(&p->lock);
++        if (c->filled == c->length || w->abort || p->closing) {
++            if (w->abort || p->closing) {
++                // An interrupted reply is unusable.
++                pthread_mutex_unlock(&p->lock);
++                close_connection(w);
++                pthread_mutex_lock(&p->lock);
++            }
++            break;
++        }
++        // The connection failed: retry on a new one, with backoff. A server
++        // that turns this connection down while others work has a limit.
++        pthread_mutex_unlock(&p->lock);
++        close_connection(w);
++        pthread_mutex_lock(&p->lock);
++        int working = 0;
++        for (int n = 0; n < p->num_workers; n++)
++            working += n != w->id && p->workers[n].avio != NULL;
++        if (got == 0 && working > 0) {
++            // Refused while other connections work: the server has a limit.
++            // Use as many as work now; this chunk goes to one of them.
++            if (working < p->active_limit)
++                p->active_limit = working;
++            logf_(p, AV_LOG_WARNING, "server refused another connection (%s); using %d from now on\n",
++                  av_err2str(err), p->active_limit);
++            break;
++        }
++        // Playback is being stopped: nothing failed.
++        if (p->params.interrupt && p->params.interrupt(p->params.interrupt_ctx))
++            break;
++        if (++attempts >= MAX_ATTEMPTS) {
++            logf_(p, AV_LOG_ERROR, "chunk at %lld failed: %s\n", (long long)start, av_err2str(err));
++            c->failed = true;
++            break;
++        }
++        p->stats.retries++;
++        logf_(p, AV_LOG_WARNING, "connection %d failed at %lld (%s), retrying\n", w->id + 1,
++              (long long)(start + got), av_err2str(err));
++        timed_wait(p, 250LL << (attempts - 1));
++    }
++    c->fetcher = -1;
++    w->chunk = -1;
++    w->abort = 0;
++    pthread_cond_broadcast(&p->wakeup);
++}
++
++static void *worker_thread(void *arg)
++{
++    struct worker *w = arg;
++    struct mp_http_parallel *p = w->p;
++    pthread_mutex_lock(&p->lock);
++    while (!p->closing) {
++        struct chunk *c = pick(w);
++        if (c) {
++            fetch(w, c);
++            continue;
++        }
++        // A connection beyond the server's limit is given back.
++        if (w->id >= p->active_limit && w->avio) {
++            pthread_mutex_unlock(&p->lock);
++            close_connection(w);
++            pthread_mutex_lock(&p->lock);
++        }
++        timed_wait(p, 100);
++    }
++    pthread_mutex_unlock(&p->lock);
++    close_connection(w);
++    return NULL;
++}
++
++struct mp_http_parallel *mp_http_parallel_create(const struct mp_http_parallel_params *params)
++{
++    struct mp_http_parallel *p = calloc(1, sizeof(*p));
++    if (!p || params->size <= 0 || params->connections < 2 || params->chunk_size < 65536)
++        goto fail;
++    p->params = *params;
++    p->url = strdup(params->url);
++    if (!p->url)
++        goto fail;
++    av_dict_copy(&p->options, params->options, 0);
++    p->chunk_size = params->chunk_size;
++    p->num_workers = params->connections > MAX_CONNECTIONS ? MAX_CONNECTIONS : params->connections;
++    p->active_limit = p->num_workers;
++    // The reader's chunk, one ahead per connection, and two behind it.
++    p->num_chunks = p->num_workers + 3;
++    p->chunks = calloc(p->num_chunks, sizeof(p->chunks[0]));
++    if (!p->chunks)
++        goto fail;
++    for (int n = 0; n < p->num_chunks; n++) {
++        p->chunks[n].index = -1;
++        p->chunks[n].fetcher = -1;
++        p->chunks[n].data = malloc(p->chunk_size);
++        if (!p->chunks[n].data)
++            goto fail;
++    }
++    pthread_mutex_init(&p->lock, NULL);
++    pthread_cond_init(&p->wakeup, NULL);
++    for (int n = 0; n < p->num_workers; n++) {
++        struct worker *w = &p->workers[n];
++        w->p = p;
++        w->id = n;
++        w->pos = -1;
++        w->chunk = -1;
++    }
++    // The open connection serves the start of the resource, as it would
++    // without this reader.
++    if (params->adopt) {
++        p->workers[0].avio = params->adopt;
++        p->workers[0].pos = 0;
++        p->workers[0].adopted = true;
++        p->workers[0].open_ended = true;
++    }
++    for (int n = 0; n < p->num_workers; n++) {
++        if (pthread_create(&p->workers[n].thread, NULL, worker_thread, &p->workers[n])) {
++            mp_http_parallel_destroy(p);
++            return NULL;
++        }
++        p->threads_started[n] = true;
++    }
++    logf_(p, AV_LOG_VERBOSE, "%d connections, %lld KiB chunks, %lld bytes\n", p->num_workers,
++          (long long)(p->chunk_size / 1024), (long long)params->size);
++    return p;
++
++fail:
++    if (params->adopt) {
++        AVIOContext *adopt = params->adopt;
++        avio_closep(&adopt);
++    }
++    if (p) {
++        if (p->chunks) {
++            for (int n = 0; n < p->num_chunks; n++)
++                free(p->chunks[n].data);
++        }
++        free(p->chunks);
++        av_dict_free(&p->options);
++        free(p->url);
++        free(p);
++    }
++    return NULL;
++}
++
++int mp_http_parallel_read(struct mp_http_parallel *p, void *buffer, int size)
++{
++    pthread_mutex_lock(&p->lock);
++    int r;
++    while (1) {
++        if (p->closing) {
++            r = AVERROR_EXIT;
++            break;
++        }
++        if (p->pos >= p->params.size) {
++            r = 0;
++            break;
++        }
++        int64_t index = p->pos / p->chunk_size;
++        struct chunk *c = find_chunk(p, index);
++        int64_t offset = p->pos - index * p->chunk_size;
++        if (c && c->begin <= offset && c->filled > offset) {
++            int64_t n = c->filled - offset;
++            if (n > size)
++                n = size;
++            memcpy(buffer, c->data + offset, n);
++            p->pos += n;
++            c->read = true;
++            c->used = ++p->clock;
++            r = (int)n;
++            // Reading on may open the window further.
++            pthread_cond_broadcast(&p->wakeup);
++            break;
++        }
++        if (c && c->failed && c->fetcher < 0) {
++            r = AVERROR(EIO);
++            break;
++        }
++        pthread_cond_broadcast(&p->wakeup);
++        if (p->params.interrupt && p->params.interrupt(p->params.interrupt_ctx)) {
++            r = AVERROR_EXIT;
++            break;
++        }
++        timed_wait(p, 20);
++    }
++    pthread_mutex_unlock(&p->lock);
++    return r;
++}
++
++void mp_http_parallel_seek(struct mp_http_parallel *p, int64_t pos)
++{
++    pthread_mutex_lock(&p->lock);
++    if (pos != p->pos) {
++        p->pos = pos;
++        p->run_start = pos;
++        for (int n = 0; n < p->num_chunks; n++) {
++            struct chunk *c = &p->chunks[n];
++            // A failed chunk gets another try once asked for again.
++            if (c->failed && c->fetcher < 0)
++                c->failed = false;
++            if (c->index < 0 || c->fetcher < 0)
++                continue;
++            // A fetch the reader left, or one that would make it wait for
++            // more than a short read to reach it, stops; the reader's own
++            // chunk then starts again where the reader is.
++            int64_t at = pos - c->index * p->chunk_size;
++            bool own = at >= 0 && at < c->length;
++            if (!in_window(p, c->index) || (own && (at < c->begin || at > c->filled + 262144)))
++                stop_worker(&p->workers[c->fetcher]);
++        }
++        pthread_cond_broadcast(&p->wakeup);
++    }
++    pthread_mutex_unlock(&p->lock);
++}
++
++void mp_http_parallel_get_stats(struct mp_http_parallel *p, struct mp_http_parallel_stats *stats)
++{
++    pthread_mutex_lock(&p->lock);
++    *stats = p->stats;
++    for (int n = 0; n < p->num_chunks; n++) {
++        if (p->chunks[n].index >= 0 && !p->chunks[n].read)
++            stats->wasted += p->chunks[n].filled - p->chunks[n].begin;
++    }
++    pthread_mutex_unlock(&p->lock);
++}
++
++void mp_http_parallel_destroy(struct mp_http_parallel *p)
++{
++    if (!p)
++        return;
++    pthread_mutex_lock(&p->lock);
++    p->closing = true;
++    for (int n = 0; n < p->num_workers; n++)
++        stop_worker(&p->workers[n]);
++    pthread_cond_broadcast(&p->wakeup);
++    pthread_mutex_unlock(&p->lock);
++    for (int n = 0; n < p->num_workers; n++) {
++        if (p->threads_started[n])
++            pthread_join(p->workers[n].thread, NULL);
++        else
++            close_connection(&p->workers[n]);
++    }
++    for (int n = 0; n < p->num_chunks; n++)
++        free(p->chunks[n].data);
++    free(p->chunks);
++    pthread_cond_destroy(&p->wakeup);
++    pthread_mutex_destroy(&p->lock);
++    av_dict_free(&p->options);
++    free(p->url);
++    free(p);
++}
+diff --git a/stream/http_parallel.h b/stream/http_parallel.h
+new file mode 100644
+index 0000000..e061561
+--- /dev/null
++++ b/stream/http_parallel.h
+@@ -0,0 +1,73 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// Reads one HTTP(S) resource through several connections: the chunk the
++// reader is in, and once it reads on sequentially, the chunks ahead of it,
++// each with a ranged request. Depends on libavformat and pthreads only.
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <libavformat/avio.h>
++#include <libavutil/dict.h>
++
++struct mp_http_parallel;
++
++struct mp_http_parallel_params {
++    const char *url;
++    // Options for every connection's avio_open2() (copied).
++    const AVDictionary *options;
++    // The resource's size, which must be known.
++    int64_t size;
++    // Connections at most (2..8), bytes per ranged request.
++    int connections;
++    int64_t chunk_size;
++    // Bytes read on from one position before chunks ahead are fetched.
++    int64_t sequential_threshold;
++    // An open connection positioned at 0 that the first worker takes over
++    // (its reply may be open-ended), or NULL. Owned by the reader after
++    // mp_http_parallel_create(), also when that fails. Its interrupt callback
++    // must also return non-zero while *adopt_abort is set, which the reader
++    // does to stop its reply.
++    AVIOContext *adopt;
++    volatile int *adopt_abort;
++    // Called by every connection's I/O and by waiting readers; non-zero
++    // aborts. Any thread.
++    int (*interrupt)(void *ctx);
++    void *interrupt_ctx;
++    // level: AV_LOG_*. Any thread.
++    void (*log)(void *ctx, int level, const char *msg);
++    void *log_ctx;
++};
++
++struct mp_http_parallel_stats {
++    int64_t requests;       // ranged requests made (opens and seeks)
++    int64_t opens;          // connections opened
++    int64_t bytes;          // bytes received
++    int64_t wasted;         // bytes received for chunks dropped unread
++    int64_t retries;
++};
++
++struct mp_http_parallel *mp_http_parallel_create(const struct mp_http_parallel_params *params);
++// As AVIOContext reads: bytes read, 0 at the end, negative on an error or an
++// interrupt.
++int mp_http_parallel_read(struct mp_http_parallel *p, void *buffer, int size);
++// Only moves the read position; never blocks on the network.
++void mp_http_parallel_seek(struct mp_http_parallel *p, int64_t pos);
++void mp_http_parallel_get_stats(struct mp_http_parallel *p, struct mp_http_parallel_stats *stats);
++void mp_http_parallel_destroy(struct mp_http_parallel *p);

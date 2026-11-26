@@ -20,11 +20,30 @@ void ao_request_reload(struct ao *ao) { reloads++; }
 void ao_request_pcm_fallback(struct ao *ao) { fallbacks++; }
 bool af_fmt_is_spdif(int format) { return format >= AF_FORMAT_S_AAC && format < AF_FORMAT_COUNT; }
 const char *af_fmt_to_str(int format) { return "spdif"; }
-int af_fmt_to_bytes(int format) { return 2; }
+int af_fmt_to_bytes(int format) { return format == AF_FORMAT_FLOAT ? 4 : 2; }
+// Force Dolby MAT's layout choice: the 7.1.4 speakers are offered, and a
+// layout made of them only is kept as it is.
+static uint64_t offered_speakers;
+static int chmap_adjusts;
+void mp_chmap_sel_add_speaker(struct mp_chmap_sel *s, int id) { offered_speakers |= UINT64_C(1) << id; }
+bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s, struct mp_chmap *map)
+{
+    chmap_adjusts++;
+    for (int i = 0; i < map->num; i++) {
+        if (!(offered_speakers & (UINT64_C(1) << map->speaker[i])))
+            return false;
+    }
+    return true;
+}
+const m_option_type_t m_option_type_choice, m_option_type_bool;
 
 struct fake_sink {
     bool refuse;
     int codec;
+    bool lossless;
+    // Force Dolby MAT: the channels and their 7.1.4 slots it was opened with.
+    int pcm_channels;
+    int8_t slots[16];
     size_t buffer_limit;
     AVSampleBufferRenderSynchronizer *synchronizer;
     int begins, ends, closes, volumes, failure_reads;
@@ -42,11 +61,23 @@ struct fake_sink {
 
 static struct fake_sink *opening_sink;
 
-void *mp_spatial_create(int codec, void *synchronizer, size_t buffer_limit)
+void *mp_spatial_create(int codec, bool lossless, void *synchronizer, size_t buffer_limit)
 {
     struct fake_sink *s = opening_sink;
     if (!s) return NULL;
     s->codec = codec;
+    s->lossless = lossless;
+    s->synchronizer = synchronizer;
+    s->buffer_limit = buffer_limit;
+    return s->refuse ? NULL : s;
+}
+void *mp_spatial_create_pcm(const int8_t *slots, int channels, void *synchronizer, size_t buffer_limit)
+{
+    struct fake_sink *s = opening_sink;
+    if (!s) return NULL;
+    s->codec = 0;
+    s->pcm_channels = channels;
+    memcpy(s->slots, slots, channels);
     s->synchronizer = synchronizer;
     s->buffer_limit = buffer_limit;
     return s->refuse ? NULL : s;
@@ -112,6 +143,29 @@ static struct fake_sink *new_sink(void)
     return s;
 }
 
+// mpv's layouts by name, as chmap.c spells them.
+static void set_layout(struct mp_chmap *map, const char *name)
+{
+    static const struct { const char *name; int num; uint8_t speakers[8]; } named[] = {
+        {"stereo", 2, {MP_SPEAKER_ID_FL, MP_SPEAKER_ID_FR}},
+        {"5.1", 6, {MP_SPEAKER_ID_FL, MP_SPEAKER_ID_FR, MP_SPEAKER_ID_FC, MP_SPEAKER_ID_LFE,
+                    MP_SPEAKER_ID_BL, MP_SPEAKER_ID_BR}},
+        {"5.1(side)", 6, {MP_SPEAKER_ID_FL, MP_SPEAKER_ID_FR, MP_SPEAKER_ID_FC, MP_SPEAKER_ID_LFE,
+                          MP_SPEAKER_ID_SL, MP_SPEAKER_ID_SR}},
+        {"7.1", 8, {MP_SPEAKER_ID_FL, MP_SPEAKER_ID_FR, MP_SPEAKER_ID_FC, MP_SPEAKER_ID_LFE,
+                    MP_SPEAKER_ID_BL, MP_SPEAKER_ID_BR, MP_SPEAKER_ID_SL, MP_SPEAKER_ID_SR}},
+    };
+    for (int n = 0; n < 4; n++) {
+        if (!strcmp(named[n].name, name)) {
+            map->num = named[n].num;
+            memcpy(map->speaker, named[n].speakers, named[n].num);
+        }
+    }
+}
+
+// One player's state, which its outputs share.
+static struct mpv_global player;
+
 // TrueHD passthrough as ad_spdif sets it up: 192 kHz, 8 channels of 16 bits.
 // ao_init() sets sstride only after the driver's init().
 static struct ao *new_ao(struct fake_sink *s, int format)
@@ -120,6 +174,7 @@ static struct ao *new_ao(struct fake_sink *s, int format)
     struct priv *p = calloc(1, sizeof(*p));
     opening_sink = s;
     ao->priv = p;
+    ao->global = &player;
     ao->format = format;
     ao->samplerate = 192000;
     ao->channels.num = 8;
@@ -431,6 +486,111 @@ int main(void)
         struct ao *ac3 = new_ao(s, AF_FORMAT_S_AC3);
         CHECK(init(ac3) < 0, "AC-3 goes to the next output");
         CHECK(fallbacks == 1 && reloads == 0, "opening outputs after a failure requests nothing");
+
+        // The rendered 7.1.4 as linear PCM: --ao-spatial-output. On a Mac
+        // (no audio session) auto keeps APAC; iOS and tvOS take linear PCM
+        // over HDMI.
+        int kinds[3];
+        for (int choice = SPATIAL_OUTPUT_AUTO; choice <= SPATIAL_OUTPUT_LPCM; choice++) {
+            struct ao *routed = new_ao(s, AF_FORMAT_S_TRUEHD);
+            ((struct priv *)routed->priv)->opt_output = choice;
+            CHECK(init(routed) == 0, "TrueHD opens with output choice %d", choice);
+            kinds[choice] = atomic_load(&player.spatial_output_kind);
+            CHECK(s->lossless == (choice == SPATIAL_OUTPUT_LPCM), "choice %d: lossless %d", choice, s->lossless);
+            uninit(routed);
+            CHECK(atomic_load(&player.spatial_output_kind) == MP_SPATIAL_KIND_NONE, "closing clears the reported route");
+        }
+        CHECK(kinds[SPATIAL_OUTPUT_AUTO] == MP_SPATIAL_KIND_APAC && kinds[SPATIAL_OUTPUT_APAC] == MP_SPATIAL_KIND_APAC &&
+              kinds[SPATIAL_OUTPUT_LPCM] == MP_SPATIAL_KIND_LPCM, "the reported route follows the choice");
+
+        // The renderer turning linear PCM down reopens the output, which then
+        // keeps to APAC on this player; no PCM fallback.
+        struct ao *lpcm = new_ao(s, AF_FORMAT_S_TRUEHD);
+        struct priv *lp = lpcm->priv;
+        lp->opt_output = SPATIAL_OUTPUT_LPCM;
+        CHECK(init(lpcm) == 0 && s->lossless, "linear PCM asked for");
+        lpcm->sstride = SSTRIDE;
+        s->failure = MP_SPATIAL_OUTPUT_FAILED;
+        state_of(lpcm);
+        state_of(lpcm);
+        CHECK(reloads == 1 && fallbacks == 1 && atomic_load(&player.spatial_lpcm_failed),
+              "a refused linear PCM reloads the output once (%d), without a PCM fallback (%d)", reloads, fallbacks);
+        uninit(lpcm);
+        s->failure = MP_SPATIAL_OK;
+        struct ao *again = new_ao(s, AF_FORMAT_S_TRUEHD);
+        ((struct priv *)again->priv)->opt_output = SPATIAL_OUTPUT_LPCM;
+        CHECK(init(again) == 0 && !s->lossless && atomic_load(&player.spatial_output_kind) == MP_SPATIAL_KIND_APAC,
+              "the reopened output sends APAC");
+        uninit(again);
+
+        // Force Dolby MAT: off, decoded PCM is refused as before.
+        struct ao *plain = new_ao(s, AF_FORMAT_FLOAT);
+        plain->samplerate = 96000;
+        set_layout(&plain->channels, "5.1");
+        CHECK(init(plain) < 0, "without Force Dolby MAT, PCM goes to the next output");
+        atomic_store(&player.spatial_lpcm_failed, false);
+        // On: stereo still goes to the next output, as does AC-3.
+        struct ao *stereo = new_ao(s, AF_FORMAT_FLOAT);
+        ((struct priv *)stereo->priv)->opt_force_mat = true;
+        set_layout(&stereo->channels, "stereo");
+        CHECK(init(stereo) < 0, "stereo is never forced to MAT");
+        struct ao *dd = new_ao(s, AF_FORMAT_S_AC3);
+        ((struct priv *)dd->priv)->opt_force_mat = true;
+        CHECK(init(dd) < 0, "AC-3 passthrough is untouched by Force Dolby MAT");
+        struct ao *eac3 = new_ao(s, AF_FORMAT_S_EAC3);
+        ((struct priv *)eac3->priv)->opt_force_mat = true;
+        CHECK(init(eac3) < 0, "E-AC-3 passthrough is untouched by Force Dolby MAT");
+        // 5.1 (back), 96 kHz S32 from a decoder: float at 48 kHz, each
+        // channel in its 7.1.4 slot, surrounds at the sides.
+        static const struct { const char *layout; int slots[8]; } layouts[] = {
+            {"5.1", {0, 1, 2, 3, 4, 5}},
+            {"5.1(side)", {0, 1, 2, 3, 4, 5}},
+            {"7.1", {0, 1, 2, 3, 6, 7, 4, 5}},
+        };
+        for (int n = 0; n < 3; n++) {
+            struct ao *mat = new_ao(s, AF_FORMAT_S32);
+            struct priv *mp = mat->priv;
+            mp->opt_force_mat = true;
+            mat->samplerate = 96000;
+            set_layout(&mat->channels, layouts[n].layout);
+            s->volumes = 0;
+            CHECK(init(mat) == 0, "Force Dolby MAT takes %s", layouts[n].layout);
+            CHECK(mat->format == AF_FORMAT_FLOAT && mat->samplerate == 48000, "as float at 48 kHz");
+            CHECK(s->codec == 0 && s->pcm_channels == mat->channels.num, "through the PCM sink (%d channels)", s->pcm_channels);
+            bool placed = true;
+            for (int c = 0; c < mat->channels.num; c++)
+                placed &= s->slots[c] == layouts[n].slots[c];
+            CHECK(placed, "%s: every channel in its 7.1.4 slot", layouts[n].layout);
+            CHECK(s->buffer_limit == 48000 * 4 * (size_t)mat->channels.num, "a second of PCM buffered (%zu)", s->buffer_limit);
+            CHECK(atomic_load(&player.spatial_output_kind) == MP_SPATIAL_KIND_PCM, "reported as PCM to MAT");
+            CHECK(s->volumes == 1 && s->volume == 1.0f, "the renderer plays at unity");
+            audio_out_spatial.set_gain(mat, 0.25f);
+            CHECK(s->volumes == 1, "mpv's volume is mpv's own on decoded PCM, never applied twice");
+            CHECK(offered_speakers == ((UINT64_C(1) << MP_SPEAKER_ID_FL) | (UINT64_C(1) << MP_SPEAKER_ID_FR) |
+                  (UINT64_C(1) << MP_SPEAKER_ID_FC) | (UINT64_C(1) << MP_SPEAKER_ID_LFE) |
+                  (UINT64_C(1) << MP_SPEAKER_ID_SL) | (UINT64_C(1) << MP_SPEAKER_ID_SR) |
+                  (UINT64_C(1) << MP_SPEAKER_ID_BL) | (UINT64_C(1) << MP_SPEAKER_ID_BR) |
+                  (UINT64_C(1) << MP_SPEAKER_ID_TFL) | (UINT64_C(1) << MP_SPEAKER_ID_TFR) |
+                  (UINT64_C(1) << MP_SPEAKER_ID_TBL) | (UINT64_C(1) << MP_SPEAKER_ID_TBR)),
+                  "only the 7.1.4 speakers are offered");
+            uninit(mat);
+        }
+        // A renderer refusing the PCM leaves it to the next output.
+        struct ao *refusing = new_ao(s, AF_FORMAT_FLOAT);
+        ((struct priv *)refusing->priv)->opt_force_mat = true;
+        set_layout(&refusing->channels, "5.1");
+        CHECK(init(refusing) == 0, "opens");
+        refusing->sstride = 24;
+        s->failure = MP_SPATIAL_OUTPUT_FAILED;
+        int before = reloads;
+        state_of(refusing);
+        CHECK(reloads == before + 1 && fallbacks == 1, "a refusal reloads the output, no track fallback");
+        uninit(refusing);
+        s->failure = MP_SPATIAL_OK;
+        struct ao *after = new_ao(s, AF_FORMAT_FLOAT);
+        ((struct priv *)after->priv)->opt_force_mat = true;
+        set_layout(&after->channels, "5.1");
+        CHECK(init(after) < 0, "and the reopened chain plays it on the usual output");
     }
     printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;
