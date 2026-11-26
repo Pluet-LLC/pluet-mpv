@@ -20,10 +20,15 @@ skip the IEC 61937 unpacker.
 
 ---
 diff --git a/Sources/SpatialAudioBridge/APACEncoder.swift b/Sources/SpatialAudioBridge/APACEncoder.swift
-index 11596c9..f15ab98 100644
+index 11596c9..ee68b1b 100644
 --- a/Sources/SpatialAudioBridge/APACEncoder.swift
 +++ b/Sources/SpatialAudioBridge/APACEncoder.swift
-@@ -85,6 +85,8 @@ final class APACEncoder {
+@@ -1,3 +1,4 @@
++import Accelerate
+ import AVFoundation
+ import CoreMedia
+ 
+@@ -85,6 +86,8 @@ final class APACEncoder {
      struct Packet {
          let data: Data
          let isIndependent: Bool
@@ -32,7 +37,7 @@ index 11596c9..f15ab98 100644
      }
  
      /// Appends PCM and returns the packets it completes. The live encoder holds 71 packets (1.5 s)
-@@ -145,3 +147,50 @@ final class APACEncoder {
+@@ -145,3 +148,72 @@ final class APACEncoder {
          guard status == noErr else { throw SpatialAudioError.coreMedia(status) }
      }
  }
@@ -53,9 +58,12 @@ index 11596c9..f15ab98 100644
 +@available(macOS 26, iOS 26, tvOS 26, *)
 +extension APACEncoder: SpatialPacketEncoder {}
 +
-+/// The rendered speaker feeds unchanged: interleaved 32-bit float linear PCM at 48 kHz in the
-+/// layout's Atmos channel layout, cut into independent packets of 1024 frames. No priming and no
-+/// delay; the final packet holds what is left.
++/// The rendered speaker feeds as linear PCM: interleaved 32-bit float at 48 kHz in the layout's
++/// Atmos channel layout, cut into independent packets of 1024 frames. No priming and no delay; the
++/// final packet holds what is left. Each sample is rounded to the nearest 24-bit step (1/8388608 of
++/// full scale), so the output's conversion to the 24-bit PCM that Dolby MAT and HDMI carry is exact:
++/// what reaches the receiver is these samples bit for bit, not a second rounding of the render.
++/// A float32 holds every 24-bit value exactly; decoded 24-bit PCM is already on the grid.
 +@available(macOS 26, iOS 26, tvOS 26, *)
 +final class LPCMPacketizer: SpatialPacketEncoder {
 +    let format: CMAudioFormatDescription
@@ -69,7 +77,7 @@ index 11596c9..f15ab98 100644
 +    }
 +
 +    func encode(_ samples: ArraySlice<Float>, final: Bool) throws -> [APACEncoder.Packet] {
-+        pending.append(contentsOf: samples)
++        pending.append(contentsOf: Self.on24BitGrid(samples))
 +        let step = 1024 * channels
 +        var packets: [APACEncoder.Packet] = []
 +        var start = 0
@@ -81,6 +89,25 @@ index 11596c9..f15ab98 100644
 +        }
 +        pending.removeFirst(start)
 +        return packets
++    }
++
++    /// Rounds to the nearest multiple of 2^-23, within the 24-bit range [-1, 1 - 2^-23].
++    static func on24BitGrid(_ samples: ArraySlice<Float>) -> [Float] {
++        guard !samples.isEmpty else { return [] }
++        var out = [Float](repeating: 0, count: samples.count)
++        samples.withUnsafeBufferPointer { input in
++            out.withUnsafeMutableBufferPointer { output in
++                var scale: Float = 8_388_608
++                vDSP_vsmul(input.baseAddress!, 1, &scale, output.baseAddress!, 1, vDSP_Length(input.count))
++                var count = Int32(input.count)
++                vvnintf(output.baseAddress!, output.baseAddress!, &count)
++                var low: Float = -8_388_608, high: Float = 8_388_607
++                vDSP_vclip(output.baseAddress!, 1, &low, &high, output.baseAddress!, 1, vDSP_Length(input.count))
++                var back: Float = 1 / 8_388_608
++                vDSP_vsmul(output.baseAddress!, 1, &back, output.baseAddress!, 1, vDSP_Length(input.count))
++            }
++        }
++        return out
 +    }
 +}
 diff --git a/Sources/SpatialAudioBridge/SpatialAudioPassthroughSink.swift b/Sources/SpatialAudioBridge/SpatialAudioPassthroughSink.swift

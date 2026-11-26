@@ -17,11 +17,14 @@ int main(int argc, char **argv)
         // SPATIAL_LOSSLESS=1: the rendered 7.1.4 as linear PCM (mpv 0317).
         const char *mode = getenv("SPATIAL_LOSSLESS");
         bool lossless = mode && atoi(mode);
+        // SPATIAL_LAYOUT=16: render 9.1.6.
+        const char *layout_env = getenv("SPATIAL_LAYOUT");
+        int layout = layout_env && atoi(layout_env) == 16 ? 16 : 12;
         bool expect_failure = atoi(argv[3]);
         NSData *bursts = [NSData dataWithContentsOfFile:@(argv[2])];
         if (!bursts.length) return 2;
         AVSampleBufferRenderSynchronizer *clock = [AVSampleBufferRenderSynchronizer new];
-        void *sink = mp_spatial_create(codec, lossless, (__bridge void *)clock, 1 << 20);
+        void *sink = mp_spatial_create(codec, lossless, layout, (__bridge void *)clock, 1 << 20);
         if (!sink) return 3;
         mp_spatial_volume(sink, 0);
         for (int seek = 0; seek < 3; seek++) {
@@ -66,7 +69,7 @@ int main(int argc, char **argv)
         pump(0.2);
         // Closing before the main-actor activator setup runs must be safe.
         for (int iteration = 0; iteration < 20; iteration++) {
-            sink = mp_spatial_create(codec, lossless, (__bridge void *)clock, 1 << 20);
+            sink = mp_spatial_create(codec, lossless, layout, (__bridge void *)clock, 1 << 20);
             if (!sink) return 5;
             mp_spatial_begin(sink, 0);
             mp_spatial_destroy(sink);

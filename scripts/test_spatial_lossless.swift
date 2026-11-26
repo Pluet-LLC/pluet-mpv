@@ -55,8 +55,11 @@ final class FixedDecoder: SpatialAudioRendererDecoding {
     }
 }
 
-func render(_ blocks: [PCMBlock], lossless: Bool) async throws -> (buffers: [CMSampleBuffer], progress: SpatialAudioRendererProgress?) {
-    var configuration = APACConfiguration()
+/// The 24-bit step each lossless sample lands on, as Dolby MAT carries it.
+func grid(_ x: Float) -> Float { min(max((x * 8_388_608).rounded(.toNearestOrEven), -8_388_608), 8_388_607) / 8_388_608 }
+
+func render(_ blocks: [PCMBlock], lossless: Bool, layout: SpatialAudioLayout = .sevenOneFour) async throws -> (buffers: [CMSampleBuffer], progress: SpatialAudioRendererProgress?) {
+    var configuration = APACConfiguration(layout: layout)
     configuration.losslessPCM = lossless
     let output = CaptureOutput()
     let synchronizer = AVSampleBufferRenderSynchronizer()
@@ -87,7 +90,14 @@ struct Main {
                       PCMBlock(samples: Array(samples[(1000 * 12)...]), frames: frames - 1000, sampleRate: 48_000, channels: 12)]
         let pcm = try await render(blocks, lossless: true)
         let out = pcm.buffers.flatMap(floats)
-        check(out == samples, "linear PCM output is bit-identical to the rendered 7.1.4 (\(out.count) of \(samples.count) samples)")
+        check(out == samples.map(grid),
+              "linear PCM output is the rendered 7.1.4 on the 24-bit grid, sample for sample (\(out.count) of \(samples.count))")
+        check(out.allSatisfy { ($0 * 8_388_608).rounded() == $0 * 8_388_608 }, "every sample is an exact 24-bit value")
+        check(zip(out, samples).allSatisfy { abs($0 - $1) <= 0.5 / 8_388_608 }, "no sample moved more than half a 24-bit step")
+        // Already 24-bit PCM (a decoded bed) passes untouched.
+        let pcm24 = samples.map(grid)
+        let again = try await render([PCMBlock(samples: pcm24, frames: frames, sampleRate: 48_000, channels: 12)], lossless: true)
+        check(again.buffers.flatMap(floats) == pcm24, "24-bit PCM goes through bit for bit")
         let first = pcm.buffers.first.flatMap { CMSampleBufferGetFormatDescription($0) }
         let asbd = first.flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
         check(asbd?.mFormatID == kAudioFormatLinearPCM && asbd?.mChannelsPerFrame == 12 && asbd?.mSampleRate == 48_000
@@ -110,6 +120,18 @@ struct Main {
         let apac = try await render(blocks, lossless: false)
         let apacFormat = apac.buffers.first.flatMap(CMSampleBufferGetFormatDescription)
         check(apacFormat.map(CMFormatDescriptionGetMediaSubType) == kAudioFormatAPAC, "without losslessPCM the renderer enqueues APAC")
+
+        // 2b. 9.1.6: 16 channels in the Atmos 9.1.6 layout, on the same grid.
+        var wide = [Float](repeating: 0, count: 2000 * 16)
+        for i in wide.indices { wide[i] = sinf(Float(i) * 0.021) * 0.7 }
+        let nine = try await render([PCMBlock(samples: wide, frames: 2000, sampleRate: 48_000, channels: 16)], lossless: true,
+                                    layout: .nineOneSix)
+        let nineFormat = nine.buffers.first.flatMap(CMSampleBufferGetFormatDescription)
+        var nineSize = 0
+        check(nineFormat.flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee.mChannelsPerFrame } == 16
+              && nineFormat.flatMap { CMAudioFormatDescriptionGetChannelLayout($0, sizeOut: &nineSize)?.pointee.mChannelLayoutTag }
+                == kAudioChannelLayoutTag_Atmos_9_1_6
+              && nine.buffers.flatMap(floats) == wide.map(grid), "9.1.6: 16 channels in the Atmos 9.1.6 layout, 24-bit exact")
 
         // 3. Force Dolby MAT: 5.1 (side) and 5.1 (back) in their 7.1.4 slots, split anywhere.
         for (name, slots) in [("5.1(side)", [0, 1, 2, 3, 4, 5]), ("5.1(back) as side", [0, 1, 2, 3, 4, 5]),
@@ -187,7 +209,11 @@ struct Main {
                 let inputSeconds = Double(firstOut ?? fed) / Double(stream.count) * Double(reference.count / 12) / 48_000
                 if lossless {
                     let out = captured.flatMap(floats)
-                    check(out == reference, "TrueHD Atmos: linear PCM output equals the renderer's 7.1.4 bit for bit (\(out.count / 12) frames)")
+                    check(out == reference.map(grid),
+                          "TrueHD Atmos: linear PCM output is the renderer's 7.1.4 on the 24-bit grid (\(out.count / 12) frames)")
+                    var err = 0.0, sig = 0.0
+                    for (o, r) in zip(out, reference) { err += Double(o - r) * Double(o - r); sig += Double(r) * Double(r) }
+                    print(String(format: "info: linear PCM against the float render: %.1f dB (the 24-bit rounding alone)", 10 * log10(sig / max(err, 1e-30))))
                     print(String(format: "info: linear PCM: first audio enqueued after %.2f s of input", inputSeconds))
                 } else if let format = captured.first.flatMap(CMSampleBufferGetFormatDescription) {
                     let snr = try apacSNR(captured, format: format, reference: reference)

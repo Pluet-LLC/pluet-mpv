@@ -41,6 +41,7 @@ struct fake_sink {
     bool refuse;
     int codec;
     bool lossless;
+    int layout;
     // Force Dolby MAT: the channels and their 7.1.4 slots it was opened with.
     int pcm_channels;
     int8_t slots[16];
@@ -61,12 +62,13 @@ struct fake_sink {
 
 static struct fake_sink *opening_sink;
 
-void *mp_spatial_create(int codec, bool lossless, void *synchronizer, size_t buffer_limit)
+void *mp_spatial_create(int codec, bool lossless, int channels, void *synchronizer, size_t buffer_limit)
 {
     struct fake_sink *s = opening_sink;
     if (!s) return NULL;
     s->codec = codec;
     s->lossless = lossless;
+    s->layout = channels;
     s->synchronizer = synchronizer;
     s->buffer_limit = buffer_limit;
     return s->refuse ? NULL : s;
@@ -502,6 +504,15 @@ int main(void)
         }
         CHECK(kinds[SPATIAL_OUTPUT_AUTO] == MP_SPATIAL_KIND_APAC && kinds[SPATIAL_OUTPUT_APAC] == MP_SPATIAL_KIND_APAC &&
               kinds[SPATIAL_OUTPUT_LPCM] == MP_SPATIAL_KIND_LPCM, "the reported route follows the choice");
+
+        // The rendered layout: 7.1.4 unless 9.1.6 is asked for.
+        struct ao *l714 = new_ao(s, AF_FORMAT_S_TRUEHD);
+        CHECK(init(l714) == 0 && s->layout == 12, "7.1.4 by default (%d)", s->layout);
+        uninit(l714);
+        struct ao *l916 = new_ao(s, AF_FORMAT_S_TRUEHD);
+        ((struct priv *)l916->priv)->opt_layout = 16;
+        CHECK(init(l916) == 0 && s->layout == 16, "9.1.6 when asked for (%d)", s->layout);
+        uninit(l916);
 
         // The renderer turning linear PCM down reopens the output, which then
         // keeps to APAC on this player; no PCM fallback.

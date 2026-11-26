@@ -95,3 +95,6 @@
 # reader that reads on (--stream-http-connections=4,
 # --stream-http-chunk-size=2MiB; test test_http_parallel.sh).
 0318-stream-lavf-read-large-http-files-through-several-connections.patch
+# Decoded PCM at its own rate where the route takes it (96/192 kHz), and the
+# route's rate and channels in the log.
+0319-ao-audiounit-ask-the-route-for-the-stream-sample-rate.patch

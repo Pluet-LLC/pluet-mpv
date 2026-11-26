@@ -1,0 +1,47 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH] ao_audiounit: ask the route for the stream's sample rate
+
+The output opened the session at whatever rate the route had and let the
+RemoteIO unit convert, so 96 kHz and 192 kHz TrueHD or DTS-HD MA decoded to
+PCM were resampled to the route's rate inside the unit without a word. It
+now asks the session for the stream's own rate (public
+setPreferredSampleRate) before activating it, logs what the route gives
+(rate and channels), and when the route keeps a different rate, opens at
+that rate so mpv's own resampler converts once, visibly in audio-out-params,
+instead of the unit doing it hidden. Format and channel order are as
+before: mpv's samples, 24-bit decodes exact in float, channels by the unit's
+labels, unity gain at 100% volume.
+
+---
+diff --git a/audio/out/ao_audiounit.m b/audio/out/ao_audiounit.m
+index 33292b3..eb344fc 100644
+--- a/audio/out/ao_audiounit.m
++++ b/audio/out/ao_audiounit.m
+@@ -17,6 +17,8 @@
+ 
+ #include "ao.h"
+ #include "internal.h"
++#include <math.h>
++
+ #include "audio/format.h"
+ #include "osdep/timer.h"
+ #include "options/m_option.h"
+@@ -127,8 +129,17 @@ static bool init_audiounit(struct ao *ao)
+ 
+     [instance setCategory:AVAudioSessionCategoryPlayback withOptions:options error:nil];
+     [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
++    // Ask for the stream's own rate (96 or 192 kHz TrueHD and DTS-HD MA),
++    // so nothing is resampled where the route takes it; the system decides.
++    [instance setPreferredSampleRate:ao->samplerate error:nil];
+     [instance setActive:YES error:nil];
+     [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++    MP_INFO(ao, "route: %d Hz asked, %.0f Hz out; %ld of %ld channels\n", ao->samplerate,
++            instance.sampleRate, (long)instance.outputNumberOfChannels, (long)maxChannels);
++    // A rate the route keeps different is converted once, here by mpv's
++    // resampler, instead of inside the output unit.
++    if (instance.sampleRate >= 8000 && lrint(instance.sampleRate) != ao->samplerate)
++        ao->samplerate = (int)lrint(instance.sampleRate);
+ 
+     AudioComponentDescription desc = (AudioComponentDescription) {
+         .componentType         = kAudioUnitType_Output,

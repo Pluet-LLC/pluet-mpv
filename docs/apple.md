@@ -226,8 +226,10 @@ unpacks, converts and queues APAC on the output's synchronizer.
   Rls Rrs Vhl Vhr Ltr Rtr) instead of encoding APAC, beside the same Atmos
   activator; `auto` does so where the audio session's route is HDMI and keeps
   APAC elsewhere (AirPlay, headphones, built-in speakers). The PCM is the
-  render bit for bit (APAC measured 49.1 dB signal-to-error against the same
-  render on a TrueHD Atmos film excerpt), and the first audio is enqueued
+  render rounded to the 24-bit grid Dolby MAT carries (so the system's
+  conversion to 24-bit is exact; on a TrueHD Atmos film excerpt the rounding
+  changed the render by -331 dB, while APAC measured 49.1 dB
+  signal-to-error), and the first audio is enqueued
   after 0.03 s of input instead of APAC's 1.46 s. A renderer that turns
   linear PCM down makes the output reload with APAC for the rest of the
   player's life; a stream without objects still falls back to decoding.
@@ -243,6 +245,13 @@ unpacks, converts and queues APAC on the output's synchronizer.
   activator. mpv's own volume already applies to decoded PCM, so the
   renderer stays at unity there. Stereo, AC-3 and E-AC-3 go to the next
   output as before.
+- **Layout.** `--ao-spatial-layout=7.1.4|9.1.6` (default 7.1.4). 9.1.6 is
+  16 channels in `kAudioChannelLayoutTag_Atmos_9_1_6`, linear PCM or APAC;
+  the output then asks the session for 16 output channels
+  (`setPreferredOutputNumberOfChannels`). SAB measured Apple TV's MAT output
+  at 12 channels with APAC; whether 16-channel linear PCM keeps 16 is for a
+  receiver to show. On iOS and tvOS the output logs the session's rendering
+  mode and output channels when it opens.
 - **`spatial-audio-output`.** What the output sends: `apac`, `lpcm` or
   `pcm` (Force Dolby MAT); unavailable otherwise. It changes with the audio
   reconfig event, as `current-ao` does.
@@ -303,4 +312,14 @@ line shared by all connections, start 1.14 -> 0.78 s, a resume as fast as
 before; unthrottled, the same.
 `scripts/test_http_parallel.sh` checks every byte through the stream layer's
 walk, retries, a server's connection limit and seeks, and prints the speedup.
+
+## Decoded PCM's rate (patch 0319)
+
+`ao_audiounit` asks the session for the stream's own sample rate
+(`setPreferredSampleRate`) before activating it, so 96 kHz and 192 kHz
+TrueHD or DTS-HD MA decoded to PCM keep their rate where the route takes it.
+When the route keeps another rate, the output opens at the route's rate, so
+mpv's resampler converts once and `audio-out-params` says so, instead of the
+output unit converting unseen. The log line `route: <asked> Hz asked, <out>
+Hz out; <n> of <max> channels` says what the route gave.
 
