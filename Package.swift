@@ -204,8 +204,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-68a7d5094992/Libmpv-bf01c066b9d3.xcframework.zip",
-            checksum: "3c83cbe82e7846e659d58eb9a282b91fde7b70759f85600281a4cce8b0995825"
+            url: "https://github.com/Pluet-LLC/pluet-mpv/releases/download/binaries-890030e5238a/Libmpv-c17e26f6891a.xcframework.zip",
+            checksum: "185deaf55ac3823bc6640461ecc5845280127436e2b73cf2172139d11ca97b95"
         ),
 
         .binaryTarget(
