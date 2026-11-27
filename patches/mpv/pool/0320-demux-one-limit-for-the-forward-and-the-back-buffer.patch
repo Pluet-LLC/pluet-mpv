@@ -1,0 +1,201 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 12:00:00 +0000
+Subject: [PATCH] demux: one limit for the forward and the back buffer
+
+--demuxer-max-bytes and --demuxer-max-back-bytes are two limits. With
+--demuxer-donate-buffer the back buffer takes what the forward buffer
+leaves unused, but never the other way round: after a start or a seek,
+when nothing is behind yet, the forward buffer still stops at its own
+limit while the back buffer's sits empty. An embedder that has one amount
+of memory for the cache (an Apple TV's, a phone's) has to split it in two
+and lose the back part of it every time playback starts or jumps.
+
+--demuxer-max-total-bytes (0, off, by default) makes the two one budget:
+the forward buffer may also take the part of --demuxer-max-back-bytes the
+back buffer does not hold, the back buffer keeps what the forward buffer
+leaves and never less than --demuxer-max-back-bytes (reading ahead never
+pushes out what was kept behind), and the two together stay within the
+limit by one packet at most. Once both are full they settle at the limit
+less --demuxer-max-back-bytes ahead and --demuxer-max-back-bytes behind,
+as the two separate limits would. No back buffer stays none. Off, the
+budgets are upstream's to the byte.
+
+Measured with mpv (macOS, --vo=null --ao=null, a 13 Mbit/s Matroska file,
+--cache-secs=1000), 40 MiB total with 10 MiB behind against 30 + 10:
+ahead after the start 40.0 MiB instead of 30.0; ahead and behind together
+40.0-40.1 MiB throughout, settling at 30-32 ahead and 7.4-9.8 behind (one
+2 s keyframe run of 3.3 MiB is what pruning drops at a time); after a
+seek the cached range before it is kept as behind, as before.
+scripts/test_demux_cache_budget.sh plays packets through the budget
+functions and checks every one of those properties.
+---
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index e9b2ece..b6dc0ed 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -4485,6 +4485,19 @@ Demuxer
+     options, minus the active size of the forward buffer. If set to ``no``, the
+     options strictly limit the forward and back buffer sizes separately.
+ 
++``--demuxer-max-total-bytes=<bytesize>``
++    One limit for the forward and the back buffer together (default: 0, off).
++    When set, the forward buffer may also use the part of
++    ``--demuxer-max-back-bytes`` the back buffer does not hold (after a start
++    or a seek, when nothing is behind yet, it reads ahead into all of it, up to
++    ``--demuxer-max-bytes``), the back buffer keeps what the forward buffer
++    leaves of this limit and never less than ``--demuxer-max-back-bytes``, and
++    the two together stay within it (by one packet at most). Once both are
++    full they settle at this limit minus ``--demuxer-max-back-bytes`` ahead and
++    ``--demuxer-max-back-bytes`` behind. Without a back buffer
++    (``--demuxer-max-back-bytes=0``) there is none. With
++    ``--cache-on-disk``, it is the limit of the cache file.
++
+     Note that if the end of the file is reached, the buffered data stays the
+     same, even if you seek back within the cache. This is because the back
+     buffer is only reduced when new data is read.
+diff --git a/demux/demux.c b/demux/demux.c
+index 834c40c..35f51bb 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -110,6 +110,8 @@ const struct m_sub_options demux_conf = {
+         {"demuxer-max-back-bytes", OPT_BYTE_SIZE(max_bytes_bw),
+             M_RANGE(0, M_MAX_MEM_BYTES)},
+         {"demuxer-donate-buffer", OPT_BOOL(donate_fw)},
++        {"demuxer-max-total-bytes", OPT_BYTE_SIZE(max_bytes_total),
++            M_RANGE(0, M_MAX_MEM_BYTES)},
+         {"force-seekable", OPT_BOOL(force_seekable)},
+         {"cache-secs", OPT_DOUBLE(min_secs_cache), M_RANGE(0, DBL_MAX)},
+         {"access-references", OPT_BOOL(access_references)},
+@@ -214,6 +216,7 @@ struct demux_internal {
+     bool nav_pump;              // one-shot request to force a single read
+     size_t max_bytes;
+     size_t max_bytes_bw;
++    size_t max_bytes_total;
+     bool seekable_cache;
+     bool using_network_cache_opts;
+     char *record_filename;
+@@ -2319,6 +2322,55 @@ static void mark_stream_eof(struct demux_stream *ds)
+     }
+ }
+ 
++// --- demux cache budget (host-testable; keep freestanding)
++// The packet cache's limits. max_fw (--demuxer-max-bytes) caps what is read
++// ahead and max_bw (--demuxer-max-back-bytes) what is kept behind; with
++// donate (--demuxer-donate-buffer) the backward cache also takes what the
++// forward cache leaves unused, so the two together never exceed
++// max_fw + max_bw. total (--demuxer-max-total-bytes, 0: off) makes the two
++// one budget: the forward cache may also take what the backward cache does
++// not hold, up to total less the part of max_bw the backward cache holds
++// (after a start or a seek, when nothing is behind yet, it reads ahead
++// into all of it), and the backward cache keeps at most what the forward
++// cache leaves of total. Ahead and behind together stay within total; once
++// both are full they settle at total - max_bw ahead and max_bw behind. No
++// backward cache (max_bw 0) stays none.
++
++// How far the forward cache may fill, with bw_held bytes held behind.
++static uint64_t demux_fw_budget(uint64_t max_fw, uint64_t max_bw,
++                                uint64_t total, uint64_t bw_held)
++{
++    if (!total)
++        return max_fw;
++    uint64_t reserved = bw_held < max_bw ? bw_held : max_bw;
++    uint64_t room = total > reserved ? total - reserved : 0;
++    return room < max_fw ? room : max_fw;
++}
++
++// How much the backward cache may hold, with fw_held bytes ahead.
++static uint64_t demux_bw_budget(uint64_t max_fw, uint64_t max_bw,
++                                uint64_t total, bool donate, uint64_t fw_held)
++{
++    uint64_t avail = max_bw;
++    if (!avail)
++        return 0;
++    // One budget: what the forward cache leaves of it, and never less than
++    // max_bw, which the forward cache doesn't take from what is held behind
++    // (fw_budget): reading ahead never pushes out what was kept behind, and
++    // what plays moves behind until it holds max_bw.
++    if (total) {
++        uint64_t room = total > fw_held ? total - fw_held : 0;
++        uint64_t keep = avail < total ? avail : total;
++        return room > keep ? room : keep;
++    }
++    // Backward cache (if enabled at all) can use unused forward cache.
++    // Still leave 1 byte free, so the read_packet logic doesn't get stuck.
++    if (max_fw > fw_held + 1 && donate)
++        avail += max_fw - (fw_held + 1);
++    return avail;
++}
++// --- end demux cache budget
++
+ static bool lazy_stream_needs_wait(struct demux_stream *ds)
+ {
+     struct demux_internal *in = ds->in;
+@@ -2383,7 +2435,10 @@ static bool read_packet(struct demux_internal *in)
+ 
+     MP_TRACE(in, "bytes=%zd, read_more=%d prefetch_more=%d, refresh_more=%d\n",
+              (size_t)total_fw_bytes, read_more, prefetch_more, refresh_more);
+-    if (total_fw_bytes >= in->max_bytes) {
++    uint64_t fw_cap = demux_fw_budget(in->max_bytes, in->max_bytes_bw,
++                                      in->max_bytes_total,
++                                      in->total_bytes - total_fw_bytes);
++    if (total_fw_bytes >= fw_cap) {
+         // if we hit the limit just by prefetching, simply stop prefetching
+         if (!read_more) {
+             in->hyst_active = in->hyst_secs > 0 || in->hyst_bytes > 0;
+@@ -2485,11 +2540,9 @@ static void prune_old_packets(struct demux_internal *in)
+             struct demux_stream *ds = in->streams[n]->ds;
+             fw_bytes += get_forward_buffered_bytes(ds);
+         }
+-        uint64_t max_avail = in->max_bytes_bw;
+-        // Backward cache (if enabled at all) can use unused forward cache.
+-        // Still leave 1 byte free, so the read_packet logic doesn't get stuck.
+-        if (max_avail && in->max_bytes > (fw_bytes + 1) && in->d_user->opts->donate_fw)
+-            max_avail += in->max_bytes - (fw_bytes + 1);
++        uint64_t max_avail =
++            demux_bw_budget(in->max_bytes, in->max_bytes_bw, in->max_bytes_total,
++                            in->d_user->opts->donate_fw, fw_bytes);
+         if (in->total_bytes - fw_bytes <= max_avail)
+             break;
+ 
+@@ -2655,6 +2708,7 @@ static void update_opts(struct demuxer *demuxer)
+     in->hyst_bytes = opts->hyst_bytes;
+     in->max_bytes = opts->max_bytes;
+     in->max_bytes_bw = opts->max_bytes_bw;
++    in->max_bytes_total = opts->max_bytes_total;
+ 
+     int seekable = opts->seekable_cache;
+     bool is_streaming = in->d_thread->is_streaming;
+@@ -2680,6 +2734,7 @@ static void update_opts(struct demuxer *demuxer)
+         in->min_secs = 0;
+         in->max_bytes = 1;
+         in->max_bytes_bw = 0;
++        in->max_bytes_total = 0;
+         in->using_network_cache_opts = false;
+     }
+ 
+@@ -2720,9 +2775,12 @@ static bool thread_work(struct demux_internal *in)
+     struct demux_opts *opts = in->d_user->opts;
+     size_t old_max_bytes = opts->max_bytes;
+     size_t old_max_bytes_bw = opts->max_bytes_bw;
++    size_t old_max_bytes_total = opts->max_bytes_total;
+     if (m_config_cache_update(in->d_user->opts_cache)) {
+         update_opts(in->d_user);
+-        if (opts->max_bytes + opts->max_bytes_bw < old_max_bytes + old_max_bytes_bw)
++        if (opts->max_bytes + opts->max_bytes_bw < old_max_bytes + old_max_bytes_bw ||
++            (opts->max_bytes_total && (!old_max_bytes_total ||
++                                       opts->max_bytes_total < old_max_bytes_total)))
+             demux_packet_pool_clear(in->packet_pool);
+     }
+     if (in->tracks_switched) {
+diff --git a/demux/demux.h b/demux/demux.h
+index 00e3f5a..03ee7b3 100644
+--- a/demux/demux.h
++++ b/demux/demux.h
+@@ -68,6 +68,7 @@ struct demux_opts {
+     bool disk_cache;
+     int64_t max_bytes;
+     int64_t max_bytes_bw;
++    int64_t max_bytes_total;
+     bool donate_fw;
+     double min_secs;
+     double hyst_secs;

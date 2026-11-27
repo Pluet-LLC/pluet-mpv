@@ -98,3 +98,8 @@
 # Decoded PCM at its own rate where the route takes it (96/192 kHz), and the
 # route's rate and channels in the log.
 0319-ao-audiounit-ask-the-route-for-the-stream-sample-rate.patch
+# --demuxer-max-total-bytes: the forward and the back buffer as one limit
+# (the forward buffer reads into the back buffer's unused part after a start
+# or a seek; together never over the limit; off by default; test
+# test_demux_cache_budget.sh).
+0320-demux-one-limit-for-the-forward-and-the-back-buffer.patch
