@@ -98,3 +98,8 @@
 # Decoded PCM at its own rate where the route takes it (96/192 kHz), and the
 # route's rate and channels in the log.
 0319-ao-audiounit-ask-the-route-for-the-stream-sample-rate.patch
+# Blu-ray (PGS) and DVD subtitles drawn as text the app reads from the
+# pictures (--sub-picture-text-callback, the sub-picture-text command), in
+# the text subtitle style; pictures stay pictures without it (Pluet's
+# PictureSubtitleText, checked by its tool/subtitle_ocr/engine_check.sh).
+0320-sd-lavc-picture-subtitles-shown-as-text.patch

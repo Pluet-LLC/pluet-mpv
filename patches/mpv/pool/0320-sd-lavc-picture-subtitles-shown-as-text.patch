@@ -1,0 +1,641 @@
+From: "Pluet, LLC" <358065800+pluetllc@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 12:00:00 +0000
+Subject: [PATCH] sd_lavc: picture subtitles shown as text the app reads
+
+Blu-ray (PGS) and DVD subtitles are pictures, so they ignored the subtitle
+style (font, size, colours, position) that text tracks take. With
+--sub-picture-text-callback (a function of the app's, passed as an integer
+as --wid passes a window) and --sub-picture-text-context, sd_lavc hands each
+picture it decodes to that function once: premultiplied BGRA (the union of
+its parts), its start time, a hash of its pixels, the track's language and
+the canvas size. The function copies what it needs and returns at once,
+with the text when it knows it already; otherwise the text may come later
+with the new sub-picture-text command (pts, hash, text). A picture with text
+is drawn as that text by an sd_ass of its own (SubRip lines), so it takes
+every option a text subtitle file takes; a picture in the canvas's top half
+is drawn at the top ({\an8}). A picture without text is drawn as before, and
+one drawn as a picture once stays a picture until it ends, so a line never
+changes its look on screen.
+
+Timing is the picture's: its start, and the end the next display set gives
+(when that end arrives after the text went in, the text renderer's track is
+rebuilt). A display set that repeats the one before up to its start (a
+Blu-ray acquisition point) keeps its text, or its picture, without asking
+again. While the app reads pictures, 16 decoded subtitles are kept instead
+of 4, so lines are decoded, and read, well before they are due. Forced-only
+playback (--sub-forced-events-only) keeps working: the picture holds only
+its forced parts, and the text renderer does not drop them as it would for
+a text track. DVD menus stay pictures. sub-text gives the read text.
+
+Without the callback nothing changes (4 subtitles kept, pictures drawn).
+
+---
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 1092ce7..f4de9c5 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -752,6 +752,11 @@ Track Manipulation
+ 
+     This works by unloading and re-adding the subtitle track.
+ 
++``sub-picture-text <pts> <hash> <text>``
++    The text read in a subtitle picture (``--sub-picture-text-callback``): the
++    picture's start time and hash (hexadecimal) as the callback gave them.
++    Lines are separated by newlines.
++
+ ``sub-step <skip> [<flags>]``
+     Change subtitle timing such, that the subtitle event after the next
+     ``<skip>`` subtitle events is displayed. ``<skip>`` can be negative to step
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index e9b2ece..f0f8613 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -3078,6 +3078,17 @@ Subtitles
+     mixture of forced and unforced events within the stream. Enabling this on
+     text subtitles will cause no subtitles to be displayed (default: ``no``).
+ 
++``--sub-picture-text-callback=<pointer>``, ``--sub-picture-text-context=<pointer>``
++    (libmpv only) A function of the application's, and its context, that
++    reads Blu-ray (PGS) and DVD subtitle pictures as text, passed as integers
++    (as ``--wid`` passes a window). Each picture decoded is handed to it once,
++    with its start time and a hash of its pixels; the text it gives (at once,
++    or later with the ``sub-picture-text`` command) is drawn as a text
++    subtitle, with every option a text subtitle file takes. A picture without
++    text is drawn as the picture, and one drawn as a picture stays one until
++    it ends. The function's signature is ``sub_picture_text_fn`` in
++    ``sub/sd_lavc.c``. Default: 0 (pictures stay pictures).
++
+ ``--sub-fps=<rate>``
+     Specify the framerate of the subtitle file (default: video fps). Affects
+     text subtitles only.
+diff --git a/options/options.c b/options/options.c
+index c38db28..5037206 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -351,6 +351,8 @@ const struct m_sub_options mp_subtitle_sub_opts = {
+         {"sub-past-video-end", OPT_BOOL(sub_past_video_end)},
+         {"sub-ass-force-style", OPT_REPLACED("sub-ass-style-overrides")},
+         {"sub-lavc-o", OPT_KEYVALUELIST(sub_avopts), .flags = UPDATE_SUB_HARD},
++        {"sub-picture-text-callback", OPT_INT64(sub_picture_text_cb), .flags = UPDATE_SUB_HARD},
++        {"sub-picture-text-context", OPT_INT64(sub_picture_text_ctx), .flags = UPDATE_SUB_HARD},
+         {"sub-glyph-limit", OPT_INT(sub_glyph_limit)},
+         {"sub-bitmap-max-size", OPT_INT(sub_bitmap_max_size)},
+         {"sub-ass-atlas-reuse", OPT_BOOL(sub_ass_atlas_reuse)},
+diff --git a/options/options.h b/options/options.h
+index 0efe4d9..8dbd8cf 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -138,6 +138,9 @@ struct mp_subtitle_opts {
+     int sub_ass_atlas_pool;
+     int sub_ass_render_threads;
+     char **sub_avopts;
++    // Pluet: picture subtitles recognised as text (sd_lavc.c).
++    int64_t sub_picture_text_cb;
++    int64_t sub_picture_text_ctx;
+ };
+ 
+ // Options for both primary and secondary subs.
+diff --git a/player/command.c b/player/command.c
+index ca6bc15..552ccfc 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -6493,6 +6493,29 @@ static void cmd_sub_step_seek(void *p)
+     }
+ }
+ 
++// Pluet: the text recognised in a picture subtitle (sd_lavc.c), for the
++// primary and secondary subtitle tracks that have that picture.
++static void cmd_sub_picture_text(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    char *end = NULL;
++    struct sd_picture_text a = {
++        .pts = cmd->args[0].v.d,
++        .hash = strtoull(cmd->args[1].v.s, &end, 16),
++        .text = cmd->args[2].v.s,
++    };
++    if (!end || *end) {
++        cmd->success = false;
++        return;
++    }
++    for (int n = 0; n < num_ptracks[STREAM_SUB]; n++) {
++        struct track *track = mpctx->current_track[n][STREAM_SUB];
++        if (track && track->d_sub)
++            sub_control(track->d_sub, SD_CTRL_PICTURE_TEXT, &a);
++    }
++}
++
+ static void cmd_print_text(void *p)
+ {
+     struct mp_cmd_ctx *cmd = p;
+@@ -7788,6 +7811,14 @@ const struct mp_cmd_def mp_cmds[] = {
+         .allow_auto_repeat = true,
+         .priv = &(const bool){false}
+     },
++    { "sub-picture-text", cmd_sub_picture_text,
++        {
++            {"pts", OPT_DOUBLE(v.d)},
++            {"hash", OPT_STRING(v.s)},
++            {"text", OPT_STRING(v.s)},
++        },
++        .is_noisy = true,
++    },
+     { "print-text", cmd_print_text, { {"text", OPT_STRING(v.s)} },
+         .is_noisy = true, .allow_auto_repeat = true },
+     { "show-text", cmd_show_text,
+diff --git a/sub/dec_sub.h b/sub/dec_sub.h
+index 7511d12..6fe868e 100644
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -24,6 +24,7 @@ enum sd_ctrl {
+     SD_CTRL_RESET_SOFT,
+     SD_CTRL_UPDATE_OPTS,
+     SD_CTRL_APPLY_DVDNAV,   // const struct stream_nav_state *
++    SD_CTRL_PICTURE_TEXT,   // const struct sd_picture_text *
+ };
+ 
+ enum sd_text_type {
+@@ -32,6 +33,13 @@ enum sd_text_type {
+     SD_TEXT_TYPE_ASS_FULL,
+ };
+ 
++// The text recognised in a picture subtitle (sub-picture-text command).
++struct sd_picture_text {
++    double pts;
++    uint64_t hash;
++    const char *text;
++};
++
+ struct sd_times {
+     double start;
+     double end;
+diff --git a/sub/sd.h b/sub/sd.h
+index a813520..3546781 100644
+--- a/sub/sd.h
++++ b/sub/sd.h
+@@ -34,6 +34,11 @@ struct sd {
+     // Set to false as soon as the decoder discards old subtitle events.
+     // (only needed if sd_functions.accept_packets_in_advance == false)
+     bool preload_ok;
++
++    // Renders the text recognised in a picture subtitle track (sd_lavc's
++    // text renderer): the picture track already kept only its forced
++    // lines when --sub-forced-events-only asked for that.
++    bool picture_text;
+ };
+ 
+ struct sd_functions {
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index 8d73396..c1b2f8b 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -867,7 +867,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+     // Currently no supported text sub formats support a distinction between forced
+     // and unforced lines, so we just assume everything's unforced and discard everything.
+     // If we ever see a format that makes this distinction, we can add support here.
+-    if (opts->sub_forced_events_only)
++    if (opts->sub_forced_events_only && !sd->picture_text)
+         goto done;
+ 
+     double scale = dim.display_par;
+diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
+index dde1dd7..7d97771 100644
+--- a/sub/sd_lavc.c
++++ b/sub/sd_lavc.c
+@@ -18,6 +18,8 @@
+ #include <stdlib.h>
+ #include <assert.h>
+ #include <math.h>
++#include <limits.h>
++#include <stdint.h>
+ 
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/common.h>
+@@ -35,7 +37,36 @@
+ #include "sd.h"
+ #include "dec_sub.h"
+ 
+-#define MAX_QUEUE 4
++// Decoded subtitles kept: upstream's 4, or 16 while the app recognises
++// pictures as text (QUEUE_TEXT), so lines are decoded, and recognised, well
++// before they are due.
++#define MAX_QUEUE 16
++#define QUEUE_PLAIN 4
++#define QUEUE_TEXT MAX_QUEUE
++
++// Pluet: picture subtitles (Blu-ray PGS, DVD) shown as text.
++//
++// The app passes a function (--sub-picture-text-callback, a pointer as an
++// integer, as --wid passes a window) and its context
++// (--sub-picture-text-context). Each picture decoded is handed to it once,
++// as premultiplied BGRA (the union of its parts, at its place on the
++// subtitle canvas), with its start time and a hash of its pixels. The
++// function copies what it needs and returns at once: 1 when it wrote the
++// text already (a picture it recognised before), else 0, and the text may
++// come later with the sub-picture-text command (pts, hash, text). A picture
++// with text is drawn as that text, by an sd_ass of the same options, so it
++// looks like a text subtitle: font, size, colours, position (the top of the
++// screen for a picture in the canvas's top half). A picture without text is
++// drawn as the picture, and one drawn as a picture once stays one until it
++// ends: a line never changes its look while it is on screen.
++typedef int (*sub_picture_text_fn)(void *ctx, double pts, uint64_t hash,
++                                   const char *lang, const char *codec,
++                                   int canvas_w, int canvas_h,
++                                   int x, int y, int w, int h, int stride,
++                                   const uint8_t *bgra,
++                                   char *text, int text_size);
++
++extern const struct sd_functions sd_ass;
+ 
+ struct sub {
+     bool valid;
+@@ -48,6 +79,13 @@ struct sub {
+     double pts;
+     double endpts;
+     int64_t id;
++    // Picture text (see above).
++    uint64_t hash;
++    char *text;          // recognised text, or NULL
++    bool top;            // the picture sits in the canvas's top half
++    bool picture_shown;  // drawn as a picture: stays one
++    bool fed;            // its text is in text_sd's track
++    double fed_end;      // with this end
+ };
+ 
+ struct seekpoint {
+@@ -76,8 +114,50 @@ struct sd_lavc_priv {
+     bool menu_active;               // in-menu: gates the highlight overlay
+     struct mp_dvdnav_highlight hl;  // focused button rect + palette
+     uint32_t hli_change_id;
++
++    // Picture text (see above): how many decoded subtitles are kept, the
++    // app's function, and the renderer of recognised text.
++    int queue_len;
++    sub_picture_text_fn text_fn;
++    void *text_ctx;
++    struct sd *text_sd;
++    bool showing_text;   // the last get_bitmaps drew text
+ };
+ 
++// The renderer of recognised text: an sd_ass decoding SubRip lines, so it
++// takes every option a text subtitle file takes.
++static void init_text(struct sd *sd)
++{
++    struct sd_lavc_priv *priv = sd->priv;
++    struct mp_codec_params *codec = talloc_zero(priv, struct mp_codec_params);
++    codec->type = STREAM_SUB;
++    codec->codec = "subrip";
++    struct sd *t = talloc(priv, struct sd);
++    *t = (struct sd){
++        .global = sd->global,
++        .log = mp_log_new(t, sd->log, "text"),
++        .opts = sd->opts,
++        .shared_opts = sd->shared_opts,
++        .driver = &sd_ass,
++        .order = sd->order,
++        .attachments = sd->attachments,
++        .codec = codec,
++        .lang = sd->lang,
++        .preload_ok = true,
++        .picture_text = true,
++    };
++    if (t->driver->init(t) < 0) {
++        MP_WARN(sd, "No text renderer: pictures stay pictures.\n");
++        talloc_free(t);
++        return;
++    }
++    priv->text_sd = t;
++    priv->text_fn = (sub_picture_text_fn)(intptr_t)sd->opts->sub_picture_text_cb;
++    priv->text_ctx = (void *)(intptr_t)sd->opts->sub_picture_text_ctx;
++    priv->queue_len = QUEUE_TEXT;
++    MP_VERBOSE(sd, "Pictures shown as text where recognised.\n");
++}
++
+ static int init(struct sd *sd)
+ {
+     enum AVCodecID cid = mp_codec_to_av_codec_id(sd->codec->codec);
+@@ -143,6 +223,10 @@ static int init(struct sd *sd)
+     priv->displayed_id = -1;
+     priv->current_pts = MP_NOPTS_VALUE;
+     priv->packer = talloc_zero(priv, struct bitmap_packer);
++    priv->queue_len = QUEUE_PLAIN;
++    if (sd->opts->sub_picture_text_cb &&
++        (cid == AV_CODEC_ID_HDMV_PGS_SUBTITLE || cid == AV_CODEC_ID_DVD_SUBTITLE))
++        init_text(sd);
+     return 0;
+ 
+ error:
+@@ -162,13 +246,20 @@ static void clear_sub(struct sub *sub)
+     if (sub->valid)
+         avsubtitle_free(&sub->avsub);
+     sub->valid = false;
++    TA_FREEP(&sub->text);
++    sub->hash = 0;
++    sub->top = false;
++    sub->picture_shown = false;
++    sub->fed = false;
++    sub->fed_end = MP_NOPTS_VALUE;
+ }
+ 
+ static void alloc_sub(struct sd_lavc_priv *priv)
+ {
+-    clear_sub(&priv->subs[MAX_QUEUE - 1]);
+-    struct sub tmp = priv->subs[MAX_QUEUE - 1];
+-    for (int n = MAX_QUEUE - 1; n > 0; n--)
++    int len = priv->queue_len;
++    clear_sub(&priv->subs[len - 1]);
++    struct sub tmp = priv->subs[len - 1];
++    for (int n = len - 1; n > 0; n--)
+         priv->subs[n] = priv->subs[n - 1];
+     priv->subs[0] = tmp;
+     // clear only some fields; the memory allocs can be reused
+@@ -365,6 +456,155 @@ static void rerender_queued_subs(struct sd *sd)
+     }
+ }
+ 
++
++// Every recognised line leaves text_sd's track; each goes in again when it
++// is next drawn (text_draw). For a fed line's end changing, a seek, and new
++// options.
++static void text_forget(struct sd *sd)
++{
++    struct sd_lavc_priv *priv = sd->priv;
++    if (!priv->text_sd)
++        return;
++    priv->text_sd->driver->control(priv->text_sd, SD_CTRL_RESET_SOFT, NULL);
++    for (int n = 0; n < MAX_QUEUE; n++)
++        priv->subs[n].fed = false;
++}
++
++// The text for a picture: one line per row, as the app sent it, without
++// what would read as ASS override tags or SubRip markup.
++static void text_set(struct sd_lavc_priv *priv, struct sub *sub, const char *text)
++{
++    if (sub->text || !text)
++        return;
++    char *clean = talloc_strdup(priv, "");
++    for (const char *c = text; *c; c++) {
++        if (*c == '{' || *c == '}' || *c == '\\' || *c == '<' || *c == '>' ||
++            *c == '\r')
++            continue;
++        clean = talloc_strndup_append_buffer(clean, c, 1);
++    }
++    // No blank rows at either end.
++    int start = 0, len = strlen(clean);
++    while (start < len && (clean[start] == '\n' || clean[start] == ' '))
++        start++;
++    while (len > start && (clean[len - 1] == '\n' || clean[len - 1] == ' '))
++        len--;
++    if (len <= start) {
++        talloc_free(clean);
++        return;
++    }
++    sub->text = talloc_strndup(priv, clean + start, len - start);
++    talloc_free(clean);
++}
++
++static uint64_t hash_pixels(const uint32_t *px, int w, int h)
++{
++    uint64_t hash = 0xcbf29ce484222325;
++    const uint8_t *b = (const uint8_t *)px;
++    for (size_t n = 0; n < (size_t)w * h * 4; n++)
++        hash = (hash ^ b[n]) * 0x100000001b3;
++    hash = (hash ^ (uint64_t)w) * 0x100000001b3;
++    hash = (hash ^ (uint64_t)h) * 0x100000001b3;
++    return hash;
++}
++
++// A picture was decoded: its hash, and its text if the app has it (or will).
++static void picture_ready(struct sd *sd, struct sub *cur)
++{
++    struct sd_lavc_priv *priv = sd->priv;
++    if (!priv->text_sd || !cur->count || priv->menu_active)
++        return;
++
++    int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
++    for (int n = 0; n < cur->count; n++) {
++        struct sub_bitmap *b = &cur->inbitmaps[n];
++        x0 = MPMIN(x0, b->x);
++        y0 = MPMIN(y0, b->y);
++        x1 = MPMAX(x1, b->x + b->w);
++        y1 = MPMAX(y1, b->y + b->h);
++    }
++    int w = x1 - x0, h = y1 - y0;
++    if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
++        return;
++    uint32_t *img = talloc_zero_array(NULL, uint32_t, (size_t)w * h);
++    for (int n = 0; n < cur->count; n++) {
++        struct sub_bitmap *b = &cur->inbitmaps[n];
++        for (int y = 0; y < b->h; y++) {
++            const uint32_t *in = (const uint32_t *)((const char *)b->bitmap + y * b->stride);
++            uint32_t *out = img + (size_t)(b->y - y0 + y) * w + (b->x - x0);
++            for (int x = 0; x < b->w; x++) {
++                if (in[x])
++                    out[x] = in[x];
++            }
++        }
++    }
++
++    int canvas_w = priv->avctx->width, canvas_h = priv->avctx->height;
++    if (canvas_w <= 0 || canvas_h <= 0) {
++        canvas_w = priv->video_params.w;
++        canvas_h = priv->video_params.h;
++    }
++    canvas_w = MPMAX(canvas_w, cur->src_w);
++    canvas_h = MPMAX(canvas_h, cur->src_h);
++
++    cur->hash = hash_pixels(img, w, h);
++    cur->top = y0 + h / 2.0 < canvas_h / 2.0;
++
++    // The display set before showed the same picture and ran up to this one
++    // (a Blu-ray acquisition point repeats it): the same line goes on, as it
++    // was drawn.
++    struct sub *prev = &priv->subs[1];
++    if (prev->valid && prev->count && prev->hash == cur->hash &&
++        prev->endpts == cur->pts)
++    {
++        cur->picture_shown = prev->picture_shown;
++        text_set(priv, cur, prev->text);
++    }
++
++    if (!cur->text && !cur->picture_shown && priv->text_fn) {
++        char text[4096] = {0};
++        const char *codec = priv->avctx->codec_id == AV_CODEC_ID_DVD_SUBTITLE ?
++                            "dvd_subtitle" : "hdmv_pgs_subtitle";
++        if (priv->text_fn(priv->text_ctx, cur->pts, cur->hash,
++                          sd->lang ? sd->lang : "", codec, canvas_w, canvas_h,
++                          x0, y0, w, h, w * 4, (const uint8_t *)img,
++                          text, sizeof(text) - 1) == 1)
++        {
++            text_set(priv, cur, text);
++        }
++    }
++    talloc_free(img);
++}
++
++// Draws a recognised line, putting it in text_sd's track first if it is not
++// there (with its end as known now; text_forget when that changes).
++static struct sub_bitmaps *text_draw(struct sd *sd, struct sub *cur,
++                                     struct mp_osd_res d, int format,
++                                     double pts, bool prefetch)
++{
++    struct sd_lavc_priv *priv = sd->priv;
++    struct sd *t = priv->text_sd;
++    if (!cur->fed) {
++        char *line = talloc_asprintf(NULL, "%s%s", cur->top ? "{\\an8}" : "",
++                                     cur->text);
++        struct demux_packet *pkt = new_demux_packet_from(NULL, line, strlen(line));
++        talloc_free(line);
++        if (!pkt)
++            return NULL;
++        pkt->pts = cur->pts;
++        pkt->duration = cur->endpts == MP_NOPTS_VALUE ? -1 : cur->endpts - cur->pts;
++        pkt->pos = -1;
++        t->driver->decode(t, pkt);
++        talloc_free(pkt);
++        cur->fed = true;
++        cur->fed_end = cur->endpts;
++    }
++    struct sub_bitmaps *res = t->driver->get_bitmaps(t, d, format, pts, prefetch);
++    if (res && !priv->showing_text)
++        res->change_id++;
++    return res;
++}
++
+ static void decode(struct sd *sd, struct demux_packet *packet)
+ {
+     struct mp_subtitle_opts *opts = sd->opts;
+@@ -420,6 +660,10 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+             if (opts->sub_fix_timing && pts - prev->endpts <= opts->sub_fix_timing_threshold / 1000.0)
+                 prev->endpts = pts;
+ 
++            // Its text went in with another end (or none).
++            if (prev->fed && prev->endpts != prev->fed_end)
++                text_forget(sd);
++
+             for (int n = 0; n < priv->num_seekpoints; n++) {
+                 if (priv->seekpoints[n].pts == prev->pts) {
+                     priv->seekpoints[n].endpts = prev->endpts;
+@@ -444,6 +688,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+     current->avsub = sub;
+ 
+     read_sub_bitmaps(sd, current);
++    picture_ready(sd, current);
+ 
+     if (pts != MP_NOPTS_VALUE) {
+         for (int n = 0; n < priv->num_seekpoints; n++) {
+@@ -494,6 +739,19 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
+     if (!current)
+         return NULL;
+ 
++    if (priv->text_sd && !priv->menu_active) {
++        if (current->text && !current->picture_shown) {
++            struct sub_bitmaps *text = text_draw(sd, current, d, format, pts, prefetch);
++            if (text) {
++                priv->showing_text = true;
++                // The next picture is a change, whatever it is.
++                priv->displayed_id = -1;
++                return text;
++            }
++        }
++        current->picture_shown = true;
++    }
++
+     MP_TARRAY_GROW(priv, priv->outbitmaps, current->count);
+     for (int n = 0; n < current->count; n++)
+         priv->outbitmaps[n] = current->inbitmaps[n];
+@@ -585,8 +843,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
+         }
+     }
+ 
+-    if (priv->prevret_num != res->num_parts)
++    if (priv->prevret_num != res->num_parts || priv->showing_text)
+         res->change_id++;
++    priv->showing_text = false;
+ 
+     if (!res->change_id) {
+         mp_assert(priv->prevret_num == res->num_parts);
+@@ -610,6 +869,14 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
+     return sub_bitmaps_copy(NULL, res);
+ }
+ 
++// The recognised text of the line at pts (sub-text), if it has one.
++static char *get_text(struct sd *sd, double pts, enum sd_text_type type)
++{
++    struct sd_lavc_priv *priv = sd->priv;
++    struct sub *current = get_current(priv, pts);
++    return current && current->text ? talloc_strdup(NULL, current->text) : NULL;
++}
++
+ static struct sd_times get_times(struct sd *sd, double pts)
+ {
+     struct sd_lavc_priv *priv = sd->priv;
+@@ -658,7 +925,7 @@ static bool accepts_packet(struct sd *sd, double min_pts)
+     }
+     // We can accept a packet if it wouldn't overflow the fixed subtitle queue.
+     // We assume that get_bitmaps() never decreases the PTS.
+-    return last_needed + 1 < MAX_QUEUE;
++    return last_needed + 1 < priv->queue_len;
+ }
+ 
+ static void reset(struct sd *sd)
+@@ -667,6 +934,7 @@ static void reset(struct sd *sd)
+ 
+     for (int n = 0; n < MAX_QUEUE; n++)
+         clear_sub(&priv->subs[n]);
++    text_forget(sd);
+     // lavc might not do this right for all codecs; may need close+reopen
+     avcodec_flush_buffers(priv->avctx);
+ 
+@@ -679,6 +947,10 @@ static void uninit(struct sd *sd)
+ 
+     for (int n = 0; n < MAX_QUEUE; n++)
+         clear_sub(&priv->subs[n]);
++    if (priv->text_sd) {
++        priv->text_sd->driver->uninit(priv->text_sd);
++        TA_FREEP(&priv->text_sd);
++    }
+     avcodec_free_context(&priv->avctx);
+     mp_free_av_packet(&priv->avpkt);
+     talloc_free(priv);
+@@ -747,7 +1019,31 @@ static double step_sub(struct sd *sd, double now, int movement)
+ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
+ {
+     struct sd_lavc_priv *priv = sd->priv;
++    // The text renderer follows the video and the options as a text track.
++    if (priv->text_sd) {
++        struct sd *t = priv->text_sd;
++        switch (cmd) {
++        case SD_CTRL_SET_VIDEO_PARAMS:
++        case SD_CTRL_SET_ANIMATED_CHECK:
++            t->driver->control(t, cmd, arg);
++            break;
++        case SD_CTRL_UPDATE_OPTS:
++        case SD_CTRL_RESET_SOFT:
++            t->driver->control(t, cmd, arg);
++            text_forget(sd);
++            break;
++        }
++    }
+     switch (cmd) {
++    case SD_CTRL_PICTURE_TEXT: {
++        const struct sd_picture_text *a = arg;
++        for (int n = 0; n < MAX_QUEUE; n++) {
++            struct sub *sub = &priv->subs[n];
++            if (sub->valid && sub->hash == a->hash && fabs(sub->pts - a->pts) < 1e-4)
++                text_set(priv, sub, a->text);
++        }
++        return CONTROL_OK;
++    }
+     case SD_CTRL_SUB_STEP: {
+         double *a = arg;
+         double res = step_sub(sd, a[0], a[1]);
+@@ -786,6 +1082,7 @@ const struct sd_functions sd_lavc = {
+     .init = init,
+     .decode = decode,
+     .get_bitmaps = get_bitmaps,
++    .get_text = get_text,
+     .get_times = get_times,
+     .accepts_packet = accepts_packet,
+     .control = control,
