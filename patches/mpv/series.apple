@@ -103,3 +103,8 @@
 # or a seek; together never over the limit; off by default; test
 # test_demux_cache_budget.sh).
 0320-demux-one-limit-for-the-forward-and-the-back-buffer.patch
+# Blu-ray (PGS) and DVD subtitles drawn as text the app reads from the
+# pictures (--sub-picture-text-callback, the sub-picture-text command), in
+# the text subtitle style; pictures stay pictures without it (Pluet's
+# PictureSubtitleText, checked by its tool/subtitle_ocr/engine_check.sh).
+0321-sd-lavc-picture-subtitles-shown-as-text.patch
