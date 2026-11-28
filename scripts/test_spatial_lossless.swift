@@ -14,8 +14,9 @@ import Accelerate
 //  - ao_spatial's failure kinds: a renderer refusal of linear PCM is
 //    MP_SPATIAL_OUTPUT_FAILED (3), a stream without objects stays
 //    MP_SPATIAL_FAILED (2).
-// Optional argument: an IEC 61937 TrueHD Atmos file (ffmpeg -f spdif), for the
-// rendered comparison and the time each route takes to be ready to play.
+// Optional arguments: IEC 61937 TrueHD Atmos or DTS:X files (ffmpeg -f spdif;
+// DTS-HD with -dtshd_rate 768000), for the rendered comparison and the time
+// each route takes to be ready to play.
 
 final class CaptureOutput: SpatialAudioRendererOutput, @unchecked Sendable {
     var buffers: [CMSampleBuffer] = []
@@ -186,14 +187,17 @@ struct Main {
         check(mpSpatialFailureKind(SpatialAudioError.encoding("x"), lossless: false) == 2, "an APAC failure decodes as before")
         check(mpSpatialFailureKind(SpatialAudioError.discontinuity("pause burst"), lossless: true) == 1, "a gap begins a new timeline")
 
-        // 5. A real TrueHD Atmos stream, if given: identical render either way, readiness.
-        let arguments = CommandLine.arguments
-        if arguments.count > 1 {
-            let bursts = try Data(contentsOf: URL(fileURLWithPath: arguments[1]))
+        // 5. Real TrueHD Atmos or DTS:X streams, if given: identical render either way, readiness.
+        for path in CommandLine.arguments.dropFirst() {
+            let bursts = try Data(contentsOf: URL(fileURLWithPath: path))
             var unpacker = IEC61937Unpacker()
             let stream = try unpacker.unpack(bursts)
+            // A DTS core sync word first (big-endian 7FFE8001) is DTS-HD; MAT frames give TrueHD.
+            let dts = stream.prefix(4) == Data([0x7F, 0xFE, 0x80, 0x01])
+            let codec: SpatialAudioCodec = dts ? .dtsX : .trueHDAtmos
+            let name = dts ? "DTS:X" : "TrueHD Atmos"
             // The renderer's own decode, straight.
-            let decoder = try Decoder(codec: .trueHDAtmos, layout: .sevenOneFour)
+            let decoder = try Decoder(codec: codec, layout: .sevenOneFour)
             var reference: [Float] = []
             for start in stride(from: 0, to: stream.count, by: 65_536) {
                 let end = min(stream.count, start + 65_536)
@@ -205,7 +209,7 @@ struct Main {
                 configuration.losslessPCM = lossless
                 let output = CaptureOutput()
                 let synchronizer = AVSampleBufferRenderSynchronizer()
-                let renderer = try SpatialAudioRenderer(codec: .trueHDAtmos, configuration: configuration,
+                let renderer = try SpatialAudioRenderer(codec: codec, configuration: configuration,
                                                         synchronizer: synchronizer, output: output)
                 try await renderer.begin(at: .zero)
                 // Readiness: how much audio goes in before the first buffer comes out.
@@ -224,14 +228,14 @@ struct Main {
                 if lossless {
                     let out = captured.flatMap(floats)
                     check(out == reference.map(grid),
-                          "TrueHD Atmos: linear PCM output is the renderer's 7.1.4 on the 24-bit grid (\(out.count / 12) frames)")
+                          "\(name): linear PCM output is the renderer's 7.1.4 on the 24-bit grid (\(out.count / 12) frames)")
                     var err = 0.0, sig = 0.0
                     for (o, r) in zip(out, reference) { err += Double(o - r) * Double(o - r); sig += Double(r) * Double(r) }
-                    print(String(format: "info: linear PCM against the float render: %.1f dB (the 24-bit rounding alone)", 10 * log10(sig / max(err, 1e-30))))
-                    print(String(format: "info: linear PCM: first audio enqueued after %.2f s of input", inputSeconds))
+                    print(String(format: "info: %@: linear PCM against the float render: %.1f dB (the 24-bit rounding alone)", name, 10 * log10(sig / max(err, 1e-30))))
+                    print(String(format: "info: %@: linear PCM: first audio enqueued after %.2f s of input", name, inputSeconds))
                 } else if let format = captured.first.flatMap(CMSampleBufferGetFormatDescription) {
                     let snr = try apacSNR(captured, format: format, reference: reference)
-                    print(String(format: "info: APAC: first packet after %.2f s of input; 7.1.4 signal-to-error %.1f dB", inputSeconds, snr))
+                    print(String(format: "info: %@: APAC: first packet after %.2f s of input; 7.1.4 signal-to-error %.1f dB", name, inputSeconds, snr))
                 }
             }
         }

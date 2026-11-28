@@ -3,7 +3,7 @@
 # SpatialAudioBridge patch 0001): SpatialAudioBridge's renderer and ao_spatial's
 # Swift side, built from the pinned and patched sources with the Rust core,
 # against a capturing output (test_spatial_lossless.swift). No audio is played.
-# macOS only. Usage: test_spatial_lossless.sh [patched-mpv] [iec-truehd-atmos]
+# macOS only. Usage: test_spatial_lossless.sh [patched-mpv] [iec-truehd-atmos-or-dts-x ...]
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d)"
@@ -28,4 +28,4 @@ xcrun --sdk macosx swiftc -swift-version 6 -O -parse-as-library -target "$arch-a
     "$mpv/audio/out/ao_spatial.swift" "$work/spatial/SpatialResources.swift" "$root/scripts/test_spatial_lossless.swift" \
     "$work/spatial/libspatial_audio_core.a" -framework AVFoundation -framework Accelerate -framework AudioToolbox \
     -o "$work/test"
-"$work/test" ${2:+"$2"}
+"$work/test" ${2:+"${@:2}"}
